@@ -1,59 +1,65 @@
-# Architecture
+# `agy-hud` v1.0.0 — 100% Pure Rust Single-Engine Architecture
 
-`agy-hud` adapts the **Capability vs. Logic Cage** architecture pioneered by [`jarrodwatts/claude-hud`](https://github.com/jarrodwatts/claude-hud) to **Google Antigravity CLI (`agy`)**.
+`agy-hud` is a **100% Pure Rust** native statusLine HUD for the Google Antigravity CLI (`agy`). There is **zero Node.js / TypeScript runtime or wrapper code** in the repository.
 
-## 1. THE LINE: Capability Layer vs. Caged Logic Layer
+Every statusLine refresh runs a single precompiled native binary (`agy-hud`), achieving ~1–4 ms warm latency while preserving strict **Capability Shell vs. Pure Logic Core** separation at compile time.
 
-Every render triggered by `agy` CLI's `statusLine` engine crosses an explicit security boundary (`THE LINE`):
+---
 
-```text
-Antigravity CLI (agy)
-  │  pipes statusLine JSON payload on stdin (throttled 300ms, max 5s)
-  ▼
-┌─ CAPABILITY LAYER (scripts/) ───────────────────────────────────────────────────┐
-│  hud.mjs:       bounded stdin reader, AGY_HUD_DISABLE gate, heartbeat,          │
-│                 pre-warms probes concurrently with caged child spawn,           │
-│                 enforces `terminalFilter` allowlist                             │
-│  collector.mjs: resolves exact paths, caches stripped TS (`manifest.json`),     │
-│                 caches VCS probes (`probe-cache.json` via mtime + TTL),         │
-│                 sweeps symlinks in `data/`, runs read-only git/jj/hg/vm_stat    │
-│  fence.mjs:     `--import` hook blocking child_process/net/http/fetch/sockets   │
-│  install.mjs:   atomic backup & update of ~/.gemini/antigravity-cli/settings    │
-└───────────────────────────┬─────────────────────────────▲───────────────────────┘
-                            │ NDJSON over raw fd 0        │ NDJSON over raw fd 1
-═══════════ THE LINE ═══════╪═════════════════════════════╪════════════════════════
-┌─ CAGED LOGIC LAYER (src/) ▼─────────────────────────────┴───────────────────────┐
-│  Runs under: `node --permission --disallow-code-generation-from-strings`        │
-│              `--allow-fs-read=<exact-granted-paths> --allow-fs-write=<data/>`   │
-│              `--import=./scripts/fence.mjs`                                     │
-│  Parses stdin, tail-reads `transcript.jsonl` + `task.md`, requests named probes │
-│  (`vcs`, `memory`), formats ANSI lines, and handles `/hud` subcommands.         │
-└─────────────────────────────────────────────────────────────────────────────────┘
-```
+## 1. Security Boundary: Compile-Time Crate Isolation (`THE LINE`)
 
-### Defense-in-Depth Guarantees
-1. **Filesystem confinement (`node --permission`)**: Logic can read only the plugin's own files, HUD config, `settings.json` (for `doctor`), and the active session's `transcript.jsonl` + `task.md`. It can write **only** inside `<hudHome>/data` (whose symlinks are swept prior to launch).
-2. **Import & Global Fence (`scripts/fence.mjs`)**: `module.registerHooks` blocks `node:child_process`, `node:net`, `node:http`, `node:https`, `node:tls`, `node:worker_threads`, `node:vm`, and external URLs. `fetch`, `WebSocket`, `process.binding`, `process.dlopen`, `process.kill`, and `net.Socket` stdio streams are sealed before logic loads.
-3. **Terminal Escape Firewall (`terminalFilter`)**: Logic never decides what raw escape sequences reach the user's terminal. `hud.mjs` strips OSC 52 clipboard reads, window-title hijacks, cursor jumps, control bytes, and Unicode bidi Trojan characters, keeping only SGR color sequences (`\x1b[...m`) and `file:` OSC 8 hyperlinks.
+Instead of spawning a second runtime VM per render, `agy-hud` enforces capability isolation directly through Rust's module, crate, and type systems (continuously audited by `crates/hud-core/tests/arch_guard.rs`):
 
-## 2. Logic Module Graph (Verified as a Test)
+1. **`crates/hud-core` (Pure Logic Crate — Zero I/O, `#![forbid(unsafe_code)]`)**
+   - Depends **only** on `serde` and `serde_json` (11 total transitive crates, zero network/OS crates).
+   - Strictly forbidden from referencing `std::fs`, `std::process`, `std::net`, `std::env`, or `std::os`.
+   - Owns all untrusted JSON/JSONL/Markdown parsing (`stdin.rs`, `transcript.rs`, `probes.rs`), `CONFIG_SCHEMA` validation (`config.rs`), multi-layout CJK-aware rendering (`render.rs`), CLI subcommand logic (`commands.rs`), and the `terminal_filter` output escape firewall (`ansi.rs`).
+2. **`crates/hud-cli` (Thin Capability Binary — `#![forbid(unsafe_code)]`)**
+   - Owns bounded `stdin` reading (`256 KB` cap), bounded `O(1)` `transcript.jsonl` reading (`8 KB` head + `256 KB` tail), symlink-swept `<hudHome>/data` management, and `std::thread::scope` parallel probe execution.
+   - Executes strictly read-only, shell-free, `1200 ms` timeout-bounded `git`, `jj`, `hg`, and `vm_stat` probes:
+     - **Git**: Enforces `-c protocol.allow=never`, `-c core.fsmonitor=false`, `--no-optional-locks`, `--ignore-submodules=dirty`, `GIT_NO_LAZY_FETCH=1`, AND parses `.git/config` in memory to dynamically neutralize any repo-local `[filter "<name>"]` drivers (`-c filter.<name>.clean=`, `smudge=`, `process=`, `required=false`).
+     - **Jujutsu (`jj`)**: Enforces `--ignore-working-copy --at-operation=@ --no-pager` so background renders never snapshot or mutate the working copy.
+     - **Mercurial (`hg`)**: Enforces `HGPLAIN=1 --config ui.interactive=False --config extensions.fsmonitor=!`.
+   - Stores VCS probe caches in **per-workspace sharded files** (`<hudHome>/probe-cache/<fnv64>.json`), eliminating cross-window write contention while invalidating in `O(1)` on `.git/HEAD`, `.git/index`, `.jj/working_copy/checkout`, or `.hg/dirstate` `mtime`/`size` changes.
+   - Passes every rendered output line through `hud_core::ansi::terminal_filter` before writing to `stdout`.
 
-`tests/arch.test.mjs` parses the Mermaid graph below on every test run, strips TypeScript types from `src/*.ts`, inspects actual runtime imports, and fails if any file is unassigned, if any import crosses layers without a declared arrow, or if the rounded nodes diverge from `ALLOWED_BUILTINS` in `scripts/fence.mjs`.
+---
+
+## 2. Module Dependency Graph (`hud-core` Verified by `arch_guard.rs`)
 
 ```mermaid
 flowchart TD
-  entry["entry: main.ts commands.ts"]
-  render["render: render.ts"]
-  parse["parse: stdin.ts probes.ts transcript.ts"]
-  config["config: config.ts"]
-  shared["shared: ansi.ts i18n.ts types.ts"]
+  subgraph CLI["crates/hud-cli (Native Capability Binary: agy-hud)"]
+    cli_main["Binary Entry: main.rs"]
+    cli_lib["CLI Modules: lib.rs collector.rs install.rs paths.rs"]
+  end
 
-  fsio(["node:fs node:fs/promises"])
-  host(["node:path node:os node:url node:crypto"])
+  subgraph CORE["crates/hud-core (Zero-I/O Pure Crate)"]
+    lib["Entry: lib.rs"]
+    commands["Subcommands: commands.rs"]
+    render["Layout Engine: render.rs"]
+    parsers["Parsers: stdin.rs probes.rs transcript.rs"]
+    config["Config Schema: config.rs"]
+    shared["Primitives: types.rs i18n.rs ansi.rs"]
+  end
 
-  entry --> config & parse & render & shared & fsio
-  render --> parse & shared
-  parse --> shared & fsio & host
-  config --> fsio
-  shared --> host
+  cli_main --> cli_lib & lib
+  cli_lib --> lib
+  lib --> commands & render & parsers & config & shared
+  commands --> config & parsers & render & shared
+  render --> config & parsers & shared
+  parsers --> shared
+  config --> shared
 ```
+
+---
+
+## 3. Data Flow Per `agy` `statusLine` Refresh
+
+1. `agy` CLI pipes live session JSON to `agy-hud` over `stdin` (throttled to at most once every `300 ms`).
+2. `crates/hud-cli` reads `stdin` (`<= 256 KB`) and `config.json` (`<= 64 KB`), then enters `std::thread::scope`:
+   - **Worker 1**: Seeks `transcript.jsonl` (`0..8 KB` for `session_started_at` + `len-256 KB..len` for recent `tool_calls`, skills, MCP servers, and subagents) and reads `<brain>/<id>/task.md`.
+   - **Worker 2**: Computes `O(1)` VCS metadata stat signature and checks `<hudHome>/probe-cache/<fnv64>.json`; on warm hit (`0` child spawns), returns cached VCS JSON in `< 0.1 ms`; on cold miss, runs hardened read-only `git` / `jj` / `hg` probe.
+   - **Worker 3**: (Optional when `display.showMemory = true`) Reads `/proc/meminfo` (Linux) or `sysctl` + `vm_stat` (macOS).
+3. `hud_core::render::render_hud_lines` formats 1–5 ANSI status lines tailored to `terminal_width` (`>= 132` single-line idle, `76..131` box-railed expanded, `< 76` auto-compact), clamping CJK 2-column boundaries and closing any open `file://` OSC 8 hyperlink.
+4. `hud_core::ansi::terminal_filter` strips any non-SGR / non-`file://` escape or bidi control character before `stdout` flush.

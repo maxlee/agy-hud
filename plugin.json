@@ -2,8 +2,8 @@
   "$schema": "https://antigravity.google/schemas/v1/plugin.json",
   "name": "agy-hud",
   "displayName": "AGY HUD",
-  "version": "0.2.0",
-  "description": "Real-time statusline HUD for Antigravity CLI showing context window, quota pace, active tools, subagents, and task progress.",
+  "version": "1.0.0",
+  "description": "Ultra-fast 100% Pure Rust real-time statusline HUD for Antigravity CLI showing context window, quota pace, active tools, subagents, and task progress.",
   "logo": "assets/logo.svg",
   "suggestedPrompts": [
     "Set up the HUD status line in Antigravity CLI",

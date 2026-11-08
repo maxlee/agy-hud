@@ -1,5 +1,4 @@
-node_modules/
+/target/
 .DS_Store
 *.bak.*
 *.tmp
-tests/.tmp-*
