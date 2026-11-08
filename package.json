@@ -1,0 +1,19 @@
+{
+  "name": "agy-hud",
+  "version": "0.1.0",
+  "description": "Real-time statusline HUD plugin for Google Antigravity CLI (agy), inspired by claude-hud",
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.18.0"
+  },
+  "bin": {
+    "agy-hud": "./scripts/hud.mjs"
+  },
+  "scripts": {
+    "test": "node --no-warnings --test tests/*.test.mjs",
+    "preview": "node --no-warnings ./scripts/hud.mjs preview --state showcase",
+    "doctor": "node --no-warnings ./scripts/hud.mjs doctor",
+    "validate": "agy plugin validate --strict ."
+  }
+}
