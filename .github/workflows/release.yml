@@ -85,12 +85,13 @@ jobs:
           set -euo pipefail
           STAGE="dist/agy-hud"
           mkdir -p "$STAGE/scripts/bin/${{ matrix.platform }}"
-          cp plugin.json LICENSE README.md README.zh-CN.md ARCHITECTURE.md install.sh "$STAGE/"
+          cp plugin.json LICENSE README.md README.zh-CN.md ARCHITECTURE.md install.sh uninstall.sh "$STAGE/"
           cp -R assets skills "$STAGE/"
           cp scripts/agy-hud "$STAGE/scripts/agy-hud"
           cp "target/${{ matrix.target }}/release/${{ matrix.bin_name }}" "$STAGE/scripts/bin/${{ matrix.platform }}/${{ matrix.bin_name }}"
           chmod 0755 \
             "$STAGE/install.sh" \
+            "$STAGE/uninstall.sh" \
             "$STAGE/scripts/agy-hud" \
             "$STAGE/skills/hud/scripts/hud-cli.sh" \
             "$STAGE/scripts/bin/${{ matrix.platform }}/${{ matrix.bin_name }}"
@@ -103,7 +104,7 @@ jobs:
           $ErrorActionPreference = "Stop"
           $Stage = "dist/agy-hud"
           New-Item -ItemType Directory -Force -Path "$Stage/scripts/bin/${{ matrix.platform }}" | Out-Null
-          Copy-Item plugin.json, LICENSE, README.md, README.zh-CN.md, ARCHITECTURE.md, install.sh -Destination "$Stage/"
+          Copy-Item plugin.json, LICENSE, README.md, README.zh-CN.md, ARCHITECTURE.md, install.sh, uninstall.sh -Destination "$Stage/"
           Copy-Item assets, skills -Destination "$Stage/" -Recurse
           Copy-Item scripts/agy-hud -Destination "$Stage/scripts/agy-hud"
           Copy-Item "target/${{ matrix.target }}/release/${{ matrix.bin_name }}" -Destination "$Stage/scripts/bin/${{ matrix.platform }}/${{ matrix.bin_name }}"

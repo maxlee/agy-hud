@@ -31,7 +31,7 @@ Use `sh scripts/hud-cli.sh` (relative to this skill directory) to inspect, previ
      ```bash
      sh scripts/hud-cli.sh install --stack
      ```
-   - Revert / uninstall:
+   - Revert / clean uninstall (restores official default `statusLine`, unregisters plugin if installed, removes tracked backups and `~/.gemini/antigravity-cli/agy-hud`; pass `--keep-config` to retain `config.json`):
      ```bash
      sh scripts/hud-cli.sh uninstall
      ```

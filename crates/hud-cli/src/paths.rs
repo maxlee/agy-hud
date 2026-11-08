@@ -185,6 +185,15 @@ pub fn prepare_data_dir(paths: &AgyPaths) -> Option<PathBuf> {
     fs::canonicalize(&paths.data_dir).ok()
 }
 
+/// Read-only resolution of `<hudHome>/data` without creating directories on disk.
+pub fn existing_data_dir(paths: &AgyPaths) -> Option<PathBuf> {
+    let meta = fs::symlink_metadata(&paths.data_dir).ok()?;
+    if meta.file_type().is_symlink() || !meta.is_dir() {
+        return None;
+    }
+    fs::canonicalize(&paths.data_dir).ok()
+}
+
 pub fn build_logic_paths(
     paths: &AgyPaths,
     stdin: Option<&AgyStdinData>,

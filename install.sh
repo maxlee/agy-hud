@@ -2,6 +2,7 @@
 # One-line zero-Rust installer for agy-hud:
 #   curl -fsSL https://raw.githubusercontent.com/maxlee/agy-hud/main/install.sh | sh
 #   curl -fsSL https://raw.githubusercontent.com/maxlee/agy-hud/main/install.sh | sh -s -- --stack
+#   curl -fsSL https://raw.githubusercontent.com/maxlee/agy-hud/main/install.sh | sh -s -- --uninstall
 set -eu
 
 REPO="${AGY_HUD_REPO:-maxlee/agy-hud}"
@@ -19,6 +20,24 @@ CLI_DIR_RAW="${AGY_CLI_DIR:-$HOME/.gemini/antigravity-cli}"
 CLI_DIR=$(expand_tilde "$CLI_DIR_RAW")
 HUD_HOME_RAW="${AGY_HUD_HOME:-$CLI_DIR/agy-hud}"
 HUD_HOME=$(expand_tilde "$HUD_HOME_RAW")
+
+if [ "${1:-}" = "--uninstall" ] || [ "${1:-}" = "uninstall" ]; then
+  shift
+  if [ -x "$HUD_HOME/bin/agy-hud" ]; then
+    printf '==> Running native agy-hud clean uninstaller...\n'
+    "$HUD_HOME/bin/agy-hud" uninstall --plugin "$@"
+    printf '==> agy-hud has been cleanly uninstalled and official defaults restored.\n'
+    exit 0
+  fi
+  if [ "${AGY_SKIP_PLUGIN_INSTALL:-0}" != "1" ] && command -v agy >/dev/null 2>&1; then
+    agy plugin uninstall agy-hud >/dev/null 2>&1 || true
+  fi
+  if [ -d "$HUD_HOME" ] && [ "$HUD_HOME" != "$CLI_DIR" ] && [ "$HUD_HOME" != "$HOME" ]; then
+    rm -rf "$HUD_HOME"
+  fi
+  printf '==> agy-hud directory cleaned.\n'
+  exit 0
+fi
 
 detect_platform() {
   os_raw=$(uname -s 2>/dev/null || echo unknown)
@@ -117,6 +136,9 @@ if [ ! -f "$EXTRACTED_PLUGIN/plugin.json" ] || [ ! -f "$BIN_IN_BUNDLE" ]; then
   exit 1
 fi
 chmod 0755 "$BIN_IN_BUNDLE" "$EXTRACTED_PLUGIN/scripts/agy-hud" "$EXTRACTED_PLUGIN/skills/hud/scripts/hud-cli.sh"
+if [ -f "$EXTRACTED_PLUGIN/uninstall.sh" ]; then
+  chmod 0755 "$EXTRACTED_PLUGIN/uninstall.sh"
+fi
 
 mkdir -p "$CLI_DIR" "$HUD_HOME"
 chmod 0700 "$CLI_DIR" "$HUD_HOME" 2>/dev/null || true
@@ -127,13 +149,20 @@ mv "$EXTRACTED_PLUGIN" "${PLUGIN_STAGE}.next"
 rm -rf "$PLUGIN_STAGE"
 mv "${PLUGIN_STAGE}.next" "$PLUGIN_STAGE"
 
+PLUGIN_FLAG=""
 if [ "${AGY_SKIP_PLUGIN_INSTALL:-0}" != "1" ] && command -v agy >/dev/null 2>&1; then
   printf '==> Registering Antigravity plugin (/hud skill)...\n'
-  if ! agy plugin install "$PLUGIN_STAGE"; then
+  if agy plugin install "$PLUGIN_STAGE"; then
+    PLUGIN_FLAG="--plugin-installed"
+  else
     printf 'Warning: `agy plugin install` returned non-zero; continuing with statusLine binary deployment.\n' >&2
   fi
 fi
 
 printf '==> Deploying native agy-hud statusLine binary...\n'
-"$PLUGIN_STAGE/scripts/bin/$PLATFORM/agy-hud" install "$@"
+if [ -n "$PLUGIN_FLAG" ]; then
+  "$PLUGIN_STAGE/scripts/bin/$PLATFORM/agy-hud" install "$PLUGIN_FLAG" "$@"
+else
+  "$PLUGIN_STAGE/scripts/bin/$PLATFORM/agy-hud" install "$@"
+fi
 printf '==> Done! Launch `agy` and try `/hud` anytime.\n'

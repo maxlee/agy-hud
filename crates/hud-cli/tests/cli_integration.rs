@@ -442,11 +442,20 @@ fn full_binary_cli_lifecycle_install_render_doctor_set_undo_report_uninstall() {
         serde_json::from_str(&fs::read_to_string(hud_home.join("config.json")).unwrap()).unwrap();
     assert!(cfg_after_undo.get("language").is_none());
 
-    // 8. uninstall restores previous foreign statusLine cleanly
+    // 8. uninstall restores previous foreign statusLine AND removes hud_home + tracked backups cleanly!
+    let backup_from_install = PathBuf::from(inst_json["backupPath"].as_str().unwrap());
+    assert!(backup_from_install.exists());
     let (ok_uninst, uninst_out) = run_bin(&["uninstall"], &env_vars, None);
     assert!(ok_uninst);
     let uninst_json: Value = serde_json::from_str(&uninst_out).unwrap();
     assert_eq!(uninst_json["restoredPrevious"], true);
+    assert_eq!(uninst_json["statusLineAction"], "restored-previous");
+    assert_eq!(uninst_json["removedBackups"], 1);
+    assert!(!backup_from_install.exists());
+    assert!(
+        !hud_home.exists(),
+        "hud_home must be completely removed on default clean uninstall"
+    );
     let restored_settings: Value =
         serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
     assert!(
@@ -456,7 +465,73 @@ fn full_binary_cli_lifecycle_install_render_doctor_set_undo_report_uninstall() {
             .contains("custom-bar.sh")
     );
 
-    // 9. AGY_HUD_DISABLE=1 suppresses render output cleanly
+    // 9. Running `doctor` after clean uninstall must NOT recreate `hud_home`!
+    let (ok_doc_after, doc_after_out) = run_bin(&["doctor"], &env_vars, None);
+    assert!(ok_doc_after);
+    assert!(
+        !hud_home.exists(),
+        "read-only `doctor` must not recreate hud_home after uninstall"
+    );
+    let doc_after_json: Value = serde_json::from_str(&doc_after_out).unwrap();
+    assert_eq!(doc_after_json["statusLine"]["kind"], "other");
+
+    // 10. Official-default lifecycle: install `--stack` on clean settings.json -> uninstall restores pure official default with zero leftover files!
+    let clean_cli_dir = tmp.path.join("clean-official-cli");
+    let clean_hud_home = clean_cli_dir.join("agy-hud");
+    let clean_settings_path = clean_cli_dir.join("settings.json");
+    fs::create_dir_all(&clean_cli_dir).unwrap();
+    fs::write(
+        &clean_settings_path,
+        serde_json::to_string_pretty(&json!({
+            "colorScheme": "solarized",
+            "vimMode": true
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let clean_env: [(&str, &Path); 2] = [
+        ("AGY_CLI_DIR", clean_cli_dir.as_path()),
+        ("AGY_HUD_HOME", clean_hud_home.as_path()),
+    ];
+    let (ok_clean_inst, _) = run_bin(&["install", "--stack"], &clean_env, None);
+    assert!(ok_clean_inst);
+    assert!(clean_hud_home.exists());
+
+    // Test `--keep-config` first, then full clean `uninstall`
+    let _ = run_bin(&["set", "language=zh-Hans"], &clean_env, None);
+    let (ok_keep_uninst, keep_out) = run_bin(&["uninstall", "--keep-config"], &clean_env, None);
+    assert!(ok_keep_uninst);
+    let keep_json: Value = serde_json::from_str(&keep_out).unwrap();
+    assert_eq!(keep_json["statusLineAction"], "restored-official-default");
+    assert_eq!(keep_json["keptConfig"], true);
+    assert!(clean_hud_home.join("config.json").exists());
+    assert!(!clean_hud_home.join("bin").exists());
+
+    // Now run full clean uninstall: `settings.json` has zero `statusLine` key, all user keys intact, and `clean_cli_dir` has ONLY `settings.json`!
+    let (ok_full_uninst, _) = run_bin(&["uninstall"], &clean_env, None);
+    assert!(ok_full_uninst);
+    assert!(!clean_hud_home.exists());
+    let final_official_settings: Value =
+        serde_json::from_str(&fs::read_to_string(&clean_settings_path).unwrap()).unwrap();
+    assert_eq!(
+        final_official_settings,
+        json!({
+            "colorScheme": "solarized",
+            "vimMode": true
+        })
+    );
+    let remaining_entries: Vec<String> = fs::read_dir(&clean_cli_dir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(
+        remaining_entries,
+        vec!["settings.json".to_string()],
+        "cli_dir must have zero leftover backups or agy-hud directories after clean uninstall"
+    );
+
+    // 11. AGY_HUD_DISABLE=1 suppresses render output cleanly
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_agy-hud"));
     cmd.env("AGY_CLI_DIR", &cli_dir)
         .env("AGY_HUD_HOME", &hud_home)

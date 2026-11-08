@@ -1,4 +1,4 @@
-# AGY HUD (`agy-hud`) v1.0.0 — 100% 纯 Rust 极速版指南
+# AGY HUD (`agy-hud`) v1.0.1 — 100% 纯 Rust 极速版指南
 
 [![CI](https://github.com/maxlee/agy-hud/actions/workflows/ci.yml/badge.svg)](https://github.com/maxlee/agy-hud/actions/workflows/ci.yml)
 [![Release](https://github.com/maxlee/agy-hud/actions/workflows/release.yml/badge.svg)](https://github.com/maxlee/agy-hud/releases)
@@ -65,7 +65,13 @@ agy plugin install .
 ./target/release/agy-hud install
 ```
 
-如需恢复默认状态栏，输入 `/statusline delete` 或运行 `~/.gemini/antigravity-cli/agy-hud/bin/agy-hud uninstall`。
+如需彻底卸载并恢复官方默认状态栏，可随时执行一行卸载命令（自动移除 `settings.json` 中的 `statusLine` 以恢复 `agy` 官方默认配置、保留其余所有用户设置、清理安装备份文件、注销 `agy-hud` 插件并删除 `~/.gemini/antigravity-cli/agy-hud` 目录，零残留）：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/maxlee/agy-hud/main/uninstall.sh | sh
+```
+
+（离线环境也可直接执行 `~/.gemini/antigravity-cli/agy-hud/bin/agy-hud uninstall --plugin`；若希望仅卸载但保留个性化 `config.json`，追加 `--keep-config` 即可。）
 
 ## 常用管理命令
 

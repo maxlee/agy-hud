@@ -7,7 +7,7 @@ use hud_cli::collector::{
 use hud_cli::install::{install_status_line, uninstall_status_line};
 use hud_cli::paths::{
     AgyPaths, atomic_write_bytes, build_logic_paths, canonical_or_parent, derive_task_md_path,
-    prepare_data_dir, undo_config, write_config_with_undo,
+    existing_data_dir, prepare_data_dir, undo_config, write_config_with_undo,
 };
 use hud_core::ansi::terminal_filter;
 use hud_core::commands::{CommandContext, execute_subcommand};
@@ -30,7 +30,7 @@ const HELP_LINES: &[&str] = &[
     "  agy-hud                                 (statusLine mode: reads JSON from stdin)",
     "  agy-hud doctor                          Check setup, binary, settings.json, and health",
     "  agy-hud install [--replace] [--stack]   Deploy native binary & configure settings.json",
-    "  agy-hud uninstall                       Remove agy-hud statusLine (or restore previous)",
+    "  agy-hud uninstall [--keep-config] [--reset-default]  Cleanly remove HUD & restore official default",
     "  agy-hud preview [options]               Render live previews (--state showcase|idle|tool_use|confirm|high-context, --width N, --set k=v, --last)",
     "  agy-hud schema [query]                  List configurable HUD keys and descriptions",
     "  agy-hud set <k=v...>|--undo             Update or undo HUD configuration",
@@ -144,7 +144,7 @@ fn run() -> u8 {
     }
 
     if sub == Some("uninstall") {
-        match uninstall_status_line(&paths) {
+        match uninstall_status_line(&paths, &argv[1..]) {
             Ok(report) => {
                 let pretty = serde_json::to_string_pretty(&report).unwrap_or_default();
                 let lines: Vec<&str> = pretty.lines().collect();
@@ -176,7 +176,7 @@ fn run() -> u8 {
 
     if let Some(cmd_name) = sub {
         let now_ms = now_epoch_ms();
-        let data_real = prepare_data_dir(&paths);
+        let data_real = existing_data_dir(&paths);
         let logic_paths = build_logic_paths(&paths, None, data_real.as_deref());
         let plugin_root = resolve_plugin_root(&current_exe, &paths);
 

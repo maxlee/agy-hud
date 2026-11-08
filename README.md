@@ -1,4 +1,4 @@
-# AGY HUD (`agy-hud`) v1.0.0 — 100% Pure Rust Edition
+# AGY HUD (`agy-hud`) v1.0.1 — 100% Pure Rust Edition
 
 [![CI](https://github.com/maxlee/agy-hud/actions/workflows/ci.yml/badge.svg)](https://github.com/maxlee/agy-hud/actions/workflows/ci.yml)
 [![Release](https://github.com/maxlee/agy-hud/actions/workflows/release.yml/badge.svg)](https://github.com/maxlee/agy-hud/releases)
@@ -78,8 +78,18 @@ Once installed (`~/.gemini/antigravity-cli/agy-hud/bin/agy-hud` or `./scripts/ag
 ./scripts/agy-hud set vcs.cacheTtlMs=1500                   # Tune sharded VCS mtime+TTL cache window (0 disables)
 ./scripts/agy-hud set --undo                                # Revert the previous config change
 ./scripts/agy-hud report --note "Describe issue"            # Generate privacy-scrubbed bug report JSON
-./scripts/agy-hud uninstall                                 # Remove statusLine (or restore previous script)
+./scripts/agy-hud uninstall                                 # Cleanly remove HUD, plugin & files; restore official default
 ```
+
+### Clean Uninstall (Zero Residue & Restore Official Default)
+
+Uninstall at any time with one command — removes `"statusLine"` from `~/.gemini/antigravity-cli/settings.json` (restoring Antigravity CLI's official default status bar while preserving all other settings), cleans tracked `.bak.*` backups, unregisters the `agy-hud` plugin, and deletes `~/.gemini/antigravity-cli/agy-hud`:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/maxlee/agy-hud/main/uninstall.sh | sh
+```
+
+(Or offline: `~/.gemini/antigravity-cli/agy-hud/bin/agy-hud uninstall --plugin`. Add `--keep-config` if you wish to retain `config.json`.)
 
 Disable the HUD for a single terminal session without changing `settings.json`:
 
