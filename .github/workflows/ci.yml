@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: Test & Lint (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Rust build cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Strict Clippy lints
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Run workspace unit, integration, and arch_guard tests
+        run: cargo test --workspace
+
+      - name: Build release binary & verify showcase render
+        run: |
+          cargo build --release
+          ./target/release/agy-hud --version
+          ./target/release/agy-hud preview --state showcase >/dev/null

@@ -465,7 +465,11 @@ pub fn parse_transcript_and_tasks(
                 {
                     let name = {
                         let t = unwrap_arg_value(a.get("TypeName"));
-                        if t.is_empty() { "subagent".to_string() } else { t }
+                        if t.is_empty() {
+                            "subagent".to_string()
+                        } else {
+                            t
+                        }
                     };
                     let role = {
                         let r = unwrap_arg_value(a.get("Role"));
@@ -596,7 +600,9 @@ mod tests {
     #[test]
     fn unwrap_arg_value_decodes_double_serialized_strings() {
         assert_eq!(
-            unwrap_arg_value(Some(&json!("\"/Users/max/.gemini/config/skills/hud/SKILL.md\""))),
+            unwrap_arg_value(Some(&json!(
+                "\"/Users/max/.gemini/config/skills/hud/SKILL.md\""
+            ))),
             "/Users/max/.gemini/config/skills/hud/SKILL.md"
         );
         assert_eq!(unwrap_arg_value(Some(&json!("plain-value"))), "plain-value");
@@ -605,7 +611,10 @@ mod tests {
 
     #[test]
     fn parse_iso_ms_handles_utc_fractional_and_offsets() {
-        assert_eq!(parse_iso_ms("2026-11-08T13:00:00Z"), Some(1_794_142_800_000));
+        assert_eq!(
+            parse_iso_ms("2026-11-08T13:00:00Z"),
+            Some(1_794_142_800_000)
+        );
         assert_eq!(
             parse_iso_ms("2026-11-08T21:00:00.250+08:00"),
             Some(1_794_142_800_250)
@@ -682,10 +691,18 @@ mod tests {
         assert_eq!(summary.tools[0].status, ToolStatus::Running);
         assert_eq!(summary.tools[0].target.as_deref(), Some("Run unit tests"));
 
-        let err_tool = summary.tools.iter().find(|t| t.name == "call_mcp_tool").unwrap();
+        let err_tool = summary
+            .tools
+            .iter()
+            .find(|t| t.name == "call_mcp_tool")
+            .unwrap();
         assert_eq!(err_tool.status, ToolStatus::Error);
 
-        let read_tool = summary.tools.iter().find(|t| t.name == "read_file").unwrap();
+        let read_tool = summary
+            .tools
+            .iter()
+            .find(|t| t.name == "read_file")
+            .unwrap();
         assert_eq!(read_tool.count, 2);
         assert_eq!(read_tool.target, None);
 

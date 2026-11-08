@@ -2,7 +2,10 @@ use crate::ansi::sanitize_text;
 use crate::types::{AgyStdinData, MemoryProbeInfo, ProbeAnswers, VcsProbeInfo, VcsType};
 
 /// Merges `stdin.vcs` metadata from `agy` CLI with optional rich VCS probe JSON from `hud-cli`.
-pub fn parse_vcs_info(stdin: Option<&AgyStdinData>, answers: &ProbeAnswers) -> Option<VcsProbeInfo> {
+pub fn parse_vcs_info(
+    stdin: Option<&AgyStdinData>,
+    answers: &ProbeAnswers,
+) -> Option<VcsProbeInfo> {
     if let Some(raw_json) = answers.vcs.as_deref()
         && let Ok(mut parsed) = serde_json::from_str::<VcsProbeInfo>(raw_json)
     {
@@ -125,7 +128,10 @@ pub fn parse_git_porcelain_v2(stdout: &str, detached_rev: Option<&str>) -> Optio
 
 /// Parses strictly read-only Jujutsu (`jj log -r @`) delimiter-framed output.
 pub fn parse_jj_probe_output(stdout: &str) -> Option<VcsProbeInfo> {
-    let trimmed = stdout.strip_suffix("\r\n").or_else(|| stdout.strip_suffix('\n')).unwrap_or(stdout);
+    let trimmed = stdout
+        .strip_suffix("\r\n")
+        .or_else(|| stdout.strip_suffix('\n'))
+        .unwrap_or(stdout);
     if trimmed.is_empty() || trimmed.contains('\n') || trimmed.contains('\r') {
         return None;
     }

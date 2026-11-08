@@ -1,8 +1,6 @@
 use crate::paths::{AgyPaths, atomic_write_bytes, canonical_or_parent, create_private_dir_all};
 use hud_core::config::HudConfig;
-use hud_core::probes::{
-    parse_git_porcelain_v2, parse_hg_probe_output, parse_jj_probe_output,
-};
+use hud_core::probes::{parse_git_porcelain_v2, parse_hg_probe_output, parse_jj_probe_output};
 use hud_core::transcript::parse_transcript_and_tasks;
 use hud_core::types::{
     AgyStdinData, LogicPaths, MemoryProbeInfo, ProbeAnswers, TranscriptSummary, VcsProbeInfo,
@@ -139,7 +137,10 @@ pub fn read_transcript_slices(path: &Path) -> (Option<String>, Option<String>) {
     }
     let tail_cap = (meta.len() - offset) as usize;
     let mut tail_buf = Vec::with_capacity(tail_cap);
-    if f.take(TAIL_READ_BYTES + 1).read_to_end(&mut tail_buf).is_err() {
+    if f.take(TAIL_READ_BYTES + 1)
+        .read_to_end(&mut tail_buf)
+        .is_err()
+    {
         return (head_line, None);
     }
     let lossy = String::from_utf8_lossy(&tail_buf);

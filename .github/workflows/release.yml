@@ -1,0 +1,148 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build (${{ matrix.platform }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            target: aarch64-apple-darwin
+            platform: darwin-arm64
+            bin_name: agy-hud
+            archive_ext: tar.gz
+          - os: macos-14
+            target: x86_64-apple-darwin
+            platform: darwin-x64
+            bin_name: agy-hud
+            archive_ext: tar.gz
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            platform: linux-x64
+            bin_name: agy-hud
+            archive_ext: tar.gz
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            platform: linux-arm64
+            bin_name: agy-hud
+            archive_ext: tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            platform: windows-x64
+            bin_name: agy-hud.exe
+            archive_ext: zip
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Linux musl cross-compilation tools
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          if [ "${{ matrix.target }}" = "x86_64-unknown-linux-musl" ]; then
+            sudo apt-get install -y musl-tools
+          elif [ "${{ matrix.target }}" = "aarch64-unknown-linux-musl" ]; then
+            sudo apt-get install -y musl-tools gcc-aarch64-linux-gnu
+            echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
+          fi
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Rust build cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Run test suite on host targets
+        if: matrix.target == 'aarch64-apple-darwin' || matrix.target == 'x86_64-unknown-linux-musl' || matrix.target == 'x86_64-pc-windows-msvc'
+        run: cargo test --workspace --target ${{ matrix.target }}
+
+      - name: Build optimized release binary
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package Unix release tarball
+        if: matrix.archive_ext == 'tar.gz'
+        shell: bash
+        run: |
+          set -euo pipefail
+          STAGE="dist/agy-hud"
+          mkdir -p "$STAGE/scripts/bin/${{ matrix.platform }}"
+          cp plugin.json LICENSE README.md README.zh-CN.md ARCHITECTURE.md install.sh "$STAGE/"
+          cp -R assets skills "$STAGE/"
+          cp scripts/agy-hud "$STAGE/scripts/agy-hud"
+          cp "target/${{ matrix.target }}/release/${{ matrix.bin_name }}" "$STAGE/scripts/bin/${{ matrix.platform }}/${{ matrix.bin_name }}"
+          chmod 0755 \
+            "$STAGE/install.sh" \
+            "$STAGE/scripts/agy-hud" \
+            "$STAGE/skills/hud/scripts/hud-cli.sh" \
+            "$STAGE/scripts/bin/${{ matrix.platform }}/${{ matrix.bin_name }}"
+          tar -C dist -czf "dist/agy-hud-${{ matrix.platform }}.tar.gz" agy-hud
+
+      - name: Package Windows release zip
+        if: matrix.archive_ext == 'zip'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $Stage = "dist/agy-hud"
+          New-Item -ItemType Directory -Force -Path "$Stage/scripts/bin/${{ matrix.platform }}" | Out-Null
+          Copy-Item plugin.json, LICENSE, README.md, README.zh-CN.md, ARCHITECTURE.md, install.sh -Destination "$Stage/"
+          Copy-Item assets, skills -Destination "$Stage/" -Recurse
+          Copy-Item scripts/agy-hud -Destination "$Stage/scripts/agy-hud"
+          Copy-Item "target/${{ matrix.target }}/release/${{ matrix.bin_name }}" -Destination "$Stage/scripts/bin/${{ matrix.platform }}/${{ matrix.bin_name }}"
+          Compress-Archive -Path "$Stage" -DestinationPath "dist/agy-hud-${{ matrix.platform }}.zip" -Force
+
+      - name: Upload release archive artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.platform }}
+          path: dist/agy-hud-${{ matrix.platform }}.${{ matrix.archive_ext }}
+          if-no-files-found: error
+
+  publish:
+    name: Generate Checksums & Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all platform archives
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Generate SHA256SUMS
+        run: |
+          cd artifacts
+          sha256sum agy-hud-* | sort -k2 > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Upload combined artifacts + SHA256SUMS
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-bundle-all
+          path: artifacts/*
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true

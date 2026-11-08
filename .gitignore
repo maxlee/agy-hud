@@ -1,4 +1,5 @@
 /target/
+/scripts/bin/
 .DS_Store
 *.bak.*
 *.tmp

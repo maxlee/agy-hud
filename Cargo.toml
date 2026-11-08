@@ -10,6 +10,8 @@ version = "1.0.0"
 edition = "2024"
 license = "MIT"
 authors = ["Max"]
+homepage = "https://github.com/maxlee/agy-hud"
+repository = "https://github.com/maxlee/agy-hud"
 
 [workspace.dependencies]
 serde = { version = "1.0", features = ["derive"] }

@@ -5,8 +5,8 @@ use crate::ansi::{
 use crate::config::HudConfig;
 use crate::i18n::{Labels, get_labels};
 use crate::stdin::{
-    extract_context_metrics, extract_quota_buckets, format_compact_tokens,
-    format_duration_seconds, format_model_name, format_workspace_path,
+    extract_context_metrics, extract_quota_buckets, format_compact_tokens, format_duration_seconds,
+    format_model_name, format_workspace_path,
 };
 use crate::types::{
     AgyStdinData, ContextValueMode, LineLayout, MemoryProbeInfo, ModelFormatMode, PathLevels,
@@ -32,8 +32,14 @@ fn dot() -> String {
 }
 
 fn render_state_badge(stdin: Option<&AgyStdinData>, labels: &Labels) -> String {
-    if stdin.and_then(|s| s.tool_confirmation_pending).unwrap_or(false) {
-        return paint(&format!("⚠ {}", labels.state.confirm), &[colors::BRIGHT_YELLOW, BOLD]);
+    if stdin
+        .and_then(|s| s.tool_confirmation_pending)
+        .unwrap_or(false)
+    {
+        return paint(
+            &format!("⚠ {}", labels.state.confirm),
+            &[colors::BRIGHT_YELLOW, BOLD],
+        );
     }
     let state = stdin
         .and_then(|s| s.agent_state.as_deref())
@@ -41,7 +47,10 @@ fn render_state_badge(stdin: Option<&AgyStdinData>, labels: &Labels) -> String {
         .to_ascii_lowercase();
 
     match state.as_str() {
-        "idle" => paint(&format!("● {}", labels.state.idle), &[colors::BRIGHT_GREEN, BOLD]),
+        "idle" => paint(
+            &format!("● {}", labels.state.idle),
+            &[colors::BRIGHT_GREEN, BOLD],
+        ),
         "thinking" => paint(
             &format!("◆ {}", labels.state.thinking),
             &[colors::BRIGHT_YELLOW, BOLD],
@@ -66,7 +75,10 @@ fn render_state_badge(stdin: Option<&AgyStdinData>, labels: &Labels) -> String {
             &format!("◌ {}", labels.state.initializing),
             &[colors::CYAN, BOLD],
         ),
-        "error" => paint(&format!("✖ {}", labels.state.error), &[colors::BRIGHT_RED, BOLD]),
+        "error" => paint(
+            &format!("✖ {}", labels.state.error),
+            &[colors::BRIGHT_RED, BOLD],
+        ),
         other => {
             let clean = sanitize_text(other).to_ascii_uppercase();
             let text = if clean.is_empty() {
@@ -163,7 +175,10 @@ fn render_vcs_segment(vcs: Option<&VcsProbeInfo>, config: &HudConfig) -> String 
         }
     }
     if vcs.conflicts > 0 {
-        extras.push(paint(&format!("!{}", vcs.conflicts), &[colors::BRIGHT_RED, BOLD]));
+        extras.push(paint(
+            &format!("!{}", vcs.conflicts),
+            &[colors::BRIGHT_RED, BOLD],
+        ));
     }
     if config.vcs.show_file_stats {
         let mut stats = Vec::new();
@@ -203,7 +218,10 @@ fn render_context_segment(
 ) -> String {
     let metrics = extract_context_metrics(stdin);
     let pct_str = format!("{:.1}%", metrics.used_percent);
-    let rem_str = format!("{:.1}% {}", metrics.remaining_percent, labels.metrics.remaining);
+    let rem_str = format!(
+        "{:.1}% {}",
+        metrics.remaining_percent, labels.metrics.remaining
+    );
     let tok_str = match (metrics.used_tokens, metrics.window_size) {
         (Some(u), Some(w)) => Some(format!(
             "{}/{}",
@@ -224,13 +242,12 @@ fn render_context_segment(
         ContextValueMode::Percent => pct_str,
     };
 
-    let bar_len = if config.line_layout == LineLayout::Adaptive
-        && effective_width.is_some_and(|w| w < 120)
-    {
-        config.display.bar_length.min(8)
-    } else {
-        config.display.bar_length
-    };
+    let bar_len =
+        if config.line_layout == LineLayout::Adaptive && effective_width.is_some_and(|w| w < 120) {
+            config.display.bar_length.min(8)
+        } else {
+            config.display.bar_length
+        };
 
     let warn_at = config.display.context_warning_threshold as f64;
     let crit_at = config.display.context_critical_threshold as f64;
@@ -264,7 +281,10 @@ fn render_context_segment(
         String::new()
     };
 
-    let cache_part = match (config.display.show_cache_hit_rate, metrics.cache_hit_percent) {
+    let cache_part = match (
+        config.display.show_cache_hit_rate,
+        metrics.cache_hit_percent,
+    ) {
         (true, Some(hit)) => format!(
             "{}{}",
             dot(),
@@ -298,13 +318,12 @@ fn render_quota_segment(
         return String::new();
     }
 
-    let mini_len = if config.line_layout == LineLayout::Adaptive
-        && effective_width.is_some_and(|w| w < 120)
-    {
-        5
-    } else {
-        ((config.display.bar_length as f64 * 0.65).floor() as usize).max(5)
-    };
+    let mini_len =
+        if config.line_layout == LineLayout::Adaptive && effective_width.is_some_and(|w| w < 120) {
+            5
+        } else {
+            ((config.display.bar_length as f64 * 0.65).floor() as usize).max(5)
+        };
 
     let rendered: Vec<String> = buckets
         .into_iter()
@@ -323,14 +342,20 @@ fn render_quota_segment(
                     QuotaValueMode::Used => format!("{:.0}%", used),
                 };
                 let mini_bar = if config.display.quota_bar_enabled {
-                    format!("{} ", render_bar(used, mini_len, 70.0, 90.0, colors::BRIGHT_CYAN))
+                    format!(
+                        "{} ",
+                        render_bar(used, mini_len, 70.0, 90.0, colors::BRIGHT_CYAN)
+                    )
                 } else {
                     String::new()
                 };
                 let reset = match (config.display.show_quota_reset, b.reset_in_seconds) {
                     (true, Some(sec)) => format!(
                         " {}",
-                        paint(&format!("({})", format_duration_seconds(sec)), &[colors::GRAY])
+                        paint(
+                            &format!("({})", format_duration_seconds(sec)),
+                            &[colors::GRAY]
+                        )
                     ),
                     _ => String::new(),
                 };
@@ -376,7 +401,11 @@ fn render_counts_and_meta(
         && let Some(usd) = cost.total_usd
         && usd.is_finite()
     {
-        let prefix = if cost.estimated.unwrap_or(false) { "~" } else { "" };
+        let prefix = if cost.estimated.unwrap_or(false) {
+            "~"
+        } else {
+            ""
+        };
         items.push(paint(&format!("{prefix}${usd:.2}"), &[colors::YELLOW]));
     }
 
@@ -455,7 +484,9 @@ fn render_counts_and_meta(
     }
 
     if config.display.show_sandbox
-        && let Some(enabled) = stdin.and_then(|s| s.sandbox.as_ref()).and_then(|sb| sb.enabled)
+        && let Some(enabled) = stdin
+            .and_then(|s| s.sandbox.as_ref())
+            .and_then(|sb| sb.enabled)
     {
         if enabled {
             items.push(paint(
@@ -566,7 +597,10 @@ fn render_subagents_line(
             };
             let title = match ag.role.as_deref() {
                 Some(role) if !role.is_empty() => {
-                    format!("{role} {}", paint(&format!("[{}]", ag.name), &[colors::GRAY]))
+                    format!(
+                        "{role} {}",
+                        paint(&format!("[{}]", ag.name), &[colors::GRAY])
+                    )
                 }
                 _ => ag.name.clone(),
             };
@@ -576,7 +610,10 @@ fn render_subagents_line(
                     format!(
                         " {}",
                         paint(
-                            &format!("({})", format_duration_seconds(((end - start) as f64) / 1000.0)),
+                            &format!(
+                                "({})",
+                                format_duration_seconds(((end - start) as f64) / 1000.0)
+                            ),
                             &[colors::GRAY],
                         )
                     )
@@ -617,7 +654,12 @@ fn render_todos_line(
         .todos
         .iter()
         .find(|t| t.status == TodoStatus::InProgress)
-        .or_else(|| transcript.todos.iter().find(|t| t.status == TodoStatus::Pending));
+        .or_else(|| {
+            transcript
+                .todos
+                .iter()
+                .find(|t| t.status == TodoStatus::Pending)
+        });
 
     let Some(active) = active else {
         return Some(format!(
@@ -789,13 +831,22 @@ pub fn render_hud_lines(input: RenderInput<'_>) -> Vec<String> {
 
     // Metrics segments
     let mut metrics_parts: Vec<String> = Vec::new();
-    metrics_parts.push(render_context_segment(stdin, config, labels, effective_width));
+    metrics_parts.push(render_context_segment(
+        stdin,
+        config,
+        labels,
+        effective_width,
+    ));
     let quota_seg = render_quota_segment(
         stdin,
         config,
         labels,
         effective_width,
-        if layout_mode == LineLayout::Compact { 1 } else { 2 },
+        if layout_mode == LineLayout::Compact {
+            1
+        } else {
+            2
+        },
     );
     if !quota_seg.is_empty() {
         metrics_parts.push(quota_seg);
@@ -879,7 +930,10 @@ pub fn render_hud_lines(input: RenderInput<'_>) -> Vec<String> {
                 vec![wide_line]
             } else {
                 join_with_rail(
-                    [line1, line2].into_iter().filter(|s| !s.is_empty()).collect(),
+                    [line1, line2]
+                        .into_iter()
+                        .filter(|s| !s.is_empty())
+                        .collect(),
                     true,
                 )
             }

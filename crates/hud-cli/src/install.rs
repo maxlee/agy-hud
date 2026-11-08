@@ -64,6 +64,7 @@ fn file_mode_or_default(path: &Path, default_mode: u32) -> u32 {
             return st.permissions().mode() & 0o777;
         }
     }
+    let _ = path;
     default_mode
 }
 
@@ -87,7 +88,10 @@ pub fn install_status_line(
     create_private_dir_all(&paths.bin_dir).map_err(|e| e.to_string())?;
 
     let mut settings = read_json_object_or_empty(&paths.cli_settings_path)?;
-    let existing_sl = settings.get("statusLine").and_then(Value::as_object).cloned();
+    let existing_sl = settings
+        .get("statusLine")
+        .and_then(Value::as_object)
+        .cloned();
     let current_cmd = existing_sl
         .as_ref()
         .and_then(|m| m.get("command"))
@@ -127,7 +131,11 @@ pub fn install_status_line(
         "pluginRoot": canonical_or_parent(plugin_root).to_string_lossy(),
     }))
     .unwrap_or_default();
-    let _ = atomic_write_bytes(&paths.hud_home.join("install-meta.json"), &meta_bytes, 0o600);
+    let _ = atomic_write_bytes(
+        &paths.hud_home.join("install-meta.json"),
+        &meta_bytes,
+        0o600,
+    );
 
     let mut backup_path: Option<String> = None;
     if paths.cli_settings_path.exists() {

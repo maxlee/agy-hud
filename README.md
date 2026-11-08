@@ -1,10 +1,14 @@
 # AGY HUD (`agy-hud`) v1.0.0 — 100% Pure Rust Edition
 
+[![CI](https://github.com/maxlee/agy-hud/actions/workflows/ci.yml/badge.svg)](https://github.com/maxlee/agy-hud/actions/workflows/ci.yml)
+[![Release](https://github.com/maxlee/agy-hud/actions/workflows/release.yml/badge.svg)](https://github.com/maxlee/agy-hud/releases)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
 Ultra-fast, native **100% Pure Rust** real-time heads-up display (HUD) plugin for **Google Antigravity CLI (`agy`)**, inspired by [`jarrodwatts/claude-hud`](https://github.com/jarrodwatts/claude-hud).
 
 Displays live agent state, execution mode (`PLAN` / `AUTO` / `ACCEPT` + Vim mode), model & reasoning effort, workspace + multi-VCS status (`git` + worktrees, Jujutsu `jj` bookmarks/change-IDs/conflicts, Mercurial `hg`), fine-grained context window bar, prompt cache hit rate, quota buckets & reset timers, active tools, running subagents, and `task.md` checklist progress right below your CLI prompt — with **~3 ms internal execution time** (`~11–14 ms` end-to-end process wall-clock) and **zero Node.js dependencies**.
 
-> 🌐 English | [简体中文文档](README.zh-CN.md) | [Architecture](ARCHITECTURE.md)
+> 🌐 English | [简体中文文档](README.zh-CN.md) | [Architecture](ARCHITECTURE.md) | [Releases](https://github.com/maxlee/agy-hud/releases)
 
 ## Preview
 
@@ -19,45 +23,62 @@ Displays live agent state, execution mode (`PLAN` / `AUTO` / `ACCEPT` + Vim mode
 ## Requirements
 
 - **Antigravity CLI (`agy`)** v1.4.5+
-- **Rust / Cargo** (`rustc` 1.85+ if building from source; prebuilt `scripts/bin/agy-hud` included)
-- **Zero Node.js / npm runtime required**
+- **Zero Rust / Node.js / npm required** when installing prebuilt binaries via `install.sh` or [GitHub Releases](https://github.com/maxlee/agy-hud/releases) (`rustc` 1.85+ only needed if building from source)
 
 ## Quick Install
 
-### Option A: Install as an Antigravity Plugin + Deploy Native Binary
+### Option A: One-Line Prebuilt Binary + Plugin Install (Recommended)
+
+Automatically detects your OS (`macOS` Apple Silicon / Intel, `Linux` x64 / ARM64), verifies the SHA-256 checksum against `SHA256SUMS`, registers the `/hud` skill plugin, deploys the native binary to `~/.gemini/antigravity-cli/agy-hud/bin/agy-hud`, and configures `settings.json`:
 
 ```bash
-# 1. Build (optional if scripts/bin/agy-hud is already built for your platform)
-cargo build --release && cp target/release/agy-hud scripts/bin/agy-hud
+curl -fsSL https://raw.githubusercontent.com/maxlee/agy-hud/main/install.sh | sh
+```
 
-# 2. Validate & install the plugin into Antigravity
-agy plugin validate --strict /path/to/agy-hud
-agy plugin install /path/to/agy-hud
+Need to stack below the built-in status line or replace an existing custom `statusLine`? Pass flags via `sh -s --`:
 
-# 3. Deploy native binary to ~/.gemini/antigravity-cli/agy-hud/bin/agy-hud & update settings.json
-/path/to/agy-hud/scripts/bin/agy-hud install
+```bash
+curl -fsSL https://raw.githubusercontent.com/maxlee/agy-hud/main/install.sh | sh -s -- --stack
 ```
 
 Inside `agy` CLI, run `/hud` anytime to customize layouts, language, or elements interactively, or `/statusline` to toggle the bar on/off.
 
-### Option B: Direct `/statusline` Command Inside `agy` TUI
+### Option B: Prebuilt Release Archives (macOS / Linux / Windows)
 
-```text
-/statusline /path/to/agy-hud/scripts/bin/agy-hud
+Download the archive for your platform from [**GitHub Releases**](https://github.com/maxlee/agy-hud/releases/latest):
+
+| Platform | Archive | Target Triple |
+| :--- | :--- | :--- |
+| macOS (Apple Silicon) | `agy-hud-darwin-arm64.tar.gz` | `aarch64-apple-darwin` |
+| macOS (Intel) | `agy-hud-darwin-x64.tar.gz` | `x86_64-apple-darwin` |
+| Linux (x64, static musl) | `agy-hud-linux-x64.tar.gz` | `x86_64-unknown-linux-musl` |
+| Linux (ARM64, static musl) | `agy-hud-linux-arm64.tar.gz` | `aarch64-unknown-linux-musl` |
+| Windows (x64) | `agy-hud-windows-x64.zip` | `x86_64-pc-windows-msvc` |
+
+### Option C: Build from Source (`git clone` + `cargo`)
+
+```bash
+git clone https://github.com/maxlee/agy-hud.git
+cd agy-hud
+cargo build --release
+agy plugin install .
+./target/release/agy-hud install
 ```
 
 ## CLI Subcommands
 
+Once installed (`~/.gemini/antigravity-cli/agy-hud/bin/agy-hud` or `./scripts/agy-hud` inside a checkout):
+
 ```bash
-scripts/bin/agy-hud doctor                                    # Check setup, native binary, heartbeat, and config
-scripts/bin/agy-hud preview --state showcase                  # Preview all 5 layout/language scenarios
-scripts/bin/agy-hud preview --set language=zh-Hans            # Preview Simplified Chinese UI
-scripts/bin/agy-hud schema                                    # List all 38 configurable keys and types
-scripts/bin/agy-hud set language=zh-Hans vcs.showFileStats=true
-scripts/bin/agy-hud set vcs.cacheTtlMs=1500                   # Tune sharded VCS mtime+TTL cache window (0 disables)
-scripts/bin/agy-hud set --undo                                # Revert the previous config change
-scripts/bin/agy-hud report --note "Describe issue"            # Generate privacy-scrubbed bug report JSON
-scripts/bin/agy-hud uninstall                                 # Remove statusLine (or restore previous script)
+./scripts/agy-hud doctor                                    # Check setup, native binary, heartbeat, and config
+./scripts/agy-hud preview --state showcase                  # Preview all 5 layout/language scenarios
+./scripts/agy-hud preview --set language=zh-Hans            # Preview Simplified Chinese UI
+./scripts/agy-hud schema                                    # List all 38 configurable keys and types
+./scripts/agy-hud set language=zh-Hans vcs.showFileStats=true
+./scripts/agy-hud set vcs.cacheTtlMs=1500                   # Tune sharded VCS mtime+TTL cache window (0 disables)
+./scripts/agy-hud set --undo                                # Revert the previous config change
+./scripts/agy-hud report --note "Describe issue"            # Generate privacy-scrubbed bug report JSON
+./scripts/agy-hud uninstall                                 # Remove statusLine (or restore previous script)
 ```
 
 Disable the HUD for a single terminal session without changing `settings.json`:
@@ -78,8 +99,13 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the full design:
 ## Development & Verification
 
 ```bash
-cargo test --workspace                                 # Unit, CLI e2e, Git filter canary, and arch_guard tests
+cargo fmt --all -- --check                             # Formatting check
 cargo clippy --workspace --all-targets -- -D warnings  # Strict zero-warning lint check
+cargo test --workspace                                 # Unit, CLI e2e, Git filter canary, and arch_guard tests
 cargo build --release                                  # LTO stripped native binary (~929 KB)
 agy plugin validate --strict .                         # Antigravity strict plugin schema check
 ```
+
+## License
+
+Released under the [MIT License](LICENSE).

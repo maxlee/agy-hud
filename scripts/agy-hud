@@ -1,0 +1,51 @@
+#!/bin/sh
+# Multi-platform native binary router for agy-hud (zero Node.js dependencies).
+set -eu
+
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+PLUGIN_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
+
+detect_platform() {
+  os_raw=$(uname -s 2>/dev/null || echo unknown)
+  arch_raw=$(uname -m 2>/dev/null || echo unknown)
+  case "$os_raw" in
+    Darwin) os="darwin" ;;
+    Linux)  os="linux" ;;
+    *)      os="unknown" ;;
+  esac
+  case "$arch_raw" in
+    arm64|aarch64) arch="arm64" ;;
+    x86_64|amd64)  arch="x64" ;;
+    *)             arch="unknown" ;;
+  esac
+  printf '%s-%s' "$os" "$arch"
+}
+
+PLATFORM=$(detect_platform)
+
+if [ -x "$PLUGIN_ROOT/scripts/bin/$PLATFORM/agy-hud" ]; then
+  exec "$PLUGIN_ROOT/scripts/bin/$PLATFORM/agy-hud" "$@"
+fi
+
+if [ -x "$PLUGIN_ROOT/scripts/bin/agy-hud" ]; then
+  exec "$PLUGIN_ROOT/scripts/bin/agy-hud" "$@"
+fi
+
+if [ -x "$PLUGIN_ROOT/target/release/agy-hud" ]; then
+  exec "$PLUGIN_ROOT/target/release/agy-hud" "$@"
+fi
+
+CLI_DIR="${AGY_CLI_DIR:-$HOME/.gemini/antigravity-cli}"
+HUD_HOME="${AGY_HUD_HOME:-$CLI_DIR/agy-hud}"
+if [ -x "$HUD_HOME/bin/agy-hud" ]; then
+  exec "$HUD_HOME/bin/agy-hud" "$@"
+fi
+
+if command -v cargo >/dev/null 2>&1 && [ -f "$PLUGIN_ROOT/Cargo.toml" ]; then
+  cargo build --release --manifest-path "$PLUGIN_ROOT/Cargo.toml" --quiet
+  exec "$PLUGIN_ROOT/target/release/agy-hud" "$@"
+fi
+
+printf '%s\n' "agy-hud: native binary not found for $PLATFORM and cargo is not installed." >&2
+printf '%s\n' "Install prebuilt release via: curl -fsSL https://raw.githubusercontent.com/maxlee/agy-hud/main/install.sh | sh" >&2
+exit 1

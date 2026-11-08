@@ -25,10 +25,8 @@ impl TempDir {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let dir = std::env::temp_dir().join(format!(
-            "agy-hud-{prefix}-{}-{nanos}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("agy-hud-{prefix}-{}-{nanos}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         Self { path: dir }
     }
@@ -40,12 +38,14 @@ impl Drop for TempDir {
     }
 }
 
-fn run_bin(args: &[&str], env_overrides: &[(&str, &Path)], stdin_data: Option<&str>) -> (bool, String) {
+fn run_bin(
+    args: &[&str],
+    env_overrides: &[(&str, &Path)],
+    stdin_data: Option<&str>,
+) -> (bool, String) {
     let bin = env!("CARGO_BIN_EXE_agy-hud");
     let mut cmd = Command::new(bin);
-    cmd.args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
     for (k, v) in env_overrides {
         cmd.env(k, v);
     }
@@ -68,14 +68,14 @@ fn run_bin(args: &[&str], env_overrides: &[(&str, &Path)], stdin_data: Option<&s
 
 #[test]
 fn derive_task_md_path_resolves_conversation_root_from_system_generated_logs() {
-    let tp = Path::new(
-        "/Users/dev/.gemini/antigravity-cli/brain/1234-5678/.system_generated/logs/transcript.jsonl",
-    );
+    let base = std::env::temp_dir().join("brain").join("1234-5678");
+    let tp = base
+        .join(".system_generated")
+        .join("logs")
+        .join("transcript.jsonl");
     assert_eq!(
-        derive_task_md_path(tp).as_deref(),
-        Some(Path::new(
-            "/Users/dev/.gemini/antigravity-cli/brain/1234-5678/task.md"
-        ))
+        derive_task_md_path(&tp).as_deref(),
+        Some(base.join("task.md").as_path())
     );
 }
 
@@ -205,11 +205,10 @@ fn jj_hg_and_git_probes_enforce_read_only_flags_and_neutralize_repo_local_git_fi
 
     if init_ok {
         // Plant a repo-local filter driver + .gitattributes that would create `canary_file` if executed
+        let canary_posix = canary_file.to_string_lossy().replace('\\', "/");
         let mut cfg_text = fs::read_to_string(repo_dir.join(".git/config")).unwrap_or_default();
         cfg_text.push_str(&format!(
-            "\n[filter \"evil\"]\n\tclean = touch '{}'\n\tsmudge = touch '{}'\n\trequired = true\n",
-            canary_file.display(),
-            canary_file.display()
+            "\n[filter \"evil\"]\n\tclean = touch '{canary_posix}'\n\tsmudge = touch '{canary_posix}'\n\trequired = true\n",
         ));
         fs::write(repo_dir.join(".git/config"), cfg_text).unwrap();
         fs::write(repo_dir.join(".gitattributes"), "*.txt filter=evil\n").unwrap();
@@ -271,10 +270,9 @@ fn sharded_vcs_cache_isolates_workspaces_and_invalidates_on_mtime_stdin_flip_and
     let t0 = 1_700_000_000_000i64;
 
     // 1. Cold miss on repo_a -> 1 spawn
-    let r1: Value = serde_json::from_str(
-        &probe_vcs_cached(&repo_a, &paths, 1500, None, t0, &runner).unwrap(),
-    )
-    .unwrap();
+    let r1: Value =
+        serde_json::from_str(&probe_vcs_cached(&repo_a, &paths, 1500, None, t0, &runner).unwrap())
+            .unwrap();
     assert_eq!(spawns.load(Ordering::SeqCst), 1);
     assert_eq!(r1["ahead"], 1);
 
@@ -376,7 +374,12 @@ fn full_binary_cli_lifecycle_install_render_doctor_set_undo_report_uninstall() {
     assert_eq!(inst_json["engine"], "rust-native");
     assert_eq!(inst_json["replaced"], "other");
     assert!(Path::new(inst_json["backupPath"].as_str().unwrap()).exists());
-    assert!(hud_home.join("bin/agy-hud").exists());
+    let expected_bin = if cfg!(windows) {
+        "agy-hud.exe"
+    } else {
+        "agy-hud"
+    };
+    assert!(hud_home.join("bin").join(expected_bin).exists());
 
     let updated_settings: Value =
         serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
@@ -386,7 +389,7 @@ fn full_binary_cli_lifecycle_install_render_doctor_set_undo_report_uninstall() {
         updated_settings["statusLine"]["command"]
             .as_str()
             .unwrap()
-            .contains("bin/agy-hud")
+            .contains(expected_bin)
     );
 
     // 4. Pipe live stdin payload to render statusLine and populate heartbeat + last-snapshot

@@ -55,7 +55,9 @@ fn sample_stdin(width: usize) -> AgyStdinData {
         vim: Some(VimStdin {
             mode: Some("INSERT".to_string()),
         }),
-        sandbox: Some(SandboxStdin { enabled: Some(true) }),
+        sandbox: Some(SandboxStdin {
+            enabled: Some(true),
+        }),
         terminal_width: Some(width),
         cost: Some(CostStdin {
             total_usd: Some(1.25),
@@ -169,7 +171,10 @@ fn config_schema_validates_all_38_keys_and_preview_showcase_renders_5_scenarios(
     assert_eq!(loaded.problems.len(), 1);
     assert!(loaded.problems[0].contains("unknownKey"));
 
-    let bad_set = parse_set_pairs(&["display.barLength=999".to_string()], &HudConfig::default());
+    let bad_set = parse_set_pairs(
+        &["display.barLength=999".to_string()],
+        &HudConfig::default(),
+    );
     assert_eq!(bad_set.problems.len(), 1);
 
     let facts = DoctorFacts {

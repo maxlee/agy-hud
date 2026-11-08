@@ -44,7 +44,13 @@ fn scan_escape(text: &str, start: usize, consume_unterminated: bool) -> Option<u
     }
     let next = match bytes.get(start + 1).copied() {
         Some(b) => b,
-        None => return if consume_unterminated { Some(start + 1) } else { None },
+        None => {
+            return if consume_unterminated {
+                Some(start + 1)
+            } else {
+                None
+            };
+        }
     };
 
     if next == b'[' {
@@ -78,7 +84,11 @@ fn scan_escape(text: &str, start: usize, consume_unterminated: bool) -> Option<u
             }
             i += 1;
         }
-        return if consume_unterminated { Some(bytes.len()) } else { None };
+        return if consume_unterminated {
+            Some(bytes.len())
+        } else {
+            None
+        };
     }
 
     // 2-byte / intermediate ESC: \x1b [0x20..=0x2f]* [0x30..=0x7e]
@@ -89,11 +99,7 @@ fn scan_escape(text: &str, start: usize, consume_unterminated: bool) -> Option<u
     if i < bytes.len() && (0x30..=0x7e).contains(&bytes[i]) {
         return Some(i + 1);
     }
-    if consume_unterminated {
-        Some(i)
-    } else {
-        None
-    }
+    if consume_unterminated { Some(i) } else { None }
 }
 
 /// Strips ANSI escapes, replaces control/bidi characters with spaces, and collapses whitespace.
@@ -295,7 +301,10 @@ pub fn render_bar(
         }
     }
 
-    format!("{bar_color}{filled_part}{}{empty_part}{RESET}", colors::GRAY)
+    format!(
+        "{bar_color}{filled_part}{}{empty_part}{RESET}",
+        colors::GRAY
+    )
 }
 
 fn path_to_file_url(abs_path: &str) -> Option<String> {
@@ -315,8 +324,8 @@ fn path_to_file_url(abs_path: &str) -> Option<String> {
     let mut url = String::with_capacity("file://".len() + normalized.len() + 8);
     url.push_str("file://");
     for &b in normalized.as_bytes() {
-        let keep = b.is_ascii_alphanumeric()
-            || matches!(b, b'/' | b'-' | b'_' | b'.' | b'~' | b':');
+        let keep =
+            b.is_ascii_alphanumeric() || matches!(b, b'/' | b'-' | b'_' | b'.' | b'~' | b':');
         if keep {
             url.push(b as char);
         } else {
@@ -399,8 +408,15 @@ mod tests {
         assert_eq!(text_width("hello"), 5);
         assert_eq!(text_width("简体中文"), 8);
         assert_eq!(text_width("🔧 TOOL"), 7);
-        assert_eq!(text_width(&paint("上下文 100%", &[colors::BRIGHT_GREEN])), 11);
-        let linked = file_link("/Users/dev/agy-hud", &paint("agy-hud", &[colors::BRIGHT_WHITE]), true);
+        assert_eq!(
+            text_width(&paint("上下文 100%", &[colors::BRIGHT_GREEN])),
+            11
+        );
+        let linked = file_link(
+            "/Users/dev/agy-hud",
+            &paint("agy-hud", &[colors::BRIGHT_WHITE]),
+            true,
+        );
         assert_eq!(text_width(&linked), 7);
     }
 

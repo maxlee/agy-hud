@@ -114,7 +114,10 @@ pub fn format_model_name(
     .to_ascii_lowercase();
 
     let mut base = raw_name.as_str();
-    if matches!(model_format, ModelFormatMode::Compact | ModelFormatMode::Short) {
+    if matches!(
+        model_format,
+        ModelFormatMode::Compact | ModelFormatMode::Short
+    ) {
         base = strip_trailing_paren(base);
     }
     if model_format == ModelFormatMode::Short {
@@ -161,25 +164,28 @@ pub fn extract_context_metrics(stdin: Option<&AgyStdinData>) -> ContextMetrics {
         let out_tok = cu.output_tokens.unwrap_or(0);
         let cache_create = cu.cache_creation_input_tokens.unwrap_or(0);
         let cache_read = cu.cache_read_input_tokens.unwrap_or(0);
-        let prompt_total = in_tok.saturating_add(cache_create).saturating_add(cache_read);
+        let prompt_total = in_tok
+            .saturating_add(cache_create)
+            .saturating_add(cache_read);
         if prompt_total.saturating_add(out_tok) > 0 {
             current_context_tokens = Some(prompt_total.saturating_add(out_tok));
         }
         if cache_read > 0 && prompt_total > 0 {
-            cache_hit_percent = Some(((cache_read as f64 / prompt_total as f64) * 100.0).round() as u64);
+            cache_hit_percent =
+                Some(((cache_read as f64 / prompt_total as f64) * 100.0).round() as u64);
         }
     }
 
-    let total_tokens_fallback = if cw.total_input_tokens.is_some() || cw.total_output_tokens.is_some()
-    {
-        Some(
-            cw.total_input_tokens
-                .unwrap_or(0)
-                .saturating_add(cw.total_output_tokens.unwrap_or(0)),
-        )
-    } else {
-        None
-    };
+    let total_tokens_fallback =
+        if cw.total_input_tokens.is_some() || cw.total_output_tokens.is_some() {
+            Some(
+                cw.total_input_tokens
+                    .unwrap_or(0)
+                    .saturating_add(cw.total_output_tokens.unwrap_or(0)),
+            )
+        } else {
+            None
+        };
 
     let used_tokens = current_context_tokens.or(total_tokens_fallback);
 
@@ -251,9 +257,7 @@ pub fn extract_quota_buckets(stdin: Option<&AgyStdinData>) -> Vec<QuotaBucketVie
             used_percent = Some(((1.0 - frac) * 1000.0).round() / 10.0);
         }
         let remaining_amount = raw.remaining_amount.filter(|v| v.is_finite());
-        let reset_in_seconds = raw
-            .reset_in_seconds
-            .filter(|v| v.is_finite() && *v >= 0.0);
+        let reset_in_seconds = raw.reset_in_seconds.filter(|v| v.is_finite() && *v >= 0.0);
 
         if used_percent.is_none() && remaining_amount.is_none() {
             continue;

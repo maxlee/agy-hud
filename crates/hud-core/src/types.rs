@@ -94,10 +94,14 @@ impl<'de> Deserialize<'de> for PathLevels {
                 Some(1) => Ok(Self::One),
                 Some(2) => Ok(Self::Two),
                 Some(3) => Ok(Self::Three),
-                _ => Err(serde::de::Error::custom("pathLevels must be 1, 2, 3, or \"full\"")),
+                _ => Err(serde::de::Error::custom(
+                    "pathLevels must be 1, 2, 3, or \"full\"",
+                )),
             },
             serde_json::Value::String(s) if s == "full" => Ok(Self::Full),
-            _ => Err(serde::de::Error::custom("pathLevels must be 1, 2, 3, or \"full\"")),
+            _ => Err(serde::de::Error::custom(
+                "pathLevels must be 1, 2, 3, or \"full\"",
+            )),
         }
     }
 }

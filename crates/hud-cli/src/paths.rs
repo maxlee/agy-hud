@@ -67,7 +67,11 @@ impl AgyPaths {
             .map(|s| resolve_abs(expand_tilde(s, &home)))
             .unwrap_or_else(|| cli_dir.join("agy-hud"));
 
-        let bin_name = if cfg!(windows) { "agy-hud.exe" } else { "agy-hud" };
+        let bin_name = if cfg!(windows) {
+            "agy-hud.exe"
+        } else {
+            "agy-hud"
+        };
         let bin_dir = hud_home.join("bin");
 
         Self {
@@ -283,8 +287,7 @@ pub fn write_config_with_undo(
     } else {
         atomic_write_bytes(&paths.undo_path, b"{}\n", 0o600).map_err(|e| e.to_string())?;
     }
-    let mut json_bytes =
-        serde_json::to_vec_pretty(next_raw_config).map_err(|e| e.to_string())?;
+    let mut json_bytes = serde_json::to_vec_pretty(next_raw_config).map_err(|e| e.to_string())?;
     json_bytes.push(b'\n');
     atomic_write_bytes(&paths.config_path, &json_bytes, 0o600).map_err(|e| e.to_string())
 }

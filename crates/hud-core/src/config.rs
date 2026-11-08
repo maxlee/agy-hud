@@ -200,7 +200,10 @@ pub const CONFIG_SCHEMA: &[SchemaEntry] = &[
     },
     SchemaEntry {
         key: "vcs.cacheTtlMs",
-        kind: SchemaValueKind::Number { min: 0, max: 60_000 },
+        kind: SchemaValueKind::Number {
+            min: 0,
+            max: 60_000,
+        },
         description: "VCS probe cache TTL in ms (0 disables caching; auto-invalidates on repo HEAD/index/dirstate mtime changes).",
     },
     SchemaEntry {
@@ -373,7 +376,10 @@ pub fn validate_setting(key: &str, value: &Value) -> Result<(), String> {
             if allowed_json.contains(&serialized.as_str()) {
                 Ok(())
             } else {
-                Err(format!("{key} must be one of: {}.", allowed_json.join(", ")))
+                Err(format!(
+                    "{key} must be one of: {}.",
+                    allowed_json.join(", ")
+                ))
             }
         }
         SchemaValueKind::Number { min, max } => {
@@ -516,9 +522,7 @@ pub fn parse_config_str(raw_text: Option<&str>) -> LoadedConfig {
         return LoadedConfig {
             config: defaults,
             raw: Map::new(),
-            problems: vec![format!(
-                "Config file exceeds {MAX_CONFIG_BYTES} bytes."
-            )],
+            problems: vec![format!("Config file exceeds {MAX_CONFIG_BYTES} bytes.")],
         };
     }
     let text = text_raw.strip_prefix('\u{feff}').unwrap_or(text_raw);
@@ -570,11 +574,15 @@ pub fn parse_set_pairs(pairs: &[String], base_config: &HudConfig) -> ParsedSet {
 
     for pair in pairs {
         let Some(eq) = pair.find('=') else {
-            problems.push(format!("Invalid assignment \"{pair}\" (expected key=value)."));
+            problems.push(format!(
+                "Invalid assignment \"{pair}\" (expected key=value)."
+            ));
             continue;
         };
         if eq == 0 {
-            problems.push(format!("Invalid assignment \"{pair}\" (expected key=value)."));
+            problems.push(format!(
+                "Invalid assignment \"{pair}\" (expected key=value)."
+            ));
             continue;
         }
         let key = pair[..eq].trim().to_string();

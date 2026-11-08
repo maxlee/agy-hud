@@ -1,7 +1,6 @@
 use crate::ansi::{BOLD, colors, paint, strip_ansi};
 use crate::config::{
-    CONFIG_SCHEMA, SchemaValueKind, get_dot_value, parse_config_str, parse_set_pairs,
-    set_dot_value,
+    CONFIG_SCHEMA, SchemaValueKind, get_dot_value, parse_config_str, parse_set_pairs, set_dot_value,
 };
 use crate::probes::{parse_memory_info, parse_vcs_info};
 use crate::render::{RenderInput, render_hud_lines};
@@ -345,7 +344,9 @@ fn sample_presets(now_ms: i64) -> HashMap<&'static str, SamplePreset> {
         quota: Some(base_quota),
         agent_state: Some("idle".to_string()),
         cycle_mode: Some("auto".to_string()),
-        sandbox: Some(SandboxStdin { enabled: Some(true) }),
+        sandbox: Some(SandboxStdin {
+            enabled: Some(true),
+        }),
         artifact_count: Some(2),
         plan_tier: Some("Pro".to_string()),
         task_count: Some(1),
@@ -875,11 +876,7 @@ fn run_report(args: &[String], ctx: &CommandContext<'_>) -> CommandOutput {
     }
 }
 
-pub fn execute_subcommand(
-    name: &str,
-    args: &[String],
-    ctx: &CommandContext<'_>,
-) -> CommandOutput {
+pub fn execute_subcommand(name: &str, args: &[String], ctx: &CommandContext<'_>) -> CommandOutput {
     match name {
         "doctor" => run_doctor(ctx),
         "schema" => run_schema(args, ctx),

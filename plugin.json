@@ -13,6 +13,8 @@
   "author": {
     "name": "Max"
   },
+  "homepage": "https://github.com/maxlee/agy-hud",
+  "repository": "https://github.com/maxlee/agy-hud",
   "license": "MIT",
   "keywords": ["hud", "statusline", "cli", "monitoring", "context", "quota", "subagents"]
 }
