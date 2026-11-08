@@ -12,9 +12,11 @@ Antigravity CLI (agy)
   ▼
 ┌─ CAPABILITY LAYER (scripts/) ───────────────────────────────────────────────────┐
 │  hud.mjs:       bounded stdin reader, AGY_HUD_DISABLE gate, heartbeat,          │
-│                 spawns caged child process, enforces `terminalFilter` allowlist │
-│  collector.mjs: resolves exact paths, caches stripped TS (`stripped/`),         │
-│                 sweeps symlinks in `data/`, executes fixed git & vm_stat probes │
+│                 pre-warms probes concurrently with caged child spawn,           │
+│                 enforces `terminalFilter` allowlist                             │
+│  collector.mjs: resolves exact paths, caches stripped TS (`manifest.json`),     │
+│                 caches VCS probes (`probe-cache.json` via mtime + TTL),         │
+│                 sweeps symlinks in `data/`, runs read-only git/jj/hg/vm_stat    │
 │  fence.mjs:     `--import` hook blocking child_process/net/http/fetch/sockets   │
 │  install.mjs:   atomic backup & update of ~/.gemini/antigravity-cli/settings    │
 └───────────────────────────┬─────────────────────────────▲───────────────────────┘

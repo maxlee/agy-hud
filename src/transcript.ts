@@ -161,7 +161,9 @@ export function parseTaskMarkdown(taskMdPath: string | null): TodoItem[] {
       const match = /^\s*[-*]\s+\[([ xX/])\]\s+(.+)$/.exec(rawLine);
       if (!match) continue;
       const marker = match[1];
-      const text = sanitizeText(match[2].replace(/`([^`]+)`/g, '$1'));
+      const text = sanitizeText(
+        match[2].replace(/\*\*([^*]+)\*\*/g, '$1').replace(/`([^`]+)`/g, '$1'),
+      );
       if (!text) continue;
       const status: TodoItem['status'] =
         marker === '/' ? 'in_progress' : marker.toLowerCase() === 'x' ? 'completed' : 'pending';

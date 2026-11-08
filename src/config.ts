@@ -24,6 +24,7 @@ export interface HudConfig {
     showDirty: boolean;
     showAheadBehind: boolean;
     showFileStats: boolean;
+    cacheTtlMs: number;
   };
   display: {
     showState: boolean;
@@ -68,6 +69,7 @@ export const DEFAULT_CONFIG: HudConfig = {
     showDirty: true,
     showAheadBehind: true,
     showFileStats: false,
+    cacheTtlMs: 1500,
   },
   display: {
     showState: true,
@@ -160,6 +162,13 @@ export const CONFIG_SCHEMA: readonly SchemaEntry[] = [
     key: 'vcs.showFileStats',
     type: 'boolean',
     description: 'Show modified/added/deleted file counts (+A ~M -D).',
+  },
+  {
+    key: 'vcs.cacheTtlMs',
+    type: 'number',
+    min: 0,
+    max: 60000,
+    description: 'VCS probe cache TTL in ms (0 disables caching; auto-invalidates on repo HEAD/index/dirstate mtime changes).',
   },
   {
     key: 'display.showState',

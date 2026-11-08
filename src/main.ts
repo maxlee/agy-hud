@@ -85,7 +85,13 @@ async function run(): Promise<void> {
 
   const { config } = loadConfigFile(input.paths.config);
   const needed: ProbeName[] = [];
-  if (config.vcs.enabled && (config.vcs.showAheadBehind || config.vcs.showFileStats || !input.stdin?.vcs?.branch)) {
+  if (
+    config.vcs.enabled &&
+    (config.vcs.showAheadBehind ||
+      config.vcs.showFileStats ||
+      !input.stdin?.vcs?.branch ||
+      input.stdin?.vcs?.type === 'jj')
+  ) {
     needed.push('vcs');
   }
   if (config.display.showMemory) {

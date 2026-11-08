@@ -134,6 +134,7 @@ function runDoctor(facts: DoctorFacts, paths: LogicPaths): CageOutput {
       : null,
     config: {
       path: paths.config,
+      vcsCacheTtlMs: loaded.config.vcs.cacheTtlMs,
       problems: loaded.problems,
     },
     findings:

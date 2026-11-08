@@ -1,6 +1,6 @@
 {
   "name": "agy-hud",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Real-time statusline HUD plugin for Google Antigravity CLI (agy), inspired by claude-hud",
   "type": "module",
   "license": "MIT",

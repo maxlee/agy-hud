@@ -40,9 +40,10 @@ test('install, --replace guard, uninstall restore, doctor, set/--undo, preview -
       'utf8',
     );
 
-    // 1. doctor detects foreign statusLine and redacts secret token
+    // 1. doctor detects foreign statusLine, redacts secret token, and reports 0 config problems even before config.json exists
     const doc1 = JSON.parse(runHudCli(['doctor'], env));
     assert.equal(doc1.statusLine.kind, 'other');
+    assert.deepEqual(doc1.config.problems, []);
     assert.ok(!doc1.statusLine.command.includes('secret123'));
     assert.ok(doc1.statusLine.command.includes('[REDACTED]'));
 

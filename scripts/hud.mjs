@@ -164,7 +164,7 @@ export async function runCage({
   env = process.env,
   entry = DEFAULT_LOGIC_ENTRY,
   extraReadGrants = [],
-  probesRunner = collector.executeProbes,
+  probesRunner = null,
 }) {
   const paths = collector.agyPaths(env);
   let dataRealDir = collector.prepareDataDir(paths);
@@ -185,6 +185,17 @@ export async function runCage({
       ...extraReadGrants.filter((g) => fs.existsSync(g)).map((g) => fs.realpathSync(g)),
     ]),
   ];
+
+  // Start VCS/memory probes concurrently with caged Node startup when rendering live statusLine
+  const probeSession =
+    probesRunner === null
+      ? collector.createProbeSession({ paths, cwd: named.cwd, stdin, now })
+      : null;
+  if (mode === 'render' && probeSession) {
+    probeSession.prewarm();
+  }
+  const runProbes =
+    probesRunner ?? ((requested) => probeSession.ask(requested));
 
   const nodeArgs = [
     '--no-warnings',
@@ -259,7 +270,7 @@ export async function runCage({
             return;
           }
           if (Array.isArray(msg.ask) && typeof msg.id === 'number') {
-            Promise.resolve(probesRunner(msg.ask, named.cwd))
+            Promise.resolve(runProbes(msg.ask, named.cwd))
               .then((answers) => sendLine({ id: msg.id, answers }))
               .catch(() => sendLine({ id: msg.id, answers: {} }));
           } else if (msg.result) {

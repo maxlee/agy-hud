@@ -2,7 +2,7 @@
 
 Real-time heads-up display (HUD) plugin for **Google Antigravity CLI (`agy`)**, inspired by [`jarrodwatts/claude-hud`](https://github.com/jarrodwatts/claude-hud).
 
-Displays live agent state, execution mode (`PLAN` / `AUTO` / `ACCEPT` + Vim mode), model & reasoning effort, workspace + Git status, fine-grained context window bar, prompt cache hit rate, quota buckets & reset timers, active tools, running subagents, and `task.md` checklist progress right below your CLI prompt.
+Displays live agent state, execution mode (`PLAN` / `AUTO` / `ACCEPT` + Vim mode), model & reasoning effort, workspace + multi-VCS status (`git` + worktrees, Jujutsu `jj` bookmarks/change-IDs/conflicts, Mercurial `hg`), fine-grained context window bar, prompt cache hit rate, quota buckets & reset timers, active tools, running subagents, and `task.md` checklist progress right below your CLI prompt.
 
 > 🌐 English | [简体中文文档](README.zh-CN.md) | [Architecture](ARCHITECTURE.md)
 
@@ -50,6 +50,7 @@ node scripts/hud.mjs preview --state showcase                  # Preview all 5 l
 node scripts/hud.mjs preview --set language=zh-Hans            # Preview Simplified Chinese UI
 node scripts/hud.mjs schema                                    # List all configurable keys and types
 node scripts/hud.mjs set language=zh-Hans vcs.showFileStats=true
+node scripts/hud.mjs set vcs.cacheTtlMs=1500                   # Tune VCS mtime+TTL cache window (0 disables)
 node scripts/hud.mjs set --undo                                # Revert the previous config change
 node scripts/hud.mjs report --note "Describe issue"            # Generate privacy-scrubbed bug report JSON
 node scripts/hud.mjs uninstall                                 # Remove statusLine (or restore previous script)
