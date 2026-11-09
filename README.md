@@ -1,4 +1,4 @@
-# AGY HUD (`agy-hud`) v1.3.0 — 100% Pure Rust Edition
+# AGY HUD (`agy-hud`) v1.3.1 — 100% Pure Rust Edition
 
 [![CI](https://github.com/maxlee/agy-hud/actions/workflows/ci.yml/badge.svg)](https://github.com/maxlee/agy-hud/actions/workflows/ci.yml)
 [![Release](https://github.com/maxlee/agy-hud/actions/workflows/release.yml/badge.svg)](https://github.com/maxlee/agy-hud/releases)
@@ -29,9 +29,20 @@ Displays live agent state, execution mode (`PLAN` / `AUTO` / `ACCEPT` + Vim mode
 
 ## Quick Install
 
-### Option A: One-Line Prebuilt Binary + Plugin Install (Recommended)
+### Option A: Antigravity Marketplace or `agy plugin install` (Recommended)
 
-Automatically detects your OS (`macOS` Apple Silicon / Intel, `Linux` x64 / ARM64), verifies the SHA-256 checksum against `SHA256SUMS`, registers the `/hud` skill plugin, deploys the native binary to `~/.gemini/antigravity-cli/agy-hud/bin/agy-hud`, and configures `settings.json`:
+1. **In Antigravity App**: Open **Customizations > Marketplace**, search for **AGY HUD**, click **Add**, then click the **"Set up the HUD status line in Antigravity CLI"** starter prompt chip on the plugin card.
+2. **Or via `agy` CLI**:
+   ```bash
+   agy plugin install agy-hud
+   # Or install directly from GitHub anytime:
+   agy plugin install https://github.com/maxlee/agy-hud
+   ```
+   Then launch `agy` and run `/agy-hud:hud` (if `agy` was already running, run `/skills reload` first) to activate the `statusLine` in `settings.json`.
+
+### Option B: One-Line Prebuilt Binary + Plugin Script
+
+Automatically detects your OS (`macOS` Apple Silicon / Intel, `Linux` x64 / ARM64), verifies the SHA-256 checksum against `SHA256SUMS`, registers the `/agy-hud:hud` & `/agy-hud:hud-update` plugin skills, deploys the native binary to `~/.gemini/antigravity-cli/agy-hud/bin/agy-hud`, and configures `settings.json` in one step:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/maxlee/agy-hud/main/install.sh | sh
@@ -43,9 +54,9 @@ Need to stack below the built-in status line or replace an existing custom `stat
 curl -fsSL https://raw.githubusercontent.com/maxlee/agy-hud/main/install.sh | sh -s -- --stack
 ```
 
-Inside `agy` CLI, run `/hud` anytime to customize layouts, language, or elements interactively, `/hud-update` to check and upgrade to the latest verified GitHub release in one step, or `/statusline` to toggle the bar on/off.
+Inside `agy` CLI, run `/agy-hud:hud` anytime to customize layouts, language, or elements interactively, `/agy-hud:hud-update` to check and upgrade to the latest verified GitHub release in one step, or `/statusline` to toggle the bar on/off.
 
-### Option B: Prebuilt Release Archives (macOS / Linux / Windows)
+### Option C: Prebuilt Release Archives (macOS / Linux / Windows)
 
 Download the archive for your platform from [**GitHub Releases**](https://github.com/maxlee/agy-hud/releases/latest):
 
@@ -57,7 +68,7 @@ Download the archive for your platform from [**GitHub Releases**](https://github
 | Linux (ARM64, static musl) | `agy-hud-linux-arm64.tar.gz` | `aarch64-unknown-linux-musl` |
 | Windows (x64) | `agy-hud-windows-x64.zip` | `x86_64-pc-windows-msvc` |
 
-### Option C: Build from Source (`git clone` + `cargo`)
+### Option D: Build from Source (`git clone` + `cargo`)
 
 ```bash
 git clone https://github.com/maxlee/agy-hud.git

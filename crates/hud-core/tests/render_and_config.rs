@@ -556,7 +556,7 @@ fn update_semver_parsing_badge_rendering_and_doctor_findings() {
         now_ms: 1_700_000_000_000,
     });
     let uni_plain = strip_ansi(&uni_lines[0]);
-    assert!(uni_plain.contains("↑ v9.9.0 · /hud-update"));
+    assert!(uni_plain.contains("↑ v9.9.0 · /agy-hud:hud-update"));
 
     // 2. ASCII badge (strictly 7-bit)
     let mut ascii_cfg = HudConfig::default();
@@ -573,7 +573,7 @@ fn update_semver_parsing_badge_rendering_and_doctor_findings() {
         now_ms: 1_700_000_000_000,
     });
     assert!(ascii_lines[0].is_ascii());
-    assert!(strip_ansi(&ascii_lines[0]).contains("^ v9.9.0 . /hud-update"));
+    assert!(strip_ansi(&ascii_lines[0]).contains("^ v9.9.0 . /agy-hud:hud-update"));
 
     // 3. `updates.enabled = false` hides badge completely
     let mut disabled_cfg = HudConfig::default();
@@ -589,7 +589,7 @@ fn update_semver_parsing_badge_rendering_and_doctor_findings() {
         columns: Some(140),
         now_ms: 1_700_000_000_000,
     });
-    assert!(!strip_ansi(&disabled_lines[0]).contains("/hud-update"));
+    assert!(!strip_ansi(&disabled_lines[0]).contains("/agy-hud:hud-update"));
 
     // 4. `doctor` surfaces available update in JSON and `--pretty`
     let facts = DoctorFacts {

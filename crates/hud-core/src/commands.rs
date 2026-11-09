@@ -256,7 +256,7 @@ fn run_doctor(args: &[String], ctx: &CommandContext<'_>) -> CommandOutput {
             .is_some_and(|u| is_newer_semver(&ctx.facts.runtime.version, &u.latest_version));
     if update_available && let Some(ref u) = cached_update {
         findings.push(format!(
-            "New agy-hud release available: v{} (current: v{}). Fix: run `/hud-update` inside agy CLI or `agy-hud update`.",
+            "New agy-hud release available: v{} (current: v{}). Fix: run `/agy-hud:hud-update` inside agy CLI or `agy-hud update`.",
             u.latest_version, ctx.facts.runtime.version
         ));
     }
@@ -351,7 +351,7 @@ fn run_doctor(args: &[String], ctx: &CommandContext<'_>) -> CommandOutput {
         if let Some(ref u) = cached_update {
             if update_available {
                 out.push(format!(
-                    "  Updates          : v{} available! (current v{} -> run `/hud-update` or `agy-hud update`)",
+                    "  Updates          : v{} available! (current v{} -> run `/agy-hud:hud-update` or `agy-hud update`)",
                     u.latest_version, ctx.facts.runtime.version
                 ));
             } else {

@@ -1,5 +1,6 @@
 /target/
-/scripts/bin/
+/scripts/bin/agy-hud
+/scripts/bin/agy-hud.exe
 .DS_Store
 *.bak.*
 *.tmp

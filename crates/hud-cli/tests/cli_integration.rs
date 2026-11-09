@@ -941,7 +941,7 @@ fn install_sh_version_logging_and_self_update_e2e() {
     assert_eq!(check_json["latestVersion"], "9.9.0");
     assert!(hud_upd.join("data/update-cache.json").exists());
 
-    // Live render now displays `↑ v9.9.0 · /hud-update` badge!
+    // Live render now displays `↑ v9.9.0 · /agy-hud:hud-update` badge!
     let live_payload = json!({
         "cwd": "/tmp/demo",
         "model": { "id": "Gemini 4 Argon", "display_name": "Gemini 4 Argon" },
@@ -952,7 +952,7 @@ fn install_sh_version_logging_and_self_update_e2e() {
     .to_string();
     let (ok_badge, badge_out) = run_bin(&[], &upd_env, Some(&live_payload));
     assert!(ok_badge);
-    assert!(badge_out.contains("/hud-update"));
+    assert!(badge_out.contains("/agy-hud:hud-update"));
     assert!(badge_out.contains("v9.9.0"));
 
     // Run `agy-hud update` end-to-end (without needing to re-pass `--stack`)!
@@ -1095,4 +1095,150 @@ fn resolve_transcript_path_recovers_cli_brain_when_stdin_points_to_ide_dir() {
     let plain_prev = hud_core::ansi::strip_ansi(&prev_stdout);
     assert!(plain_prev.contains("edit_file ×2: paths.rs"));
     assert!(plain_prev.contains("Recover real CLI transcript path"));
+}
+
+#[cfg(unix)]
+#[test]
+fn marketplace_plugin_router_runs_bundled_binary_and_sha256_bootstrap_fallback() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let os_part = if cfg!(target_os = "macos") {
+        "darwin"
+    } else if cfg!(target_os = "linux") {
+        "linux"
+    } else {
+        return;
+    };
+    let arch_part = if cfg!(target_arch = "aarch64") {
+        "arm64"
+    } else if cfg!(target_arch = "x86_64") {
+        "x64"
+    } else {
+        return;
+    };
+    let platform = format!("{os_part}-{arch_part}");
+
+    let tmp = TempDir::new("marketplace-router");
+    let workspace_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let bin_exe = PathBuf::from(env!("CARGO_BIN_EXE_agy-hud"));
+
+    // Simulate an unpacked read-only Marketplace plugin directory (no Cargo.toml, no target/)
+    let mp_plugin = tmp.path.join("unpacked-plugin");
+    fs::create_dir_all(mp_plugin.join("scripts/bin").join(&platform)).unwrap();
+    fs::create_dir_all(mp_plugin.join("skills/hud/scripts")).unwrap();
+    fs::copy(
+        workspace_root.join("plugin.json"),
+        mp_plugin.join("plugin.json"),
+    )
+    .unwrap();
+    fs::copy(
+        workspace_root.join("scripts/agy-hud"),
+        mp_plugin.join("scripts/agy-hud"),
+    )
+    .unwrap();
+    fs::copy(
+        workspace_root.join("skills/hud/scripts/hud-cli.sh"),
+        mp_plugin.join("skills/hud/scripts/hud-cli.sh"),
+    )
+    .unwrap();
+    let bundled_bin = mp_plugin
+        .join("scripts/bin")
+        .join(&platform)
+        .join("agy-hud");
+    fs::copy(&bin_exe, &bundled_bin).unwrap();
+    for exec_p in [
+        mp_plugin.join("scripts/agy-hud"),
+        mp_plugin.join("skills/hud/scripts/hud-cli.sh"),
+        bundled_bin.clone(),
+    ] {
+        fs::set_permissions(&exec_p, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let fresh_cli = tmp.path.join("fresh-cli");
+    let fresh_hud = fresh_cli.join("agy-hud");
+
+    // 1. Offline execution via bundled `scripts/bin/<platform>/agy-hud` (no $HUD_HOME/bin, no network)
+    let offline_out = Command::new("sh")
+        .arg("scripts/hud-cli.sh")
+        .arg("doctor")
+        .current_dir(mp_plugin.join("skills/hud"))
+        .env("AGY_CLI_DIR", &fresh_cli)
+        .env("AGY_HUD_HOME", &fresh_hud)
+        .env("AGY_HUD_NO_BOOTSTRAP", "1")
+        .output()
+        .unwrap();
+    assert!(
+        offline_out.status.success(),
+        "bundled binary router failed: {}",
+        String::from_utf8_lossy(&offline_out.stderr)
+    );
+    let doc_json: Value = serde_json::from_slice(&offline_out.stdout).unwrap();
+    assert_eq!(doc_json["runtime"]["engine"], "rust-native");
+
+    // 2. Remove bundled binary and verify SHA-256-verified archive bootstrap fallback into $HUD_HOME/bin/agy-hud
+    fs::remove_file(&bundled_bin).unwrap();
+    let bundle_stage_root = tmp.path.join("archive-stage");
+    let bundle_dir = bundle_stage_root.join("agy-hud");
+    fs::create_dir_all(bundle_dir.join("scripts/bin").join(&platform)).unwrap();
+    fs::copy(
+        workspace_root.join("plugin.json"),
+        bundle_dir.join("plugin.json"),
+    )
+    .unwrap();
+    let archive_bin = bundle_dir
+        .join("scripts/bin")
+        .join(&platform)
+        .join("agy-hud");
+    fs::copy(&bin_exe, &archive_bin).unwrap();
+    fs::set_permissions(&archive_bin, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let archive_name = format!("agy-hud-{platform}.tar.gz");
+    let archive_path = bundle_stage_root.join(&archive_name);
+    let tar_status = Command::new("tar")
+        .args(["-C"])
+        .arg(&bundle_stage_root)
+        .args(["-czf"])
+        .arg(&archive_path)
+        .arg("agy-hud")
+        .status()
+        .unwrap();
+    assert!(tar_status.success());
+
+    let sha_out = Command::new("sh")
+        .arg("-c")
+        .arg(format!(
+            "(sha256sum '{0}' 2>/dev/null || shasum -a 256 '{0}') | awk '{{print $1}}'",
+            archive_path.display()
+        ))
+        .output()
+        .unwrap();
+    let digest = String::from_utf8_lossy(&sha_out.stdout).trim().to_string();
+    assert_eq!(digest.len(), 64);
+    fs::write(
+        bundle_stage_root.join("SHA256SUMS"),
+        format!("{digest}  {archive_name}\n"),
+    )
+    .unwrap();
+
+    let bootstrap_out = Command::new("sh")
+        .arg("scripts/hud-cli.sh")
+        .arg("--version")
+        .current_dir(mp_plugin.join("skills/hud"))
+        .env("AGY_CLI_DIR", &fresh_cli)
+        .env("AGY_HUD_HOME", &fresh_hud)
+        .env("AGY_HUD_ARCHIVE_DIR", &bundle_stage_root)
+        .output()
+        .unwrap();
+    assert!(
+        bootstrap_out.status.success(),
+        "SHA-256 bootstrap fallback failed: {}",
+        String::from_utf8_lossy(&bootstrap_out.stderr)
+    );
+    assert!(fresh_hud.join("bin/agy-hud").is_file());
+    assert!(String::from_utf8_lossy(&bootstrap_out.stdout).contains("rust-native"));
 }

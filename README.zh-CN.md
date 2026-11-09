@@ -1,4 +1,4 @@
-# AGY HUD (`agy-hud`) v1.3.0 — 100% 纯 Rust 极速版指南
+# AGY HUD (`agy-hud`) v1.3.1 — 100% 纯 Rust 极速版指南
 
 [![CI](https://github.com/maxlee/agy-hud/actions/workflows/ci.yml/badge.svg)](https://github.com/maxlee/agy-hud/actions/workflows/ci.yml)
 [![Release](https://github.com/maxlee/agy-hud/actions/workflows/release.yml/badge.svg)](https://github.com/maxlee/agy-hud/releases)
@@ -31,9 +31,20 @@
 
 ## 快速安装与启用
 
-### 方式一：一行命令免编译极速安装（推荐）
+### 方式一：通过 Antigravity Marketplace 或 `agy plugin install` 安装（推荐）
 
-自动识别系统与架构（macOS Apple Silicon / Intel、Linux x64 / ARM64 静态编译版），下载预编译包并校验 `SHA256SUMS`，注册 `/hud` 插件技能，将原生二进制部署至 `~/.gemini/antigravity-cli/agy-hud/bin/agy-hud` 并原子更新 `settings.json`（自动备份原配置）：
+1. **Antigravity 桌面端**：打开左侧 **Customizations > Marketplace**，搜索 **AGY HUD** 点击 **Add** 安装，随后点击详情页顶部的 **"Set up the HUD status line in Antigravity CLI"** 快捷胶囊即可一键完成启用。
+2. **或通过 `agy` 命令行安装**：
+   ```bash
+   agy plugin install agy-hud
+   # 或直接从 GitHub 仓库安装：
+   agy plugin install https://github.com/maxlee/agy-hud
+   ```
+   随后启动 `agy` 输入 `/agy-hud:hud` 即可自动配置 `settings.json`（若安装前 `agy` 已处于打开状态，请先执行一次 `/skills reload` 刷新斜杠命令菜单）。
+
+### 方式二：一行脚本免编译全自动安装
+
+自动识别系统与架构（macOS Apple Silicon / Intel、Linux x64 / ARM64 静态编译版），下载预编译包并校验 `SHA256SUMS`，注册 `/agy-hud:hud` 与 `/agy-hud:hud-update` 插件技能，将原生二进制部署至 `~/.gemini/antigravity-cli/agy-hud/bin/agy-hud` 并原子更新 `settings.json`（自动备份原配置）：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/maxlee/agy-hud/main/install.sh | sh
@@ -45,9 +56,9 @@ curl -fsSL https://raw.githubusercontent.com/maxlee/agy-hud/main/install.sh | sh
 curl -fsSL https://raw.githubusercontent.com/maxlee/agy-hud/main/install.sh | sh -s -- --stack
 ```
 
-启用后，在 `agy` 会话中可随时输入 `/hud` 用自然语言调整显示项（例如 `/hud 切换成简体中文并显示文件增删统计`），当状态栏提示新版本时输入 `/hud-update` 一键校验升级，或使用内置 `/statusline` 开关状态栏。
+启用后，在 `agy` 会话中可随时输入 `/agy-hud:hud` 用自然语言调整显示项（例如 `/agy-hud:hud 切换成简体中文并显示文件增删统计`），当状态栏提示新版本时输入 `/agy-hud:hud-update` 一键校验升级，或使用内置 `/statusline` 开关状态栏。
 
-### 方式二：手动下载预编译包（支持 macOS / Linux / Windows）
+### 方式三：手动下载预编译包（支持 macOS / Linux / Windows）
 
 前往 [**GitHub Releases**](https://github.com/maxlee/agy-hud/releases/latest) 下载对应平台的发行包：
 
@@ -57,7 +68,7 @@ curl -fsSL https://raw.githubusercontent.com/maxlee/agy-hud/main/install.sh | sh
 - `agy-hud-linux-arm64.tar.gz`（Linux ARM64 静态 `musl`）
 - `agy-hud-windows-x64.zip`（Windows x64 原生 `agy-hud.exe`）
 
-### 方式三：从源码克隆编译安装
+### 方式四：从源码克隆编译安装
 
 ```bash
 git clone https://github.com/maxlee/agy-hud.git

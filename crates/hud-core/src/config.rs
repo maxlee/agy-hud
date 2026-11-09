@@ -224,7 +224,7 @@ pub const CONFIG_SCHEMA: &[SchemaEntry] = &[
     SchemaEntry {
         key: "updates.enabled",
         kind: SchemaValueKind::Boolean,
-        description: "Check GitHub Releases in background every 6h and show `/hud-update` badge when a newer version is available.",
+        description: "Check GitHub Releases in background every 6h and show `/agy-hud:hud-update` badge when a newer version is available.",
     },
     SchemaEntry {
         key: "vcs.enabled",

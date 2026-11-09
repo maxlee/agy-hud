@@ -1,5 +1,5 @@
 #!/bin/sh
-# Multi-platform native binary router for agy-hud (zero Node.js dependencies).
+# Multi-platform native binary router & SHA-256 fallback bootstrapper for agy-hud (zero Node.js dependencies).
 set -eu
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
@@ -9,9 +9,10 @@ detect_platform() {
   os_raw=$(uname -s 2>/dev/null || echo unknown)
   arch_raw=$(uname -m 2>/dev/null || echo unknown)
   case "$os_raw" in
-    Darwin) os="darwin" ;;
-    Linux)  os="linux" ;;
-    *)      os="unknown" ;;
+    Darwin)               os="darwin" ;;
+    Linux)                os="linux" ;;
+    MINGW*|MSYS*|CYGWIN*) os="windows" ;;
+    *)                    os="unknown" ;;
   esac
   case "$arch_raw" in
     arm64|aarch64) arch="arm64" ;;
@@ -22,30 +23,123 @@ detect_platform() {
 }
 
 PLATFORM=$(detect_platform)
+BIN_NAME="agy-hud"
+case "$PLATFORM" in
+  windows-*) BIN_NAME="agy-hud.exe" ;;
+esac
 
-if [ -x "$PLUGIN_ROOT/scripts/bin/$PLATFORM/agy-hud" ]; then
-  exec "$PLUGIN_ROOT/scripts/bin/$PLATFORM/agy-hud" "$@"
+# 1. Bundled Marketplace / Release archive binary (0 ms offline execution)
+if [ -x "$PLUGIN_ROOT/scripts/bin/$PLATFORM/$BIN_NAME" ]; then
+  exec "$PLUGIN_ROOT/scripts/bin/$PLATFORM/$BIN_NAME" "$@"
 fi
 
-if [ -x "$PLUGIN_ROOT/scripts/bin/agy-hud" ]; then
-  exec "$PLUGIN_ROOT/scripts/bin/agy-hud" "$@"
+if [ -x "$PLUGIN_ROOT/scripts/bin/$BIN_NAME" ]; then
+  exec "$PLUGIN_ROOT/scripts/bin/$BIN_NAME" "$@"
 fi
 
-if [ -x "$PLUGIN_ROOT/target/release/agy-hud" ]; then
-  exec "$PLUGIN_ROOT/target/release/agy-hud" "$@"
+# 2. Local cargo release checkout
+if [ -x "$PLUGIN_ROOT/target/release/$BIN_NAME" ]; then
+  exec "$PLUGIN_ROOT/target/release/$BIN_NAME" "$@"
 fi
 
+# 3. Installed CLI statusLine binary (~/.gemini/antigravity-cli/agy-hud/bin/agy-hud)
 CLI_DIR="${AGY_CLI_DIR:-$HOME/.gemini/antigravity-cli}"
 HUD_HOME="${AGY_HUD_HOME:-$CLI_DIR/agy-hud}"
-if [ -x "$HUD_HOME/bin/agy-hud" ]; then
-  exec "$HUD_HOME/bin/agy-hud" "$@"
+if [ -x "$HUD_HOME/bin/$BIN_NAME" ]; then
+  exec "$HUD_HOME/bin/$BIN_NAME" "$@"
 fi
 
+# 4. Source build when cargo + Cargo.toml are available
 if command -v cargo >/dev/null 2>&1 && [ -f "$PLUGIN_ROOT/Cargo.toml" ]; then
   cargo build --release --manifest-path "$PLUGIN_ROOT/Cargo.toml" --quiet
-  exec "$PLUGIN_ROOT/target/release/agy-hud" "$@"
+  exec "$PLUGIN_ROOT/target/release/$BIN_NAME" "$@"
 fi
 
-printf '%s\n' "agy-hud: native binary not found for $PLATFORM and cargo is not installed." >&2
+# 5. SHA-256-verified GitHub Release auto-bootstrap fallback (Unix tar.gz)
+bootstrap_from_release() {
+  case "$PLATFORM" in
+    darwin-arm64|darwin-x64|linux-arm64|linux-x64) ;;
+    *) return 1 ;;
+  esac
+
+  repo="${AGY_HUD_REPO:-maxlee/agy-hud}"
+  ver=""
+  if [ -f "$PLUGIN_ROOT/plugin.json" ]; then
+    ver=$(awk -F'"' '/"version"[[:space:]]*:/ { print $4; exit }' "$PLUGIN_ROOT/plugin.json" 2>/dev/null || true)
+  fi
+
+  archive="agy-hud-${PLATFORM}.tar.gz"
+  tmp_dir=$(mktemp -d "${TMPDIR:-/tmp}/agy-hud-bootstrap.XXXXXX")
+  cleanup_tmp() {
+    rm -rf "$tmp_dir"
+  }
+  trap cleanup_tmp EXIT INT TERM
+
+  fetch_url() {
+    if command -v curl >/dev/null 2>&1; then
+      curl -fsSL "$1" -o "$2"
+    elif command -v wget >/dev/null 2>&1; then
+      wget -qO "$2" "$1"
+    else
+      return 1
+    fi
+  }
+
+  calc_sha256() {
+    if command -v sha256sum >/dev/null 2>&1; then
+      sha256sum "$1" | awk '{print $1}'
+    elif command -v shasum >/dev/null 2>&1; then
+      shasum -a 256 "$1" | awk '{print $1}'
+    elif command -v openssl >/dev/null 2>&1; then
+      openssl dgst -sha256 "$1" | awk '{print $NF}'
+    else
+      return 1
+    fi
+  }
+
+  if [ -n "${AGY_HUD_ARCHIVE_DIR:-}" ] && [ -f "${AGY_HUD_ARCHIVE_DIR}/${archive}" ] && [ -f "${AGY_HUD_ARCHIVE_DIR}/SHA256SUMS" ]; then
+    cp "${AGY_HUD_ARCHIVE_DIR}/${archive}" "$tmp_dir/$archive"
+    cp "${AGY_HUD_ARCHIVE_DIR}/SHA256SUMS" "$tmp_dir/SHA256SUMS"
+  else
+    downloaded=0
+    if [ -n "$ver" ]; then
+      base="https://github.com/${repo}/releases/download/v${ver}"
+      if fetch_url "${base}/${archive}" "$tmp_dir/$archive" 2>/dev/null && fetch_url "${base}/SHA256SUMS" "$tmp_dir/SHA256SUMS" 2>/dev/null; then
+        downloaded=1
+      fi
+    fi
+    if [ "$downloaded" -eq 0 ]; then
+      base="https://github.com/${repo}/releases/latest/download"
+      fetch_url "${base}/${archive}" "$tmp_dir/$archive" || return 1
+      fetch_url "${base}/SHA256SUMS" "$tmp_dir/SHA256SUMS" || return 1
+    fi
+  fi
+
+  expected=$(awk -v t="$archive" '$2 == t || $2 == ("*" t) { print $1; exit }' "$tmp_dir/SHA256SUMS")
+  [ -n "$expected" ] || return 1
+  actual=$(calc_sha256 "$tmp_dir/$archive") || return 1
+  [ "$expected" = "$actual" ] || return 1
+
+  mkdir -p "$tmp_dir/extract"
+  tar -xzf "$tmp_dir/$archive" -C "$tmp_dir/extract" || return 1
+  extracted_bin="$tmp_dir/extract/agy-hud/scripts/bin/$PLATFORM/agy-hud"
+  [ -f "$extracted_bin" ] || return 1
+
+  mkdir -p "$HUD_HOME/bin"
+  chmod 0700 "$CLI_DIR" "$HUD_HOME" 2>/dev/null || true
+  stage_bin="$HUD_HOME/bin/.agy-hud.tmp.$$"
+  cp "$extracted_bin" "$stage_bin"
+  chmod 0755 "$stage_bin"
+  mv -f "$stage_bin" "$HUD_HOME/bin/agy-hud"
+  rm -rf "$tmp_dir"
+  trap - EXIT INT TERM
+  return 0
+}
+
+if [ "${AGY_HUD_NO_BOOTSTRAP:-0}" != "1" ] && bootstrap_from_release; then
+  exec "$HUD_HOME/bin/$BIN_NAME" "$@"
+fi
+
+printf '%s\n' "agy-hud: native binary not found for $PLATFORM and cargo/network bootstrap unavailable." >&2
 printf '%s\n' "Install prebuilt release via: curl -fsSL https://raw.githubusercontent.com/maxlee/agy-hud/main/install.sh | sh" >&2
 exit 1

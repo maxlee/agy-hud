@@ -295,3 +295,162 @@ fn architecture_md_mermaid_diagram_matches_hud_core_module_graph() {
         "Observed module dependency edges in hud-core must match ARCHITECTURE.md Mermaid arrows"
     );
 }
+
+#[test]
+fn marketplace_manifest_skills_and_scripts_meet_strict_spec() {
+    let root = workspace_root();
+    let manifest_raw = fs::read_to_string(root.join("plugin.json")).expect("read root plugin.json");
+    let manifest: serde_json::Value =
+        serde_json::from_str(&manifest_raw).expect("parse plugin.json");
+
+    // 1. Version parity between Cargo.toml (HUD_VERSION) and plugin.json
+    assert_eq!(
+        manifest["version"].as_str(),
+        Some(hud_core::types::HUD_VERSION),
+        "plugin.json version must stay strictly in sync with Cargo.toml HUD_VERSION"
+    );
+
+    // 2. Official Antigravity Marketplace manifest requirements
+    assert_eq!(
+        manifest["$schema"].as_str(),
+        Some("https://antigravity.google/schemas/v1/plugin.json")
+    );
+    let name = manifest["name"].as_str().expect("plugin.json name");
+    assert!(
+        !name.is_empty()
+            && name
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+            && !name.starts_with('-')
+            && !name.ends_with('-')
+            && !name.contains("--"),
+        "plugin.json name must be lowercase kebab-case: {name}"
+    );
+
+    let display_name = manifest["displayName"]
+        .as_str()
+        .expect("plugin.json displayName");
+    for forbidden_prefix in ["Antigravity", "Gemini", "Claude", "Cursor"] {
+        assert!(
+            !display_name.starts_with(forbidden_prefix),
+            "displayName must not start with restricted brand prefix {forbidden_prefix}: {display_name}"
+        );
+    }
+
+    let desc = manifest["description"]
+        .as_str()
+        .expect("plugin.json description");
+    assert!(
+        (80..=200).contains(&desc.chars().count()),
+        "Marketplace description should be concise (80..=200 chars), got {}",
+        desc.chars().count()
+    );
+
+    let logo_rel = manifest["logo"].as_str().expect("plugin.json logo");
+    let logo_svg = fs::read_to_string(root.join(logo_rel)).expect("read bundled logo asset");
+    assert!(
+        logo_svg.contains("viewBox=\"0 0 128 128\""),
+        "Bundled SVG logo must declare a 1:1 >=128x128 viewBox"
+    );
+
+    let prompts = manifest["suggestedPrompts"]
+        .as_array()
+        .expect("suggestedPrompts array");
+    assert!(
+        (1..=3).contains(&prompts.len()),
+        "Marketplace allows 1..=3 suggestedPrompts"
+    );
+    assert!(
+        prompts
+            .iter()
+            .all(|p| p.as_str().is_some_and(|s| !s.trim().is_empty()))
+    );
+
+    let author_url = manifest["author"]["url"]
+        .as_str()
+        .expect("plugin.json author.url");
+    assert!(author_url.starts_with("https://"));
+    assert!(
+        manifest["homepage"]
+            .as_str()
+            .is_some_and(|s| s.starts_with("https://"))
+    );
+    assert!(
+        manifest["repository"]
+            .as_str()
+            .is_some_and(|s| s.starts_with("https://"))
+    );
+    assert!(manifest["license"].as_str().is_some_and(|s| !s.is_empty()));
+    assert!(
+        manifest["keywords"]
+            .as_array()
+            .is_some_and(|k| !k.is_empty())
+    );
+
+    // 3. Every skill directory name must match its SKILL.md YAML frontmatter `name:`
+    let skills_root = root.join("skills");
+    for entry in fs::read_dir(&skills_root).expect("read skills/").flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let dir_name = entry.file_name().to_string_lossy().into_owned();
+        let skill_md =
+            fs::read_to_string(path.join("SKILL.md")).expect("every skill dir needs SKILL.md");
+        let frontmatter = skill_md
+            .strip_prefix("---\n")
+            .or_else(|| skill_md.strip_prefix("---\r\n"))
+            .and_then(|rest| rest.split("\n---").next())
+            .expect("SKILL.md must start with YAML frontmatter");
+        let declared_name = frontmatter
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("name:"))
+            .map(str::trim)
+            .expect("SKILL.md frontmatter must declare `name:`");
+        assert_eq!(
+            declared_name, dir_name,
+            "SKILL.md frontmatter name `{declared_name}` must match folder `skills/{dir_name}`"
+        );
+    }
+
+    // 4. Executable bits (`0755`) on helper scripts and any bundled `scripts/bin/<plat>/agy-hud`
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for rel in [
+            "scripts/agy-hud",
+            "scripts/sync-marketplace-bins.sh",
+            "skills/hud/scripts/hud-cli.sh",
+            "skills/hud-update/scripts/hud-cli.sh",
+        ] {
+            let p = root.join(rel);
+            let mode = fs::metadata(&p)
+                .unwrap_or_else(|_| panic!("missing required executable script {rel}"))
+                .permissions()
+                .mode();
+            assert_ne!(
+                mode & 0o111,
+                0,
+                "{rel} must have executable permissions (0755) for Marketplace packaging"
+            );
+        }
+
+        let bin_root = root.join("scripts/bin");
+        if bin_root.is_dir() {
+            for ent in fs::read_dir(&bin_root).unwrap().flatten() {
+                if ent.path().is_dir() {
+                    let cand = ent.path().join("agy-hud");
+                    if cand.is_file() {
+                        let mode = fs::metadata(&cand).unwrap().permissions().mode();
+                        assert_ne!(
+                            mode & 0o111,
+                            0,
+                            "{} must retain 0755 executable bit",
+                            cand.display()
+                        );
+                    }
+                }
+            }
+        }
+    }
+}

@@ -1057,7 +1057,7 @@ fn build_header_line(input: &RenderInput<'_>, labels: &Labels, opts: &HeaderOpts
             GlyphMode::Unicode => ("↑", "·"),
         };
         header_parts.push(paint(
-            &format!("{icon} v{norm} {mid} /hud-update"),
+            &format!("{icon} v{norm} {mid} /agy-hud:hud-update"),
             &[colors::YELLOW, BOLD],
         ));
     }

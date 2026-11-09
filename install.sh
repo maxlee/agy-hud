@@ -172,7 +172,7 @@ mv "${PLUGIN_STAGE}.next" "$PLUGIN_STAGE"
 
 PLUGIN_FLAG=""
 if [ "${AGY_SKIP_PLUGIN_INSTALL:-0}" != "1" ] && command -v agy >/dev/null 2>&1; then
-  printf '==> Registering Antigravity plugin (/hud & /hud-update skills) [v%s]...\n' "$BUNDLE_VERSION"
+  printf '==> Registering Antigravity plugin (/agy-hud:hud & /agy-hud:hud-update skills) [v%s]...\n' "$BUNDLE_VERSION"
   if agy plugin install "$PLUGIN_STAGE"; then
     PLUGIN_FLAG="--plugin-installed"
   else
@@ -186,4 +186,4 @@ if [ -n "$PLUGIN_FLAG" ]; then
 else
   "$PLUGIN_STAGE/scripts/bin/$PLATFORM/agy-hud" install "$@"
 fi
-printf '==> Done! agy-hud v%s is active. Launch `agy` and try `/hud` (or `/hud-update` to upgrade anytime).\n' "$BUNDLE_VERSION"
+printf '==> Done! agy-hud v%s is active. Launch `agy` and try `/agy-hud:hud` or `/agy-hud:hud-update` (if `agy` is already open, run `/skills reload` first).\n' "$BUNDLE_VERSION"

@@ -3,18 +3,19 @@ name: hud-update
 description: >-
   Check for new GitHub releases of agy-hud and upgrade the native statusLine
   binary and Antigravity plugin in one step. Use when the user invokes
-  `/hud-update`, sees an update badge (`↑ vX.Y.Z · /hud-update`) in the status
-  bar, or asks to check or update the `agy-hud` version.
+  `/agy-hud:hud-update` (or shorthand `/hud-update` / typo `/hub-update`), sees
+  an update badge (`↑ vX.Y.Z · /agy-hud:hud-update`) in the status bar, or asks
+  to check or update the `agy-hud` version.
 ---
 
-# AGY HUD (`/hud-update`) Self-Update Skill
+# AGY HUD (`/agy-hud:hud-update`) Self-Update Skill
 
 Use `sh scripts/hud-cli.sh` (relative to this skill directory) to check for newer stable releases of `agy-hud` on GitHub and perform a SHA-256-verified upgrade while preserving the user's existing `statusLine` settings (such as `stack_with_default` and `padding`) and `~/.gemini/antigravity-cli/agy-hud/config.json`.
 
 ## Workflow
 
 1. **Check or Run the Upgrade (`update`)**
-   - When the user invokes `/hud-update` directly (or asks to update `agy-hud`), run from this skill directory:
+   - When the user invokes `/agy-hud:hud-update` (or `/hud-update`) directly, or asks to update `agy-hud`, run from this skill directory:
      ```bash
      sh scripts/hud-cli.sh update
      ```

@@ -2,12 +2,13 @@
 name: hud
 description: >-
   Set up, diagnose, preview, customize, or troubleshoot the agy-hud status line
-  for Antigravity CLI (`agy`). Use when the user invokes `/hud`, mentions HUD or
-  status line, wants to display or hide context window, quota, tools, subagents,
-  or checklist progress below the CLI prompt, or wants to switch HUD language or layout.
+  for Antigravity CLI (`agy`). Use when the user invokes `/agy-hud:hud` (or
+  `/hud`), clicks a Marketplace starter prompt, mentions HUD or status line,
+  wants to display or hide context window, speed (`~tok/s`), plan tier, quota,
+  tools, subagents, or checklist progress, or wants to switch HUD language or layout.
 ---
 
-# AGY HUD (`/hud`) Interactive Skill
+# AGY HUD (`/agy-hud:hud`) Interactive Skill
 
 Use `sh scripts/hud-cli.sh` (relative to this skill directory) to inspect, preview, configure, or install the native Rust HUD binary for Antigravity CLI (`agy`).
 
@@ -35,7 +36,7 @@ Use `sh scripts/hud-cli.sh` (relative to this skill directory) to inspect, previ
      ```bash
      sh scripts/hud-cli.sh uninstall
      ```
-   - Check or upgrade to the latest release (also available directly via `/hud-update`):
+   - Check or upgrade to the latest release (also available directly via `/agy-hud:hud-update`):
      ```bash
      sh scripts/hud-cli.sh update --check
      sh scripts/hud-cli.sh update
