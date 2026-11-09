@@ -1,4 +1,4 @@
-# AGY HUD (`agy-hud`) v1.0.1 — 100% Pure Rust Edition
+# AGY HUD (`agy-hud`) v1.1.0 — 100% Pure Rust Edition
 
 [![CI](https://github.com/maxlee/agy-hud/actions/workflows/ci.yml/badge.svg)](https://github.com/maxlee/agy-hud/actions/workflows/ci.yml)
 [![Release](https://github.com/maxlee/agy-hud/actions/workflows/release.yml/badge.svg)](https://github.com/maxlee/agy-hud/releases)
@@ -70,10 +70,15 @@ agy plugin install .
 Once installed (`~/.gemini/antigravity-cli/agy-hud/bin/agy-hud` or `./scripts/agy-hud` inside a checkout):
 
 ```bash
-./scripts/agy-hud doctor                                    # Check setup, native binary, heartbeat, and config
+./scripts/agy-hud doctor                                    # JSON health check (runtime, plugin, statusLine, config)
+./scripts/agy-hud doctor --pretty                           # Human-readable diagnostics (~ paths + glyph alignment probe)
 ./scripts/agy-hud preview --state showcase                  # Preview all 5 layout/language scenarios
 ./scripts/agy-hud preview --set language=zh-Hans            # Preview Simplified Chinese UI
-./scripts/agy-hud schema                                    # List all 38 configurable keys and types
+./scripts/agy-hud schema                                    # List all 41 configurable keys and types
+./scripts/agy-hud set display.glyphMode=nerd                # Switch glyph set: unicode | nerd | ascii
+./scripts/agy-hud set display.showTitle=true                # Show sanitized conversation title (<=24 cols)
+./scripts/agy-hud set quota.backgroundRefresh=true          # Optional background `agy -p /usage` refresh (default: false)
+./scripts/agy-hud quota refresh                             # Manually refresh official `/usage` quota cache once
 ./scripts/agy-hud set language=zh-Hans vcs.showFileStats=true
 ./scripts/agy-hud set vcs.cacheTtlMs=1500                   # Tune sharded VCS mtime+TTL cache window (0 disables)
 ./scripts/agy-hud set --undo                                # Revert the previous config change

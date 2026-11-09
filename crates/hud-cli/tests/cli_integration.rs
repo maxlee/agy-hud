@@ -3,8 +3,9 @@ use hud_cli::collector::{
     compute_vcs_signature, detect_vcs_repo, extract_git_filter_names, probe_git, probe_hg,
     probe_jj, probe_vcs_cached,
 };
-use hud_cli::paths::{AgyPaths, derive_task_md_path};
-use hud_core::types::{VcsStdin, VcsType};
+use hud_cli::install::format_statusline_command_for_platform;
+use hud_cli::paths::{AgyPaths, build_logic_paths, derive_task_md_path};
+use hud_core::types::{AgyStdinData, VcsStdin, VcsType, WorkspaceStdin};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::fs;
@@ -548,4 +549,232 @@ fn full_binary_cli_lifecycle_install_render_doctor_set_undo_report_uninstall() {
     let disabled_out = child.wait_with_output().unwrap();
     assert!(disabled_out.status.success());
     assert!(disabled_out.stdout.is_empty());
+}
+
+#[test]
+fn open_pipe_stdin_exits_early_without_eof_and_nested_mode_is_inert() {
+    let tmp = TempDir::new("open-pipe");
+    let cli_dir = tmp.path.join("cli");
+    let hud_home = cli_dir.join("agy-hud");
+
+    let payload = json!({
+        "cwd": "/tmp/demo",
+        "model": { "id": "Gemini 4 Argon", "display_name": "Gemini 4 Argon" },
+        "context_window": { "used_percentage": 18.0 },
+        "agent_state": "thinking",
+        "terminal_width": 96
+    })
+    .to_string();
+
+    // 1. Open pipe WITHOUT closing `child_stdin` (`antigravity-cli#698` regression guard)
+    let started = std::time::Instant::now();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_agy-hud"))
+        .env("AGY_CLI_DIR", &cli_dir)
+        .env("AGY_HUD_HOME", &hud_home)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let mut open_stdin = child.stdin.take().unwrap();
+    open_stdin.write_all(payload.as_bytes()).unwrap();
+    open_stdin.flush().unwrap();
+    // Intentionally keep `open_stdin` alive while waiting for child to exit!
+    let status = loop {
+        if let Some(st) = child.try_wait().unwrap() {
+            break st;
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(3000),
+            "agy-hud blocked waiting for EOF on an open stdin pipe!"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    };
+    assert!(status.success());
+    let mut rendered = String::new();
+    std::io::Read::read_to_string(&mut child.stdout.take().unwrap(), &mut rendered).unwrap();
+    drop(open_stdin);
+    assert!(rendered.contains("THINKING"));
+
+    // 2. AGY_HUD_NESTED=1 exits 0 with zero output and zero disk writes
+    let nested_hud_home = tmp.path.join("nested-hud-home");
+    let mut nested = Command::new(env!("CARGO_BIN_EXE_agy-hud"))
+        .env("AGY_CLI_DIR", &cli_dir)
+        .env("AGY_HUD_HOME", &nested_hud_home)
+        .env("AGY_HUD_NESTED", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    nested
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(payload.as_bytes())
+        .unwrap();
+    let nested_out = nested.wait_with_output().unwrap();
+    assert!(nested_out.status.success());
+    assert!(nested_out.stdout.is_empty());
+    assert!(
+        !nested_hud_home.exists(),
+        "AGY_HUD_NESTED=1 must never create files or directories"
+    );
+}
+
+#[test]
+fn git_worktree_current_dir_priority_and_zero_subprocess_git_head_fallback() {
+    let tmp = TempDir::new("worktree-head-fallback");
+    let main_repo = tmp.path.join("main-repo");
+    let main_git_dir = main_repo.join(".git");
+    let wt_git_dir = main_git_dir.join("worktrees").join("wt-hotfix");
+    fs::create_dir_all(&wt_git_dir).unwrap();
+    fs::write(wt_git_dir.join("HEAD"), "ref: refs/heads/hotfix/pipe-eof\n").unwrap();
+    fs::write(wt_git_dir.join("commondir"), "../..\n").unwrap();
+
+    let wt_dir = tmp.path.join("wt-hotfix-checkout");
+    fs::create_dir_all(&wt_dir).unwrap();
+    fs::write(
+        wt_dir.join(".git"),
+        format!("gitdir: {}\n", wt_git_dir.display()),
+    )
+    .unwrap();
+
+    let mut env_map = HashMap::new();
+    env_map.insert(
+        "AGY_CLI_DIR".to_string(),
+        tmp.path.join("cli").to_string_lossy().into_owned(),
+    );
+    env_map.insert(
+        "AGY_HUD_HOME".to_string(),
+        tmp.path.join("hud").to_string_lossy().into_owned(),
+    );
+    let paths = AgyPaths::from_env_map(&env_map);
+
+    // 1. `workspace.current_dir` (worktree) takes priority over `workspace.project_dir` (main repo)
+    let stdin = AgyStdinData {
+        cwd: Some(main_repo.to_string_lossy().into_owned()),
+        workspace: Some(WorkspaceStdin {
+            current_dir: Some(wt_dir.to_string_lossy().into_owned()),
+            project_dir: Some(main_repo.to_string_lossy().into_owned()),
+        }),
+        ..Default::default()
+    };
+    let logic_paths = build_logic_paths(&paths, Some(&stdin), None);
+    assert_eq!(
+        logic_paths.cwd.as_deref(),
+        Some(
+            fs::canonicalize(&wt_dir)
+                .unwrap()
+                .to_string_lossy()
+                .as_ref()
+        )
+    );
+
+    // 2. When `git` times out / is absent (`runner` returns `None`), `.git/HEAD` fallback resolves worktree branch & caches it!
+    let spawns = AtomicUsize::new(0);
+    let failing_runner = |_cmd: &str, _args: &[String], _cwd: Option<&Path>| -> Option<String> {
+        spawns.fetch_add(1, Ordering::SeqCst);
+        None
+    };
+
+    let t0 = 1_700_000_000_000i64;
+    let first: Value = serde_json::from_str(
+        &probe_vcs_cached(&wt_dir, &paths, 1500, None, t0, &failing_runner).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(first["branch"], "hotfix/pipe-eof");
+    assert_eq!(spawns.load(Ordering::SeqCst), 1);
+
+    // Second render within TTL hits cache -> 0 additional failing `git` spawns!
+    let second: Value = serde_json::from_str(
+        &probe_vcs_cached(&wt_dir, &paths, 1500, None, t0 + 200, &failing_runner).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(second["branch"], "hotfix/pipe-eof");
+    assert_eq!(spawns.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn windows_statusline_quote_fix_and_isolated_quota_refresh_e2e() {
+    // 1. Windows `statusLine.command` quote trap check (`tightship#89`)
+    let (win_cmd_clean, warn_clean) = format_statusline_command_for_platform(
+        r"C:\Users\max\.gemini\antigravity-cli\agy-hud\bin\agy-hud.exe",
+        true,
+    );
+    assert!(!win_cmd_clean.contains('"'));
+    assert!(warn_clean.is_none());
+
+    let (win_cmd_spaced, warn_spaced) = format_statusline_command_for_platform(
+        r"C:\Users\Max Lee\.gemini\antigravity-cli\agy-hud\bin\agy-hud.exe",
+        true,
+    );
+    assert!(!win_cmd_spaced.contains('"'));
+    assert!(warn_spaced.unwrap().contains("8.3 short path"));
+
+    // 2. Hermetic `agy-hud quota refresh` E2E with fake `agy` binary verifying env & isolated temp cwd
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = TempDir::new("quota-refresh");
+        let cli_dir = tmp.path.join("cli");
+        let hud_home = cli_dir.join("agy-hud");
+        let fake_agy = tmp.path.join("fake-agy.sh");
+
+        let script = r#"#!/bin/sh
+if [ "$AGY_HUD_NESTED" != "1" ]; then
+  exit 2
+fi
+if [ "$AGY_CLI_DISABLE_AUTO_UPDATE" != "true" ]; then
+  exit 3
+fi
+case "$(pwd)" in
+  *agy-hud-usage-*) ;;
+  *) exit 4 ;;
+esac
+cat <<'EOF'
+{"command":{"data":{"groups":[{"buckets":[{"id":"gemini-argon-wtu-weekly","remaining_fraction":0.35,"reset_time":"2099-01-01T00:00:00Z"}]}]}}}
+EOF
+"#;
+        fs::write(&fake_agy, script).unwrap();
+        fs::set_permissions(&fake_agy, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let env_vars: [(&str, &Path); 3] = [
+            ("AGY_CLI_DIR", cli_dir.as_path()),
+            ("AGY_HUD_HOME", hud_home.as_path()),
+            ("AGY_HUD_AGY_BIN", fake_agy.as_path()),
+        ];
+
+        let (ok_ref, ref_out) = run_bin(&["quota", "refresh"], &env_vars, None);
+        assert!(ok_ref, "quota refresh failed: {ref_out}");
+        let ref_json: Value = serde_json::from_str(&ref_out).unwrap();
+        assert_eq!(ref_json["refreshed"], true);
+        assert_eq!(ref_json["buckets"], json!(["gemini-argon-wtu-weekly"]));
+        assert!(hud_home.join("data/quota-cache.json").exists());
+
+        // Verify live render reconciles stale official 0.80 down to cached 0.35 (65% used)!
+        let live_payload = json!({
+            "cwd": "/tmp/demo",
+            "model": { "id": "Gemini 4 Argon", "display_name": "Gemini 4 Argon" },
+            "context_window": { "used_percentage": 20.0 },
+            "quota": {
+                "gemini-argon-wtu-weekly": {
+                    "remaining_fraction": 0.80,
+                    "reset_time": "2099-01-01T00:00:00Z"
+                },
+                "3p-5h": {
+                    "remaining_fraction": 0.99,
+                    "reset_time": "2099-01-01T00:00:00Z"
+                }
+            },
+            "agent_state": "idle",
+            "terminal_width": 120
+        })
+        .to_string();
+
+        let (ok_live, live_out) = run_bin(&[], &env_vars, Some(&live_payload));
+        assert!(ok_live);
+        assert!(live_out.contains("Quota(argon-weekly)"));
+        assert!(live_out.contains("65%"));
+    }
 }

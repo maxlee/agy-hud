@@ -1,4 +1,4 @@
-# `agy-hud` v1.0.0 — 100% Pure Rust Single-Engine Architecture
+# `agy-hud` v1.1.0 — 100% Pure Rust Single-Engine Architecture
 
 `agy-hud` is a **100% Pure Rust** native statusLine HUD for the Google Antigravity CLI (`agy`). There is **zero Node.js / TypeScript runtime or wrapper code** in the repository.
 
@@ -15,12 +15,13 @@ Instead of spawning a second runtime VM per render, `agy-hud` enforces capabilit
    - Strictly forbidden from referencing `std::fs`, `std::process`, `std::net`, `std::env`, or `std::os`.
    - Owns all untrusted JSON/JSONL/Markdown parsing (`stdin.rs`, `transcript.rs`, `probes.rs`), `CONFIG_SCHEMA` validation (`config.rs`), multi-layout CJK-aware rendering (`render.rs`), CLI subcommand logic (`commands.rs`), and the `terminal_filter` output escape firewall (`ansi.rs`).
 2. **`crates/hud-cli` (Thin Capability Binary — `#![forbid(unsafe_code)]`)**
-   - Owns bounded `stdin` reading (`256 KB` cap), bounded `O(1)` `transcript.jsonl` reading (`8 KB` head + `256 KB` tail), symlink-swept `<hudHome>/data` management, and `std::thread::scope` parallel probe execution.
+   - Owns non-blocking early-exit `stdin` JSON reading (`1000 ms` open-pipe guard, `256 KB` cap, `AGY_HUD_NESTED=1` fast inert exit), bounded `O(1)` `transcript.jsonl` reading (`8 KB` head + `256 KB` tail), symlink-swept `<hudHome>/data` management, `std::thread::scope` parallel probe execution, and opt-in isolated `/usage` quota refresh (`quota_refresh.rs`).
    - Executes strictly read-only, shell-free, `1200 ms` timeout-bounded `git`, `jj`, `hg`, and `vm_stat` probes:
-     - **Git**: Enforces `-c protocol.allow=never`, `-c core.fsmonitor=false`, `--no-optional-locks`, `--ignore-submodules=dirty`, `GIT_NO_LAZY_FETCH=1`, AND parses `.git/config` in memory to dynamically neutralize any repo-local `[filter "<name>"]` drivers (`-c filter.<name>.clean=`, `smudge=`, `process=`, `required=false`).
+     - **Git**: Enforces `-c protocol.allow=never`, `-c core.fsmonitor=false`, `--no-optional-locks`, `--ignore-submodules=dirty`, `GIT_NO_LAZY_FETCH=1`, parses `.git/config` in memory to dynamically neutralize any repo-local `[filter "<name>"]` drivers (`-c filter.<name>.clean=`, `smudge=`, `process=`, `required=false`), AND falls back to zero-subprocess `.git/HEAD` parsing (including linked worktrees) if `git` is absent or exceeds `1200 ms`.
      - **Jujutsu (`jj`)**: Enforces `--ignore-working-copy --at-operation=@ --no-pager` so background renders never snapshot or mutate the working copy.
      - **Mercurial (`hg`)**: Enforces `HGPLAIN=1 --config ui.interactive=False --config extensions.fsmonitor=!`.
    - Stores VCS probe caches in **per-workspace sharded files** (`<hudHome>/probe-cache/<fnv64>.json`), eliminating cross-window write contention while invalidating in `O(1)` on `.git/HEAD`, `.git/index`, `.jj/working_copy/checkout`, or `.hg/dirstate` `mtime`/`size` changes.
+   - Supports optional official `/usage` quota cache reconciliation (`quota.backgroundRefresh = false` by default, or manual `agy-hud quota refresh`) executed in an empty isolated temp directory with `AGY_HUD_NESTED=1`, `AGY_CLI_DISABLE_AUTO_UPDATE=true`, exclusive lockfile ownership, and `60 s..600 s` exponential failure backoff.
    - Passes every rendered output line through `hud_core::ansi::terminal_filter` before writing to `stdout`.
 
 ---
@@ -31,7 +32,7 @@ Instead of spawning a second runtime VM per render, `agy-hud` enforces capabilit
 flowchart TD
   subgraph CLI["crates/hud-cli (Native Capability Binary: agy-hud)"]
     cli_main["Binary Entry: main.rs"]
-    cli_lib["CLI Modules: lib.rs collector.rs install.rs paths.rs"]
+    cli_lib["CLI Modules: lib.rs collector.rs install.rs paths.rs quota_refresh.rs"]
   end
 
   subgraph CORE["crates/hud-core (Zero-I/O Pure Crate)"]

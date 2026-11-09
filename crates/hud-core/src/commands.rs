@@ -2,14 +2,14 @@ use crate::ansi::{BOLD, colors, paint, strip_ansi};
 use crate::config::{
     CONFIG_SCHEMA, SchemaValueKind, get_dot_value, parse_config_str, parse_set_pairs, set_dot_value,
 };
-use crate::probes::{parse_memory_info, parse_vcs_info};
+use crate::probes::{parse_cached_quota_info, parse_memory_info, parse_vcs_info};
 use crate::render::{RenderInput, render_hud_lines};
 use crate::transcript::parse_transcript_and_tasks;
 use crate::types::{
     AgyStdinData, CommandOutput, ContextWindowStdin, CostStdin, CurrentUsageStdin, DoctorFacts,
-    Language, LogicPaths, ModelStdin, ProbeAnswers, RawQuotaBucket, SandboxStdin, SubagentEntry,
-    SubagentStatus, SubagentStdin, TodoItem, TodoStatus, ToolEntry, ToolStatus, TranscriptSummary,
-    VimStdin, WorkspaceStdin,
+    GlyphMode, Language, LogicPaths, ModelStdin, ProbeAnswers, RawQuotaBucket, SandboxStdin,
+    SubagentEntry, SubagentStatus, SubagentStdin, TodoItem, TodoStatus, ToolEntry, ToolStatus,
+    TranscriptSummary, VimStdin, WorkspaceStdin,
 };
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
@@ -127,7 +127,27 @@ fn parse_json_object_safe(raw_text: Option<&str>) -> Option<Map<String, Value>> 
     }
 }
 
-fn run_doctor(ctx: &CommandContext<'_>) -> CommandOutput {
+fn normalize_compare_path(p: &str) -> String {
+    p.replace('\\', "/").trim_end_matches('/').to_string()
+}
+
+pub fn abbreviate_home_path(text: &str, home_dir: &str) -> String {
+    let clean_home = home_dir.trim_end_matches(['/', '\\']);
+    if clean_home.is_empty() {
+        return text.to_string();
+    }
+    let mut out = text.replace(clean_home, "~");
+    let slash_home = clean_home.replace('\\', "/");
+    if slash_home != clean_home {
+        out = out.replace(&slash_home, "~");
+    }
+    out
+}
+
+fn run_doctor(args: &[String], ctx: &CommandContext<'_>) -> CommandOutput {
+    let (flags, _) = parse_cli_args(args);
+    let pretty_mode = flags.contains_key("--pretty");
+
     let loaded = parse_config_str(ctx.config_text);
     let cli_settings = parse_json_object_safe(ctx.cli_settings_text);
     let sl = cli_settings
@@ -172,6 +192,40 @@ fn run_doctor(ctx: &CommandContext<'_>) -> CommandOutput {
         );
     }
 
+    if kind == "agy-hud" && ctx.facts.platform == "windows" {
+        if cmd.contains('"') {
+            findings.push(
+                "Windows statusLine.command contains double quotes (\"), which breaks Antigravity CLI cmd.exe invocation (tightship#89). Fix: run `agy-hud install --replace`.".to_string(),
+            );
+        } else if cmd.contains(' ') {
+            findings.push(
+                "Windows statusLine.command path contains spaces without 8.3 short-path form. Fix: move agy-hud to a space-free path or configure its 8.3 short path.".to_string(),
+            );
+        }
+    }
+
+    let runs_installed_copy = ctx.facts.installed_plugin.as_ref().is_some_and(|ip| {
+        let ip_norm = normalize_compare_path(&ip.path);
+        !ip_norm.is_empty()
+            && (normalize_compare_path(&ctx.facts.plugin.root) == ip_norm
+                || normalize_compare_path(&ctx.facts.runtime.exec_path).starts_with(&ip_norm)
+                || normalize_compare_path(cmd).contains(&ip_norm))
+    });
+
+    if let Some(ip) = ctx.facts.installed_plugin.as_ref() {
+        if !ip.enabled {
+            findings.push(
+                "Installed agy-hud plugin is disabled in `agy plugin list`. Fix: enable the plugin in agy CLI.".to_string(),
+            );
+        }
+        if !ip.version.is_empty() && ip.version != ctx.facts.plugin.version {
+            findings.push(format!(
+                "Installed plugin version ({}) differs from active binary version ({}). Fix: update the plugin and run `agy-hud install --replace`.",
+                ip.version, ctx.facts.plugin.version
+            ));
+        }
+    }
+
     if kind == "agy-hud" && enabled && ctx.facts.heartbeat.is_none() {
         findings.push(
             "agy CLI has not executed agy-hud yet. Fix: start `agy` and send a prompt to trigger the first statusLine render.".to_string(),
@@ -191,6 +245,129 @@ fn run_doctor(ctx: &CommandContext<'_>) -> CommandOutput {
         ));
     }
 
+    let healthy_msg =
+        "None. agy-hud (native Rust engine) is healthy, configured, and ready to render."
+            .to_string();
+    let final_findings = if findings.is_empty() {
+        vec![healthy_msg]
+    } else {
+        findings
+    };
+
+    if pretty_mode {
+        let home = &ctx.facts.home_dir;
+        let platform = if ctx.facts.platform.is_empty() {
+            "unknown"
+        } else {
+            ctx.facts.platform.as_str()
+        };
+        let terminal = if ctx.facts.terminal.is_empty() {
+            "unknown"
+        } else {
+            ctx.facts.terminal.as_str()
+        };
+        let session_label = if ctx.facts.remote_session {
+            "remote (SSH)"
+        } else {
+            "local"
+        };
+        let glyph_str = match loaded.config.display.glyph_mode {
+            GlyphMode::Unicode => "unicode",
+            GlyphMode::Nerd => "nerd",
+            GlyphMode::Ascii => "ascii",
+        };
+        let cmd_disp = if cmd.is_empty() {
+            "<not set>".to_string()
+        } else {
+            abbreviate_home_path(&redact_command(cmd), home)
+        };
+        let plugin_status = if ctx.facts.installed_plugin_status.is_empty() {
+            "unknown"
+        } else {
+            ctx.facts.installed_plugin_status.as_str()
+        };
+
+        let mut out = Vec::new();
+        out.push(paint(
+            &format!(
+                "agy-hud doctor (v{} · {})",
+                ctx.facts.plugin.version, ctx.facts.runtime.engine
+            ),
+            &[colors::BRIGHT_CYAN, BOLD],
+        ));
+        out.push(format!(
+            "  Runtime          : {}",
+            abbreviate_home_path(&ctx.facts.runtime.exec_path, home)
+        ));
+        out.push(format!(
+            "  Environment      : {platform} · terminal={terminal} · session={session_label}"
+        ));
+        out.push(format!(
+            "  StatusLine       : kind={kind} · enabled={enabled} · command={cmd_disp}"
+        ));
+        out.push(format!(
+            "  Settings File    : {}",
+            abbreviate_home_path(&ctx.paths.cli_settings, home)
+        ));
+        if let Some(ip) = ctx.facts.installed_plugin.as_ref() {
+            out.push(format!(
+                "  Installed Plugin : {plugin_status} (v{}, enabled={}, runsInstalledCopy={}, path={})",
+                ip.version,
+                ip.enabled,
+                runs_installed_copy,
+                abbreviate_home_path(&ip.path, home)
+            ));
+        } else {
+            out.push(format!("  Installed Plugin : {plugin_status}"));
+        }
+        out.push(format!(
+            "  Config           : {} (glyphMode={glyph_str}, quota.backgroundRefresh={})",
+            abbreviate_home_path(&ctx.paths.config, home),
+            loaded.config.quota.background_refresh
+        ));
+        if let Some(hb) = ctx.facts.heartbeat.as_ref() {
+            let secs = ((ctx.now_ms - hb.at).max(0) as f64 / 1000.0).round() as u64;
+            out.push(format!(
+                "  Last Render      : outcome={} · {}s ago · duration={}ms",
+                hb.outcome,
+                secs,
+                hb.duration_ms.unwrap_or(0)
+            ));
+        } else {
+            out.push("  Last Render      : none yet".to_string());
+        }
+        out.push(String::new());
+        out.push(paint(
+            "Glyph Alignment Probe (right '|' bars should align vertically):",
+            &[colors::BRIGHT_WHITE, BOLD],
+        ));
+        out.push("  unicode : |● READY │ █▓▒░· │ ⏱ 12m|".to_string());
+        out.push("  nerd    : |\u{f07c} READY │ █▓▒░· │ \u{ee9c} 12m|".to_string());
+        out.push("  ascii   : |* READY | ##==- | t 12m|".to_string());
+        if ctx.facts.remote_session && loaded.config.display.glyph_mode != GlyphMode::Ascii {
+            out.push(paint(
+                "  Tip: SSH session detected; if glyphs misalign, run `agy-hud set display.glyphMode=ascii`.",
+                &[colors::YELLOW],
+            ));
+        } else {
+            out.push(paint(
+                "  Tip: switch via `agy-hud set display.glyphMode=unicode|nerd|ascii`.",
+                &[colors::GRAY],
+            ));
+        }
+        out.push(String::new());
+        out.push(paint("Findings:", &[colors::BRIGHT_WHITE, BOLD]));
+        for f in &final_findings {
+            out.push(format!("  - {}", abbreviate_home_path(f, home)));
+        }
+
+        return CommandOutput {
+            lines: out,
+            failed: false,
+            config_to_write: None,
+        };
+    }
+
     let last_render = ctx.facts.heartbeat.as_ref().map(|hb| {
         let secs = ((ctx.now_ms - hb.at).max(0) as f64 / 1000.0).round() as u64;
         json!({
@@ -201,9 +378,29 @@ fn run_doctor(ctx: &CommandContext<'_>) -> CommandOutput {
         })
     });
 
+    let installed_plugin_status = if ctx.facts.installed_plugin_status.is_empty() {
+        "unknown"
+    } else {
+        ctx.facts.installed_plugin_status.as_str()
+    };
+
     let report = json!({
         "runtime": ctx.facts.runtime,
+        "environment": {
+            "platform": ctx.facts.platform,
+            "terminal": ctx.facts.terminal,
+            "remoteSession": ctx.facts.remote_session,
+        },
         "plugin": ctx.facts.plugin,
+        "installedPlugin": {
+            "status": installed_plugin_status,
+            "details": ctx.facts.installed_plugin.as_ref().map(|ip| json!({
+                "version": ip.version,
+                "path": ip.path,
+                "enabled": ip.enabled,
+                "runsInstalledCopy": runs_installed_copy,
+            })),
+        },
         "statusLine": {
             "settingsFile": ctx.paths.cli_settings,
             "kind": kind,
@@ -215,13 +412,11 @@ fn run_doctor(ctx: &CommandContext<'_>) -> CommandOutput {
         "config": {
             "path": ctx.paths.config,
             "vcsCacheTtlMs": loaded.config.vcs.cache_ttl_ms,
+            "glyphMode": loaded.config.display.glyph_mode,
+            "quotaBackgroundRefresh": loaded.config.quota.background_refresh,
             "problems": loaded.problems,
         },
-        "findings": if findings.is_empty() {
-            vec!["None. agy-hud (native Rust engine) is healthy, configured, and ready to render.".to_string()]
-        } else {
-            findings
-        },
+        "findings": final_findings,
     });
 
     let pretty = serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".to_string());
@@ -457,6 +652,7 @@ fn sample_presets(now_ms: i64) -> HashMap<&'static str, SamplePreset> {
             })
             .to_string(),
         ),
+        quota_cache: None,
     };
 
     let mut presets = HashMap::new();
@@ -613,6 +809,7 @@ fn run_preview(args: &[String], ctx: &CommandContext<'_>) -> CommandOutput {
         );
         let vcs = parse_vcs_info(snap.stdin.as_ref(), &snap.probes);
         let memory = parse_memory_info(&snap.probes);
+        let cached_quota = parse_cached_quota_info(&snap.probes);
         let cols = explicit_width
             .or_else(|| snap.stdin.as_ref().and_then(|s| s.terminal_width))
             .or(Some(100));
@@ -622,6 +819,7 @@ fn run_preview(args: &[String], ctx: &CommandContext<'_>) -> CommandOutput {
             transcript: &transcript,
             vcs: vcs.as_ref(),
             memory: memory.as_ref(),
+            cached_quota: cached_quota.as_ref(),
             columns: cols,
             now_ms: ctx.now_ms,
         });
@@ -689,6 +887,7 @@ fn run_preview(args: &[String], ctx: &CommandContext<'_>) -> CommandOutput {
                 transcript: &p.transcript,
                 vcs: vcs.as_ref(),
                 memory: memory.as_ref(),
+                cached_quota: None,
                 columns: Some(explicit_width.unwrap_or(*width)),
                 now_ms: ctx.now_ms,
             });
@@ -714,6 +913,7 @@ fn run_preview(args: &[String], ctx: &CommandContext<'_>) -> CommandOutput {
             transcript: &p.transcript,
             vcs: vcs.as_ref(),
             memory: memory.as_ref(),
+            cached_quota: None,
             columns: cols,
             now_ms: ctx.now_ms,
         });
@@ -735,6 +935,7 @@ fn run_preview(args: &[String], ctx: &CommandContext<'_>) -> CommandOutput {
             transcript: &TranscriptSummary::default(),
             vcs: vcs.as_ref(),
             memory: None,
+            cached_quota: None,
             columns: cols,
             now_ms: ctx.now_ms,
         });
@@ -851,6 +1052,7 @@ fn run_report(args: &[String], ctx: &CommandContext<'_>) -> CommandOutput {
         transcript: &TranscriptSummary::default(),
         vcs: vcs.as_ref(),
         memory: None,
+        cached_quota: None,
         columns: cols,
         now_ms: ctx.now_ms,
     })
@@ -878,7 +1080,7 @@ fn run_report(args: &[String], ctx: &CommandContext<'_>) -> CommandOutput {
 
 pub fn execute_subcommand(name: &str, args: &[String], ctx: &CommandContext<'_>) -> CommandOutput {
     match name {
-        "doctor" => run_doctor(ctx),
+        "doctor" => run_doctor(args, ctx),
         "schema" => run_schema(args, ctx),
         "preview" => run_preview(args, ctx),
         "set" => run_set(args, ctx),
@@ -886,7 +1088,7 @@ pub fn execute_subcommand(name: &str, args: &[String], ctx: &CommandContext<'_>)
         other => CommandOutput {
             lines: vec![
                 format!("Unknown subcommand \"{other}\"."),
-                "Available commands: doctor, install, uninstall, preview, schema, set, report"
+                "Available commands: doctor, install, uninstall, preview, schema, set, quota, report"
                     .to_string(),
             ],
             failed: true,

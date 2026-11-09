@@ -55,6 +55,15 @@ pub enum EffortFormatMode {
     Hidden,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum GlyphMode {
+    #[default]
+    Unicode,
+    Nerd,
+    Ascii,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PathLevels {
     #[default]
@@ -406,11 +415,22 @@ pub struct QuotaBucketView {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CachedQuotaSnapshot {
+    pub at: i64,
+    pub source: String,
+    #[serde(default)]
+    pub quota: BTreeMap<String, RawQuotaBucket>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ProbeAnswers {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vcs: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub memory: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quota_cache: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -440,12 +460,32 @@ pub struct PluginFacts {
     pub version: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InstalledPluginFacts {
+    pub version: String,
+    pub path: String,
+    pub enabled: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DoctorFacts {
     pub cwd: String,
+    #[serde(default)]
+    pub home_dir: String,
+    #[serde(default)]
+    pub platform: String,
+    #[serde(default)]
+    pub terminal: String,
+    #[serde(default)]
+    pub remote_session: bool,
     pub runtime: RuntimeFacts,
     pub plugin: PluginFacts,
+    #[serde(default)]
+    pub installed_plugin_status: String,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub installed_plugin: Option<InstalledPluginFacts>,
     pub config_path: String,
     pub heartbeat: Option<HeartbeatInfo>,
 }
@@ -458,6 +498,8 @@ pub struct LogicPaths {
     pub undo: String,
     pub heartbeat: String,
     pub last_snapshot: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub quota_cache: Option<String>,
     pub cli_settings: String,
     pub transcript: Option<String>,
     pub task_md: Option<String>,

@@ -1,12 +1,19 @@
 use crate::types::{
-    ContextValueMode, EffortFormatMode, Language, LineLayout, ModelFormatMode, PathLevels,
-    QuotaValueMode,
+    ContextValueMode, EffortFormatMode, GlyphMode, Language, LineLayout, ModelFormatMode,
+    PathLevels, QuotaValueMode,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 pub const MAX_CONFIG_BYTES: usize = 64 * 1024;
 const MAX_DEPTH: usize = 6;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct QuotaConfig {
+    #[serde(default)]
+    pub background_refresh: bool,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -39,6 +46,10 @@ pub struct DisplayConfig {
     pub model_format: ModelFormatMode,
     pub effort_format: EffortFormatMode,
     pub show_project: bool,
+    #[serde(default)]
+    pub show_title: bool,
+    #[serde(default)]
+    pub glyph_mode: GlyphMode,
     pub show_context_bar: bool,
     pub bar_length: usize,
     pub context_value: ContextValueMode,
@@ -72,6 +83,8 @@ impl Default for DisplayConfig {
             model_format: ModelFormatMode::Compact,
             effort_format: EffortFormatMode::Text,
             show_project: true,
+            show_title: false,
+            glyph_mode: GlyphMode::Unicode,
             show_context_bar: true,
             bar_length: 12,
             context_value: ContextValueMode::Both,
@@ -106,6 +119,8 @@ pub struct HudConfig {
     pub path_levels: PathLevels,
     pub max_width: Option<usize>,
     pub hyperlinks: bool,
+    #[serde(default)]
+    pub quota: QuotaConfig,
     pub vcs: VcsConfig,
     pub display: DisplayConfig,
 }
@@ -118,6 +133,7 @@ impl Default for HudConfig {
             path_levels: PathLevels::One,
             max_width: None,
             hyperlinks: true,
+            quota: QuotaConfig::default(),
             vcs: VcsConfig::default(),
             display: DisplayConfig::default(),
         }
@@ -179,6 +195,11 @@ pub const CONFIG_SCHEMA: &[SchemaEntry] = &[
         description: "Emit clickable OSC 8 file:// links for workspace and tool targets.",
     },
     SchemaEntry {
+        key: "quota.backgroundRefresh",
+        kind: SchemaValueKind::Boolean,
+        description: "Refresh stale quota in background via read-only `agy -p /usage` (off by default).",
+    },
+    SchemaEntry {
         key: "vcs.enabled",
         kind: SchemaValueKind::Boolean,
         description: "Show git/jj/hg branch and repository state.",
@@ -235,6 +256,16 @@ pub const CONFIG_SCHEMA: &[SchemaEntry] = &[
         key: "display.showProject",
         kind: SchemaValueKind::Boolean,
         description: "Show workspace folder path.",
+    },
+    SchemaEntry {
+        key: "display.showTitle",
+        kind: SchemaValueKind::Boolean,
+        description: "Show sanitized conversation_title in header (up to 24 cols; dropped first on narrow terminals).",
+    },
+    SchemaEntry {
+        key: "display.glyphMode",
+        kind: SchemaValueKind::Enum(&["\"unicode\"", "\"nerd\"", "\"ascii\""]),
+        description: "Icon/glyph set: unicode (default), nerd (Nerd Font icons), or ascii (7-bit text for SSH/TTY).",
     },
     SchemaEntry {
         key: "display.showContextBar",

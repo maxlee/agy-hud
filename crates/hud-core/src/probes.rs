@@ -1,5 +1,11 @@
 use crate::ansi::sanitize_text;
-use crate::types::{AgyStdinData, MemoryProbeInfo, ProbeAnswers, VcsProbeInfo, VcsType};
+use crate::transcript::parse_iso_ms;
+use crate::types::{
+    AgyStdinData, CachedQuotaSnapshot, MemoryProbeInfo, ProbeAnswers, RawQuotaBucket, VcsProbeInfo,
+    VcsType,
+};
+use serde_json::Value;
+use std::collections::BTreeMap;
 
 /// Merges `stdin.vcs` metadata from `agy` CLI with optional rich VCS probe JSON from `hud-cli`.
 pub fn parse_vcs_info(
@@ -224,6 +230,111 @@ pub fn parse_hg_probe_output(branch_out: &str, status_out: Option<&str>) -> Opti
         conflicts: 0,
         repo_url: None,
     })
+}
+
+/// Parses raw `.git/HEAD` text (`ref: refs/heads/...` or detached SHA) without spawning `git`.
+pub fn parse_git_head_text(head_raw: &str) -> Option<VcsProbeInfo> {
+    let trimmed = head_raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let raw_branch = if let Some(after_ref) = trimmed.strip_prefix("ref:") {
+        let r = after_ref.trim();
+        if let Some(b) = r.strip_prefix("refs/heads/") {
+            b.to_string()
+        } else {
+            r.rsplit('/').next().unwrap_or(r).to_string()
+        }
+    } else if trimmed.len() >= 7 && trimmed.bytes().all(|b| b.is_ascii_hexdigit()) {
+        format!("@{}", &trimmed[..7])
+    } else {
+        trimmed.to_string()
+    };
+
+    let branch = sanitize_text(&raw_branch);
+    if branch.is_empty() {
+        return None;
+    }
+    Some(VcsProbeInfo {
+        vcs_type: VcsType::Git,
+        branch,
+        dirty: false,
+        ahead: 0,
+        behind: 0,
+        modified: 0,
+        added: 0,
+        deleted: 0,
+        untracked: 0,
+        conflicts: 0,
+        repo_url: None,
+    })
+}
+
+fn is_valid_bucket_id(id: &str) -> bool {
+    let bytes = id.as_bytes();
+    if bytes.is_empty() || bytes.len() > 40 {
+        return false;
+    }
+    if !(bytes[0].is_ascii_lowercase() || bytes[0].is_ascii_digit()) {
+        return false;
+    }
+    bytes
+        .iter()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'_' | b'-'))
+}
+
+/// Parses `agy -p /usage --output-format json` stdout into sanitized quota buckets.
+pub fn parse_usage_command_output(stdout: &str) -> Option<BTreeMap<String, RawQuotaBucket>> {
+    let parsed: Value = serde_json::from_str(stdout.trim()).ok()?;
+    let groups = parsed
+        .get("command")
+        .and_then(|c| c.get("data"))
+        .and_then(|d| d.get("groups"))
+        .and_then(Value::as_array)?;
+
+    let mut quota = BTreeMap::new();
+    for group in groups {
+        let Some(buckets) = group.get("buckets").and_then(Value::as_array) else {
+            continue;
+        };
+        for item in buckets {
+            let Some(id) = item.get("id").and_then(Value::as_str) else {
+                continue;
+            };
+            if !is_valid_bucket_id(id) {
+                continue;
+            }
+            let Some(fraction) = item.get("remaining_fraction").and_then(Value::as_f64) else {
+                continue;
+            };
+            if !fraction.is_finite() || !(0.0..=1.0).contains(&fraction) {
+                continue;
+            }
+            let Some(reset_str) = item.get("reset_time").and_then(Value::as_str) else {
+                continue;
+            };
+            if parse_iso_ms(reset_str).is_none() {
+                continue;
+            }
+            quota.insert(
+                id.to_string(),
+                RawQuotaBucket {
+                    remaining_fraction: Some(fraction),
+                    remaining_amount: None,
+                    reset_time: Some(reset_str.to_string()),
+                    reset_in_seconds: None,
+                    disabled: None,
+                },
+            );
+        }
+    }
+
+    (!quota.is_empty()).then_some(quota)
+}
+
+pub fn parse_cached_quota_info(answers: &ProbeAnswers) -> Option<CachedQuotaSnapshot> {
+    let raw_json = answers.quota_cache.as_deref()?;
+    serde_json::from_str::<CachedQuotaSnapshot>(raw_json).ok()
 }
 
 #[cfg(test)]

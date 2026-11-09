@@ -1,4 +1,4 @@
-# AGY HUD (`agy-hud`) v1.0.1 — 100% 纯 Rust 极速版指南
+# AGY HUD (`agy-hud`) v1.1.0 — 100% 纯 Rust 极速版指南
 
 [![CI](https://github.com/maxlee/agy-hud/actions/workflows/ci.yml/badge.svg)](https://github.com/maxlee/agy-hud/actions/workflows/ci.yml)
 [![Release](https://github.com/maxlee/agy-hud/actions/workflows/release.yml/badge.svg)](https://github.com/maxlee/agy-hud/releases)
@@ -76,9 +76,14 @@ curl -fsSL https://raw.githubusercontent.com/maxlee/agy-hud/main/uninstall.sh | 
 ## 常用管理命令
 
 ```bash
-./scripts/agy-hud doctor                                      # 诊断原生二进制、settings.json 与最近一次渲染耗时
+./scripts/agy-hud doctor                                      # 输出结构化 JSON 诊断报告（供插件与排障使用）
+./scripts/agy-hud doctor --pretty                             # 人类可读诊断面板（自动缩写 ~ 路径 + 3 模式图标对齐探针）
 ./scripts/agy-hud preview --state showcase                    # 预览 5 种典型宽度、状态与中英文布局
-./scripts/agy-hud schema                                      # 查看全部 38 个可配置项、类型及说明
+./scripts/agy-hud schema                                      # 查看全部 41 个可配置项、类型及说明
+./scripts/agy-hud set display.glyphMode=nerd                  # 切换字符集模式：unicode | nerd | ascii（纯 7-bit）
+./scripts/agy-hud set display.showTitle=true                  # 在顶栏展示当前会话标题（自动脱敏裁剪至 <=24 列）
+./scripts/agy-hud set quota.backgroundRefresh=true            # 可选开启后台 `/usage` 官方配额自动刷新（默认关闭 false）
+./scripts/agy-hud quota refresh                               # 手动触发一次官方 `/usage` 配额快照同步
 ./scripts/agy-hud set language=zh-Hans vcs.showFileStats=true # 修改配置（自动保存上一步快照）
 ./scripts/agy-hud set --undo                                  # 一键撤销上一次配置修改
 ./scripts/agy-hud report --note "问题描述"                     # 生成自动抹除敏感信息的诊断 JSON

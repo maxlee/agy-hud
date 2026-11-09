@@ -1,7 +1,18 @@
 use crate::ansi::sanitize_text;
+use crate::transcript::parse_iso_ms;
 use crate::types::{
-    AgyStdinData, EffortFormatMode, ModelFormatMode, ModelStdin, PathLevels, QuotaBucketView,
+    AgyStdinData, CachedQuotaSnapshot, EffortFormatMode, GlyphMode, ModelFormatMode, ModelStdin,
+    PathLevels, QuotaBucketView, RawQuotaBucket,
 };
+use std::collections::{BTreeMap, BTreeSet};
+
+const KNOWN_CANONICAL_BUCKETS: &[&str] = &[
+    "3p-5h",
+    "3p-weekly",
+    "gemini-5h",
+    "gemini-argon-wtu-weekly",
+    "gemini-weekly",
+];
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ContextMetrics {
@@ -14,13 +25,22 @@ pub struct ContextMetrics {
     pub cache_hit_percent: Option<u64>,
 }
 
-fn effort_symbol(effort_lower: &str) -> &str {
-    match effort_lower {
-        "low" => "⚡",
-        "medium" | "med" => "⚡⚡",
-        "high" => "⚡⚡⚡",
-        "xhigh" | "max" => "⚡⚡⚡⚡",
-        other => other,
+fn effort_symbol_for_mode(effort_lower: &str, glyph_mode: GlyphMode) -> &str {
+    match glyph_mode {
+        GlyphMode::Ascii => match effort_lower {
+            "low" => "*",
+            "medium" | "med" => "**",
+            "high" => "***",
+            "xhigh" | "max" => "****",
+            other => other,
+        },
+        GlyphMode::Unicode | GlyphMode::Nerd => match effort_lower {
+            "low" => "⚡",
+            "medium" | "med" => "⚡⚡",
+            "high" => "⚡⚡⚡",
+            "xhigh" | "max" => "⚡⚡⚡⚡",
+            other => other,
+        },
     }
 }
 
@@ -88,6 +108,15 @@ pub fn format_model_name(
     model_format: ModelFormatMode,
     effort_format: EffortFormatMode,
 ) -> String {
+    format_model_name_with_glyphs(model, model_format, effort_format, GlyphMode::Unicode)
+}
+
+pub fn format_model_name_with_glyphs(
+    model: Option<&ModelStdin>,
+    model_format: ModelFormatMode,
+    effort_format: EffortFormatMode,
+    glyph_mode: GlyphMode,
+) -> String {
     let Some(model) = model else {
         return String::new();
     };
@@ -134,10 +163,54 @@ pub fn format_model_name(
         return base.to_string();
     }
 
+    let dot_sep = match glyph_mode {
+        GlyphMode::Ascii => ".",
+        GlyphMode::Unicode | GlyphMode::Nerd => "·",
+    };
+
     match effort_format {
-        EffortFormatMode::Symbol => format!("{base} {}", effort_symbol(&inferred_effort)),
-        EffortFormatMode::Text => format!("{base} · {}", effort_short(&inferred_effort)),
+        EffortFormatMode::Symbol => {
+            format!(
+                "{base} {}",
+                effort_symbol_for_mode(&inferred_effort, glyph_mode)
+            )
+        }
+        EffortFormatMode::Text => format!("{base} {dot_sep} {}", effort_short(&inferred_effort)),
         EffortFormatMode::Hidden => base.to_string(),
+    }
+}
+
+/// Normalizes verbose plan tier names (e.g. `"Google AI Pro"` -> `"Pro"`).
+pub fn normalize_plan_tier(raw: &str) -> String {
+    let clean = sanitize_text(raw);
+    if clean.is_empty() {
+        return String::new();
+    }
+    let lower = clean.to_ascii_lowercase();
+    for prefix in ["google ai ", "antigravity "] {
+        if lower.starts_with(prefix) {
+            let rest = clean[prefix.len()..].trim();
+            if !rest.is_empty() {
+                return rest.to_string();
+            }
+        }
+    }
+    clean
+}
+
+/// Formats USD session cost with sub-cent precision (`$0.00`, `<$0.001`, `$0.004`, `$0.38`).
+pub fn format_session_cost(usd: f64) -> Option<String> {
+    if !usd.is_finite() || usd < 0.0 {
+        return None;
+    }
+    if usd == 0.0 {
+        Some("$0.00".to_string())
+    } else if usd < 0.001 {
+        Some("<$0.001".to_string())
+    } else if usd < 0.01 {
+        Some(format!("${usd:.3}"))
+    } else {
+        Some(format!("${usd:.2}"))
     }
 }
 
@@ -222,10 +295,16 @@ pub fn extract_context_metrics(stdin: Option<&AgyStdinData>) -> ContextMetrics {
 fn clean_quota_label(bucket_id: &str) -> String {
     let clean = sanitize_text(bucket_id);
     let lower = clean.to_ascii_lowercase();
+    if lower == "gemini-argon-wtu-weekly" {
+        return "argon-weekly".to_string();
+    }
     let rest = if let Some(stripped) = lower.strip_prefix("antigravity") {
         let idx = clean.len() - stripped.len();
         clean[idx..].trim_start_matches(['-', '_'])
     } else if let Some(stripped) = lower.strip_prefix("gemini") {
+        let idx = clean.len() - stripped.len();
+        clean[idx..].trim_start_matches(['-', '_'])
+    } else if let Some(stripped) = lower.strip_prefix("3p") {
         let idx = clean.len() - stripped.len();
         clean[idx..].trim_start_matches(['-', '_'])
     } else {
@@ -238,40 +317,188 @@ fn clean_quota_label(bucket_id: &str) -> String {
     }
 }
 
-pub fn extract_quota_buckets(stdin: Option<&AgyStdinData>) -> Vec<QuotaBucketView> {
-    let Some(quota) = stdin.and_then(|s| s.quota.as_ref()) else {
-        return Vec::new();
-    };
-    let mut buckets = Vec::new();
-    for (id, raw) in quota {
-        if raw.disabled.unwrap_or(false) {
-            continue;
-        }
-        let mut remaining_percent = None;
-        let mut used_percent = None;
-        if let Some(frac_raw) = raw.remaining_fraction
-            && frac_raw.is_finite()
-        {
-            let frac = frac_raw.clamp(0.0, 1.0);
-            remaining_percent = Some((frac * 1000.0).round() / 10.0);
-            used_percent = Some(((1.0 - frac) * 1000.0).round() / 10.0);
-        }
-        let remaining_amount = raw.remaining_amount.filter(|v| v.is_finite());
-        let reset_in_seconds = raw.reset_in_seconds.filter(|v| v.is_finite() && *v >= 0.0);
-
-        if used_percent.is_none() && remaining_amount.is_none() {
-            continue;
-        }
-        buckets.push(QuotaBucketView {
-            id: sanitize_text(id),
-            label: clean_quota_label(id),
-            used_percent,
-            remaining_percent,
-            remaining_amount,
-            reset_in_seconds,
-        });
+fn is_bucket_active(raw: &RawQuotaBucket, now_ms: i64) -> bool {
+    if raw.disabled.unwrap_or(false) {
+        return false;
     }
-    buckets
+    if now_ms > 0
+        && let Some(rt_str) = raw.reset_time.as_deref()
+        && let Some(rt_ms) = parse_iso_ms(rt_str)
+        && rt_ms <= now_ms
+    {
+        return false;
+    }
+    true
+}
+
+fn merge_active_buckets(
+    official: Option<&RawQuotaBucket>,
+    cached: Option<&RawQuotaBucket>,
+    now_ms: i64,
+) -> Option<RawQuotaBucket> {
+    let off = official.filter(|b| is_bucket_active(b, now_ms));
+    let cac = cached.filter(|b| is_bucket_active(b, now_ms));
+
+    match (off, cac) {
+        (Some(o), Some(c)) => {
+            let o_rt = o.reset_time.as_deref().and_then(parse_iso_ms);
+            let c_rt = c.reset_time.as_deref().and_then(parse_iso_ms);
+            if let (Some(o_ms), Some(c_ms)) = (o_rt, c_rt) {
+                if o_ms > c_ms + 60_000 {
+                    return Some(o.clone());
+                }
+                if c_ms > o_ms + 60_000 {
+                    return Some(c.clone());
+                }
+            }
+            let remaining_fraction = match (o.remaining_fraction, c.remaining_fraction) {
+                (Some(a), Some(b)) if a.is_finite() && b.is_finite() => Some(a.min(b)),
+                (Some(a), _) if a.is_finite() => Some(a),
+                (_, Some(b)) if b.is_finite() => Some(b),
+                _ => None,
+            };
+            let remaining_amount = match (o.remaining_amount, c.remaining_amount) {
+                (Some(a), Some(b)) if a.is_finite() && b.is_finite() => Some(a.min(b)),
+                (Some(a), _) if a.is_finite() => Some(a),
+                (_, Some(b)) if b.is_finite() => Some(b),
+                _ => None,
+            };
+            Some(RawQuotaBucket {
+                remaining_fraction,
+                remaining_amount,
+                reset_time: c.reset_time.clone().or_else(|| o.reset_time.clone()),
+                reset_in_seconds: o.reset_in_seconds.or(c.reset_in_seconds),
+                disabled: Some(false),
+            })
+        }
+        (Some(o), None) => Some(o.clone()),
+        (None, Some(c)) => Some(c.clone()),
+        (None, None) => None,
+    }
+}
+
+fn bucket_to_view(id: &str, raw: &RawQuotaBucket, now_ms: i64) -> Option<QuotaBucketView> {
+    let mut remaining_percent = None;
+    let mut used_percent = None;
+    if let Some(frac_raw) = raw.remaining_fraction
+        && frac_raw.is_finite()
+    {
+        let frac = frac_raw.clamp(0.0, 1.0);
+        remaining_percent = Some((frac * 1000.0).round() / 10.0);
+        used_percent = Some(((1.0 - frac) * 1000.0).round() / 10.0);
+    }
+    let remaining_amount = raw.remaining_amount.filter(|v| v.is_finite());
+    let reset_in_seconds = if now_ms > 0
+        && let Some(rt_ms) = raw.reset_time.as_deref().and_then(parse_iso_ms)
+        && rt_ms > now_ms
+    {
+        Some(((rt_ms - now_ms) as f64) / 1000.0)
+    } else {
+        raw.reset_in_seconds.filter(|v| v.is_finite() && *v >= 0.0)
+    };
+
+    if used_percent.is_none() && remaining_amount.is_none() {
+        return None;
+    }
+    Some(QuotaBucketView {
+        id: sanitize_text(id),
+        label: clean_quota_label(id),
+        used_percent,
+        remaining_percent,
+        remaining_amount,
+        reset_in_seconds,
+    })
+}
+
+pub fn extract_quota_buckets(stdin: Option<&AgyStdinData>) -> Vec<QuotaBucketView> {
+    extract_quota_buckets_reconciled(stdin, None, 0)
+}
+
+/// Extracts model-appropriate quota buckets while filtering expired windows (`reset_time <= now_ms`)
+/// and monotonically reconciling optional cached `/usage` snapshots within the same active window.
+pub fn extract_quota_buckets_reconciled(
+    stdin: Option<&AgyStdinData>,
+    cached: Option<&CachedQuotaSnapshot>,
+    now_ms: i64,
+) -> Vec<QuotaBucketView> {
+    let official_map = stdin.and_then(|s| s.quota.as_ref());
+    let cached_map = cached.map(|c| &c.quota);
+    if official_map.is_none() && cached_map.is_none() {
+        return Vec::new();
+    }
+
+    let mut all_ids = BTreeSet::new();
+    if let Some(m) = official_map {
+        all_ids.extend(m.keys().cloned());
+    }
+    if let Some(m) = cached_map {
+        all_ids.extend(m.keys().cloned());
+    }
+    if all_ids.is_empty() {
+        return Vec::new();
+    }
+
+    let has_canonical_source = KNOWN_CANONICAL_BUCKETS.iter().any(|k| all_ids.contains(*k));
+    let source_has_argon = all_ids.contains("gemini-argon-wtu-weekly");
+
+    let mut merged: BTreeMap<String, RawQuotaBucket> = BTreeMap::new();
+    for id in &all_ids {
+        let off = official_map.and_then(|m| m.get(id));
+        let cac = cached_map.and_then(|m| m.get(id));
+        if let Some(reconciled) = merge_active_buckets(off, cac, now_ms) {
+            merged.insert(id.clone(), reconciled);
+        }
+    }
+
+    if !has_canonical_source {
+        return merged
+            .iter()
+            .filter_map(|(id, raw)| bucket_to_view(id, raw, now_ms))
+            .collect();
+    }
+
+    let model_haystack = stdin
+        .and_then(|s| s.model.as_ref())
+        .map(|m| {
+            format!(
+                "{} {}",
+                m.id.as_deref().unwrap_or(""),
+                m.display_name.as_deref().unwrap_or("")
+            )
+            .to_ascii_lowercase()
+        })
+        .unwrap_or_default();
+
+    let is_3p = [
+        "claude",
+        "gpt",
+        "oss",
+        "sonnet",
+        "opus",
+        "haiku",
+        "openai",
+        "anthropic",
+    ]
+    .iter()
+    .any(|kw| model_haystack.contains(kw));
+    let is_argon = model_haystack.contains("argon");
+
+    let routed_keys: &[&str] = if is_3p {
+        &["3p-5h", "3p-weekly"]
+    } else if is_argon && source_has_argon {
+        &["gemini-argon-wtu-weekly"]
+    } else {
+        &["gemini-5h", "gemini-weekly"]
+    };
+
+    routed_keys
+        .iter()
+        .filter_map(|&key| {
+            merged
+                .get(key)
+                .and_then(|raw| bucket_to_view(key, raw, now_ms))
+        })
+        .collect()
 }
 
 pub fn format_compact_tokens(count: u64) -> String {

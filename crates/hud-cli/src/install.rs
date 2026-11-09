@@ -6,12 +6,32 @@ use std::fs;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-fn shell_quote(s: &str) -> String {
-    if cfg!(windows) {
-        format!("\"{s}\"")
+/// Formats `statusLine.command` safely per OS:
+/// - On Windows, omits surrounding double quotes (`"`) because Antigravity CLI's `cmd.exe`
+///   invocation strips/mishandles leading quotes (`tightship#89`), and returns an actionable
+///   8.3 short-path warning if the binary path contains spaces.
+/// - On POSIX, wraps in single quotes with embedded single-quote escaping.
+pub fn format_statusline_command_for_platform(
+    bin_path: &str,
+    is_windows: bool,
+) -> (String, Option<String>) {
+    if is_windows {
+        let warning = if bin_path.contains(' ') {
+            Some(
+                "Windows binary path contains spaces; because Antigravity CLI statusLine.command cannot use surrounding double quotes on Windows (tightship#89), move AGY_HUD_HOME to a space-free path or configure its 8.3 short path."
+                    .to_string(),
+            )
+        } else {
+            None
+        };
+        (bin_path.to_string(), warning)
     } else {
-        format!("'{}'", s.replace('\'', "'\\''"))
+        (format!("'{}'", bin_path.replace('\'', "'\\''")), None)
     }
+}
+
+fn format_statusline_command(bin_path: &str) -> (String, Option<String>) {
+    format_statusline_command_for_platform(bin_path, cfg!(windows))
 }
 
 fn read_json_object_or_empty(file_path: &Path) -> Result<Map<String, Value>, String> {
@@ -181,7 +201,8 @@ pub fn install_status_line(
             .map_err(|e| e.to_string())?;
     }
 
-    let command_str = shell_quote(&paths.installed_bin_path.to_string_lossy());
+    let (command_str, command_warning) =
+        format_statusline_command(&paths.installed_bin_path.to_string_lossy());
     let mut next_sl = if current_kind == "agy-hud" {
         existing_sl.unwrap_or_default()
     } else {
@@ -201,7 +222,7 @@ pub fn install_status_line(
     out_bytes.push(b'\n');
     atomic_write_bytes(&target_settings, &out_bytes, mode).map_err(|e| e.to_string())?;
 
-    Ok(json!({
+    let mut report = json!({
         "installed": true,
         "engine": "rust-native",
         "settingsPath": paths.cli_settings_path.to_string_lossy(),
@@ -209,7 +230,13 @@ pub fn install_status_line(
         "command": command_str,
         "replaced": current_kind,
         "backupPath": backup_path,
-    }))
+    });
+    if let Some(warn_msg) = command_warning
+        && let Some(obj) = report.as_object_mut()
+    {
+        obj.insert("warning".to_string(), Value::String(warn_msg));
+    }
+    Ok(report)
 }
 
 pub fn uninstall_status_line(paths: &AgyPaths, argv: &[String]) -> Result<Value, String> {

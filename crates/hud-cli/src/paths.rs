@@ -15,6 +15,7 @@ pub struct AgyPaths {
     pub bin_dir: PathBuf,
     pub installed_bin_path: PathBuf,
     pub data_dir: PathBuf,
+    pub quota_cache_path: PathBuf,
     pub probe_cache_dir: PathBuf,
     pub config_path: PathBuf,
     pub undo_path: PathBuf,
@@ -74,12 +75,15 @@ impl AgyPaths {
         };
         let bin_dir = hud_home.join("bin");
 
+        let data_dir = hud_home.join("data");
+
         Self {
             home,
             cli_settings_path: cli_dir.join("settings.json"),
             installed_bin_path: bin_dir.join(bin_name),
             bin_dir,
-            data_dir: hud_home.join("data"),
+            quota_cache_path: data_dir.join("quota-cache.json"),
+            data_dir,
             probe_cache_dir: hud_home.join("probe-cache"),
             config_path: hud_home.join("config.json"),
             undo_path: hud_home.join("config.undo.json"),
@@ -214,16 +218,28 @@ pub fn build_logic_paths(
     let cwd_buf = abs_norm(
         stdin
             .and_then(|s| s.workspace.as_ref())
-            .and_then(|w| w.project_dir.as_deref()),
+            .and_then(|w| w.current_dir.as_deref()),
     )
+    .or_else(|| abs_norm(stdin.and_then(|s| s.cwd.as_deref())))
     .or_else(|| {
         abs_norm(
             stdin
                 .and_then(|s| s.workspace.as_ref())
-                .and_then(|w| w.current_dir.as_deref()),
+                .and_then(|w| w.project_dir.as_deref()),
         )
     })
-    .or_else(|| abs_norm(stdin.and_then(|s| s.cwd.as_deref())));
+    .or_else(|| {
+        let s = stdin?;
+        let env_cwd = std::env::current_dir().ok()?;
+        if let Some(raw_rel) = s.cwd.as_deref().map(str::trim).filter(|c| !c.is_empty()) {
+            let rel_name = Path::new(raw_rel).file_name();
+            if rel_name.is_none() || rel_name == env_cwd.file_name() {
+                return Some(canonical_or_parent(&env_cwd));
+            }
+            return None;
+        }
+        Some(canonical_or_parent(&env_cwd))
+    });
 
     let transcript_buf = abs_norm(stdin.and_then(|s| s.transcript_path.as_deref()));
     let task_md_buf = transcript_buf
@@ -244,6 +260,8 @@ pub fn build_logic_paths(
             .into_owned(),
         last_snapshot: data_real_dir
             .map(|d| d.join("last-snapshot.json").to_string_lossy().into_owned()),
+        quota_cache: data_real_dir
+            .map(|d| d.join("quota-cache.json").to_string_lossy().into_owned()),
         cli_settings: canonical_or_parent(&paths.cli_settings_path)
             .to_string_lossy()
             .into_owned(),

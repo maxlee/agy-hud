@@ -1,6 +1,8 @@
 use crate::paths::{AgyPaths, atomic_write_bytes, canonical_or_parent, create_private_dir_all};
 use hud_core::config::HudConfig;
-use hud_core::probes::{parse_git_porcelain_v2, parse_hg_probe_output, parse_jj_probe_output};
+use hud_core::probes::{
+    parse_git_head_text, parse_git_porcelain_v2, parse_hg_probe_output, parse_jj_probe_output,
+};
 use hud_core::transcript::parse_transcript_and_tasks;
 use hud_core::types::{
     AgyStdinData, LogicPaths, MemoryProbeInfo, ProbeAnswers, TranscriptSummary, VcsProbeInfo,
@@ -12,10 +14,12 @@ use std::fs::{self, File};
 use std::io::{IsTerminal, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 pub const MAX_STDIN_BYTES: usize = 256 * 1024;
+pub const STDIN_READ_TIMEOUT_MS: u64 = 1_000;
 pub const HEAD_READ_BYTES: usize = 8 * 1024;
 pub const TAIL_READ_BYTES: u64 = 256 * 1024;
 pub const MAX_TASK_MD_BYTES: u64 = 64 * 1024;
@@ -74,25 +78,102 @@ where
     }
 }
 
-/// Reads bounded JSON from `stdin` when piped (`!is_terminal()`).
-pub fn read_stdin_payload() -> Option<AgyStdinData> {
-    let stdin = std::io::stdin();
-    if stdin.is_terminal() {
-        return None;
-    }
+/// Incrementally scans `reader` until the first balanced top-level JSON object `{ ... }` completes
+/// (or EOF is reached), returning immediately without waiting for pipe closure (`antigravity-cli#698`).
+pub fn read_complete_json_object<R: Read>(mut reader: R) -> Option<AgyStdinData> {
     let mut buf = Vec::with_capacity(4096);
-    if stdin
-        .lock()
-        .take((MAX_STDIN_BYTES + 1) as u64)
-        .read_to_end(&mut buf)
-        .is_err()
-    {
+    let mut chunk = [0u8; 4096];
+    let mut seen_open = false;
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escape = false;
+
+    loop {
+        let n = match reader.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return None,
+        };
+
+        for &b in &chunk[..n] {
+            if buf.len() >= MAX_STDIN_BYTES {
+                return None;
+            }
+            buf.push(b);
+
+            if !seen_open {
+                if b == b'{' {
+                    seen_open = true;
+                    depth = 1;
+                } else if !b.is_ascii_whitespace() && !matches!(b, 0xef | 0xbb | 0xbf) {
+                    // Non-object top-level payload; read until EOF up to MAX_STDIN_BYTES
+                }
+                continue;
+            }
+
+            if in_string {
+                if escape {
+                    escape = false;
+                } else if b == b'\\' {
+                    escape = true;
+                } else if b == b'"' {
+                    in_string = false;
+                }
+            } else {
+                match b {
+                    b'"' => in_string = true,
+                    b'{' => depth += 1,
+                    b'}' => {
+                        depth = depth.saturating_sub(1);
+                        if depth == 0 {
+                            let stripped = buf
+                                .strip_prefix(&[0xef, 0xbb, 0xbf])
+                                .unwrap_or(buf.as_slice());
+                            return serde_json::from_slice::<AgyStdinData>(stripped).ok();
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    if buf.is_empty() {
         return None;
     }
-    if buf.is_empty() || buf.len() > MAX_STDIN_BYTES {
+    let stripped = buf
+        .strip_prefix(&[0xef, 0xbb, 0xbf])
+        .unwrap_or(buf.as_slice());
+    serde_json::from_slice::<AgyStdinData>(stripped).ok()
+}
+
+/// Reads bounded JSON from `stdin` when piped (`!is_terminal()`), returning immediately once a
+/// complete top-level `{...}` object arrives or timing out cleanly after `timeout`.
+pub fn read_stdin_payload_bounded(timeout: Duration) -> Option<AgyStdinData> {
+    if std::io::stdin().is_terminal() {
         return None;
     }
-    serde_json::from_slice::<AgyStdinData>(&buf).ok()
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let parsed = read_complete_json_object(std::io::stdin());
+        let _ = tx.send(parsed);
+    });
+    rx.recv_timeout(timeout).ok().flatten()
+}
+
+/// Reads bounded JSON from `stdin` with the default `1000ms` open-pipe guard.
+pub fn read_stdin_payload() -> Option<AgyStdinData> {
+    read_stdin_payload_bounded(Duration::from_millis(STDIN_READ_TIMEOUT_MS))
+}
+
+/// Drains a nested `statusLine` stdin pipe briefly (`AGY_HUD_NESTED=1`) so the parent `agy`
+/// process never receives `EPIPE`, then returns immediately with no side effects.
+pub fn drain_stdin_nested(timeout: Duration) {
+    if std::io::stdin().is_terminal() {
+        return;
+    }
+    let _ = read_stdin_payload_bounded(timeout);
 }
 
 pub fn read_bounded_string(path: &Path, max_bytes: u64) -> Option<String> {
@@ -517,6 +598,13 @@ pub fn probe_hg(root: &Path, runner: &dyn ProbeRunner) -> Option<VcsProbeInfo> {
     parse_hg_probe_output(branch_out.as_deref()?, status_out.as_deref())
 }
 
+/// Zero-subprocess fallback reading `.git/HEAD` (including linked worktree gitdirs) when `git`
+/// is unavailable or exceeds `PROBE_TIMEOUT_MS`.
+pub fn read_git_head_fallback(git_dir: &Path) -> Option<VcsProbeInfo> {
+    let head_raw = read_bounded_string(&git_dir.join("HEAD"), 4096)?;
+    parse_git_head_text(&head_raw)
+}
+
 pub fn probe_vcs_uncached(repo: &DetectedRepo, runner: &dyn ProbeRunner) -> Option<VcsProbeInfo> {
     match repo {
         DetectedRepo::Jj { root, .. } => probe_jj(root, runner),
@@ -525,7 +613,9 @@ pub fn probe_vcs_uncached(repo: &DetectedRepo, runner: &dyn ProbeRunner) -> Opti
             root,
             git_dir,
             common_dir,
-        } => probe_git(root, git_dir, common_dir, runner),
+        } => {
+            probe_git(root, git_dir, common_dir, runner).or_else(|| read_git_head_fallback(git_dir))
+        }
     }
 }
 
@@ -735,11 +825,17 @@ pub fn collect_render_inputs(
             probe_memory(runner)
         });
 
+        let quota_cache = logic_paths
+            .quota_cache
+            .as_deref()
+            .and_then(|p| read_bounded_string(Path::new(p), 64 * 1024));
+
         CollectedRenderData {
             transcript: tx_handle.join().unwrap_or_default(),
             probes: ProbeAnswers {
                 vcs: vcs_handle.join().ok().flatten(),
                 memory: mem_handle.join().ok().flatten(),
+                quota_cache,
             },
         }
     })

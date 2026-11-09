@@ -1,12 +1,15 @@
-use hud_core::ansi::{strip_ansi, text_width};
+use hud_core::ansi::{sanitize_title_text, strip_ansi, text_width};
 use hud_core::commands::{CommandContext, execute_subcommand};
 use hud_core::config::{CONFIG_SCHEMA, HudConfig, parse_config_str, parse_set_pairs};
-use hud_core::probes::parse_vcs_info;
+use hud_core::probes::{parse_usage_command_output, parse_vcs_info};
 use hud_core::render::{RenderInput, render_hud_lines};
+use hud_core::stdin::{extract_quota_buckets_reconciled, format_session_cost, normalize_plan_tier};
 use hud_core::types::{
-    AgyStdinData, ContextWindowStdin, CostStdin, CurrentUsageStdin, DoctorFacts, Language,
-    LogicPaths, ModelStdin, PluginFacts, ProbeAnswers, RawQuotaBucket, RuntimeFacts, SandboxStdin,
-    TranscriptSummary, VimStdin, WorkspaceStdin,
+    AgyStdinData, CachedQuotaSnapshot, ContextWindowStdin, CostStdin, CurrentUsageStdin,
+    DoctorFacts, EffortFormatMode, GlyphMode, InstalledPluginFacts, Language, LogicPaths,
+    ModelStdin, PluginFacts, ProbeAnswers, RawQuotaBucket, RuntimeFacts, SandboxStdin,
+    SubagentEntry, SubagentStatus, TodoItem, TodoStatus, ToolEntry, ToolStatus, TranscriptSummary,
+    VimStdin, WorkspaceStdin,
 };
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -87,6 +90,7 @@ fn adaptive_layout_handles_ultrawide_standard_narrow_and_zh_hans() {
             .to_string(),
         ),
         memory: None,
+        quota_cache: None,
     };
 
     // 1. Ultra-wide 200 cols -> collapses to 1 sleek line when idle without active tools/todos
@@ -98,6 +102,7 @@ fn adaptive_layout_handles_ultrawide_standard_narrow_and_zh_hans() {
         transcript: &TranscriptSummary::default(),
         vcs: vcs.as_ref(),
         memory: None,
+        cached_quota: None,
         columns: Some(200),
         now_ms: 1_700_000_000_000,
     });
@@ -118,6 +123,7 @@ fn adaptive_layout_handles_ultrawide_standard_narrow_and_zh_hans() {
         transcript: &TranscriptSummary::default(),
         vcs: vcs.as_ref(),
         memory: None,
+        cached_quota: None,
         columns: Some(62),
         now_ms: 1_700_000_000_000,
     });
@@ -144,6 +150,7 @@ fn adaptive_layout_handles_ultrawide_standard_narrow_and_zh_hans() {
         transcript: &TranscriptSummary::default(),
         vcs: vcs.as_ref(),
         memory: None,
+        cached_quota: None,
         columns: Some(110),
         now_ms: 1_700_000_000_000,
     });
@@ -160,14 +167,21 @@ fn adaptive_layout_handles_ultrawide_standard_narrow_and_zh_hans() {
 }
 
 #[test]
-fn config_schema_validates_all_38_keys_and_preview_showcase_renders_5_scenarios() {
-    assert_eq!(CONFIG_SCHEMA.len(), 38);
+fn config_schema_validates_all_41_keys_and_preview_showcase_renders_5_scenarios() {
+    assert_eq!(CONFIG_SCHEMA.len(), 41);
+    let default_cfg = HudConfig::default();
+    assert!(!default_cfg.quota.background_refresh);
+    assert!(!default_cfg.display.show_title);
+    assert_eq!(default_cfg.display.glyph_mode, GlyphMode::Unicode);
 
     let loaded = parse_config_str(Some(
-        r#"{"language":"zh-Hans","pathLevels":"full","vcs":{"cacheTtlMs":2500},"unknownKey":1}"#,
+        r#"{"language":"zh-Hans","pathLevels":"full","vcs":{"cacheTtlMs":2500},"quota":{"backgroundRefresh":true},"display":{"showTitle":true,"glyphMode":"nerd"},"unknownKey":1}"#,
     ));
     assert_eq!(loaded.config.language, Language::ZhHans);
     assert_eq!(loaded.config.vcs.cache_ttl_ms, 2500);
+    assert!(loaded.config.quota.background_refresh);
+    assert!(loaded.config.display.show_title);
+    assert_eq!(loaded.config.display.glyph_mode, GlyphMode::Nerd);
     assert_eq!(loaded.problems.len(), 1);
     assert!(loaded.problems[0].contains("unknownKey"));
 
@@ -178,21 +192,35 @@ fn config_schema_validates_all_38_keys_and_preview_showcase_renders_5_scenarios(
     assert_eq!(bad_set.problems.len(), 1);
 
     let facts = DoctorFacts {
-        cwd: "/tmp".to_string(),
+        cwd: "/Users/alice/project".to_string(),
+        home_dir: "/Users/alice".to_string(),
+        platform: "macos".to_string(),
+        terminal: "Ghostty".to_string(),
+        remote_session: false,
         runtime: RuntimeFacts {
             engine: "rust-native".to_string(),
-            version: "1.0.0".to_string(),
-            exec_path: "/tmp/agy-hud".to_string(),
+            version: "1.0.1".to_string(),
+            exec_path: "/Users/alice/.gemini/antigravity-cli/agy-hud/bin/agy-hud".to_string(),
             supported: true,
         },
         plugin: PluginFacts {
-            root: "/tmp/plugin".to_string(),
-            version: "1.0.0".to_string(),
+            root: "/Users/alice/.gemini/config/plugins/agy-hud".to_string(),
+            version: "1.0.1".to_string(),
         },
-        config_path: "/tmp/config.json".to_string(),
+        installed_plugin_status: "installed".to_string(),
+        installed_plugin: Some(InstalledPluginFacts {
+            version: "1.0.1".to_string(),
+            path: "/Users/alice/.gemini/config/plugins/agy-hud".to_string(),
+            enabled: true,
+        }),
+        config_path: "/Users/alice/.gemini/antigravity-cli/agy-hud/config.json".to_string(),
         heartbeat: None,
     };
-    let paths = LogicPaths::default();
+    let paths = LogicPaths {
+        config: "/Users/alice/.gemini/antigravity-cli/agy-hud/config.json".to_string(),
+        cli_settings: "/Users/alice/.gemini/antigravity-cli/settings.json".to_string(),
+        ..LogicPaths::default()
+    };
     let ctx = CommandContext {
         facts: &facts,
         paths: &paths,
@@ -219,4 +247,255 @@ fn config_schema_validates_all_38_keys_and_preview_showcase_renders_5_scenarios(
         .join("\n");
     assert!(plain.contains("1) Standard Expanded"));
     assert!(plain.contains("5) 简体中文界面模式"));
+
+    // Verify `doctor --pretty` abbreviates home paths to `~` and prints 3-row aligned glyph probe
+    let doc_pretty = execute_subcommand("doctor", &["--pretty".to_string()], &ctx);
+    assert!(!doc_pretty.failed);
+    let doc_plain = doc_pretty
+        .lines
+        .iter()
+        .map(|l| strip_ansi(l))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!doc_plain.contains("/Users/alice"));
+    assert!(doc_plain.contains("~/.gemini/antigravity-cli/agy-hud/bin/agy-hud"));
+    assert!(doc_plain.contains("Glyph Alignment Probe"));
+    let probe_widths: Vec<usize> = doc_pretty
+        .lines
+        .iter()
+        .map(|l| strip_ansi(l))
+        .filter(|l| {
+            l.starts_with("  unicode :")
+                || l.starts_with("  nerd    :")
+                || l.starts_with("  ascii   :")
+        })
+        .map(|l| text_width(&l))
+        .collect();
+    assert_eq!(probe_widths.len(), 3);
+    assert_eq!(probe_widths[0], probe_widths[1]);
+    assert_eq!(probe_widths[1], probe_widths[2]);
+}
+
+#[test]
+fn model_aware_quota_routing_expired_windows_and_monotonic_cache_reconciliation() {
+    let now_ms = 1_762_650_000_000i64; // 2025-11-09T01:00:00Z
+    let active_reset = "2099-01-01T00:00:00Z".to_string();
+    let expired_reset = "2020-01-01T00:00:00Z".to_string();
+
+    let mut multi_quota = BTreeMap::new();
+    multi_quota.insert(
+        "3p-5h".to_string(),
+        RawQuotaBucket {
+            remaining_fraction: Some(0.90),
+            reset_time: Some(active_reset.clone()),
+            ..Default::default()
+        },
+    );
+    multi_quota.insert(
+        "3p-weekly".to_string(),
+        RawQuotaBucket {
+            remaining_fraction: Some(0.70),
+            reset_time: Some(active_reset.clone()),
+            ..Default::default()
+        },
+    );
+    multi_quota.insert(
+        "gemini-5h".to_string(),
+        RawQuotaBucket {
+            remaining_fraction: Some(0.80),
+            reset_time: Some(active_reset.clone()),
+            ..Default::default()
+        },
+    );
+    multi_quota.insert(
+        "gemini-argon-wtu-weekly".to_string(),
+        RawQuotaBucket {
+            remaining_fraction: Some(0.60),
+            reset_time: Some(active_reset.clone()),
+            ..Default::default()
+        },
+    );
+    multi_quota.insert(
+        "gemini-weekly".to_string(),
+        RawQuotaBucket {
+            remaining_fraction: Some(0.50),
+            reset_time: Some(active_reset.clone()),
+            ..Default::default()
+        },
+    );
+
+    // 1. Pro-plan Argon session -> routes exclusively to `gemini-argon-wtu-weekly`
+    let mut argon_stdin = sample_stdin(108);
+    argon_stdin.quota = Some(multi_quota.clone());
+    let argon_buckets = extract_quota_buckets_reconciled(Some(&argon_stdin), None, now_ms);
+    assert_eq!(argon_buckets.len(), 1);
+    assert_eq!(argon_buckets[0].id, "gemini-argon-wtu-weekly");
+    assert_eq!(argon_buckets[0].label, "argon-weekly");
+    assert_eq!(argon_buckets[0].remaining_percent, Some(60.0));
+
+    // 2. Non-Argon Gemini session -> routes to `gemini-5h` + `gemini-weekly`
+    let mut gemini_stdin = argon_stdin.clone();
+    gemini_stdin.model = Some(ModelStdin {
+        id: Some("Gemini 2.5 Pro".to_string()),
+        display_name: Some("Gemini 2.5 Pro".to_string()),
+        effort: None,
+    });
+    let gemini_buckets = extract_quota_buckets_reconciled(Some(&gemini_stdin), None, now_ms);
+    let gemini_ids: Vec<&str> = gemini_buckets.iter().map(|b| b.id.as_str()).collect();
+    assert_eq!(gemini_ids, vec!["gemini-5h", "gemini-weekly"]);
+
+    // 3. Claude / 3P session -> routes to `3p-5h` + `3p-weekly`
+    let mut claude_stdin = argon_stdin.clone();
+    claude_stdin.model = Some(ModelStdin {
+        id: Some("Claude Sonnet 4.6 (Thinking)".to_string()),
+        display_name: Some("Claude Sonnet 4.6 (Thinking)".to_string()),
+        effort: Some("high".to_string()),
+    });
+    let claude_buckets = extract_quota_buckets_reconciled(Some(&claude_stdin), None, now_ms);
+    let claude_ids: Vec<&str> = claude_buckets.iter().map(|b| b.id.as_str()).collect();
+    assert_eq!(claude_ids, vec!["3p-5h", "3p-weekly"]);
+
+    // 4. Expired window is filtered out cleanly
+    let mut expired_map = multi_quota.clone();
+    expired_map.get_mut("3p-5h").unwrap().reset_time = Some(expired_reset);
+    claude_stdin.quota = Some(expired_map);
+    let after_expiry = extract_quota_buckets_reconciled(Some(&claude_stdin), None, now_ms);
+    assert_eq!(after_expiry.len(), 1);
+    assert_eq!(after_expiry[0].id, "3p-weekly");
+
+    // 5. Monotonic reconciliation with `/usage` cache within the same active window
+    let usage_stdout = json!({
+        "command": {
+            "data": {
+                "groups": [{
+                    "buckets": [{
+                        "id": "gemini-argon-wtu-weekly",
+                        "remaining_fraction": 0.42,
+                        "reset_time": active_reset
+                    }]
+                }]
+            }
+        }
+    })
+    .to_string();
+    let parsed_usage = parse_usage_command_output(&usage_stdout).expect("parse /usage JSON");
+    let cached_snap = CachedQuotaSnapshot {
+        at: now_ms,
+        source: "agy-usage".to_string(),
+        quota: parsed_usage,
+    };
+    let reconciled =
+        extract_quota_buckets_reconciled(Some(&argon_stdin), Some(&cached_snap), now_ms);
+    assert_eq!(reconciled.len(), 1);
+    assert_eq!(reconciled[0].remaining_percent, Some(42.0));
+    assert_eq!(reconciled[0].used_percent, Some(58.0));
+}
+
+#[test]
+fn sub_cent_cost_plan_tier_title_zwj_glyph_modes_and_progressive_degradation() {
+    assert_eq!(format_session_cost(0.0).as_deref(), Some("$0.00"));
+    assert_eq!(format_session_cost(0.0004).as_deref(), Some("<$0.001"));
+    assert_eq!(format_session_cost(0.004).as_deref(), Some("$0.004"));
+    assert_eq!(format_session_cost(0.38).as_deref(), Some("$0.38"));
+    assert_eq!(normalize_plan_tier("Google AI Pro"), "Pro");
+    assert_eq!(normalize_plan_tier("Google AI Ultra"), "Ultra");
+
+    // ZWJ family/coder emoji preserved while bidi/ANSI/newlines stripped
+    let cleaned_title = sanitize_title_text("  Fix 👨‍💻\n\x1b[31mquota\u{202e}\u{200b} bug  ");
+    assert_eq!(cleaned_title, "Fix 👨‍💻 quota bug");
+
+    let mut stdin = sample_stdin(120);
+    stdin.plan_tier = Some("Google AI Pro".to_string());
+    stdin.conversation_title = Some("Implement pure Rust HUD glyphs".to_string());
+    stdin.cost = Some(CostStdin {
+        total_usd: Some(0.004),
+        subagent_usd: None,
+        estimated: Some(true),
+    });
+
+    let tx = TranscriptSummary {
+        tools: vec![ToolEntry {
+            id: "1".to_string(),
+            name: "edit_file".to_string(),
+            target: Some("render.rs".to_string()),
+            status: ToolStatus::Completed,
+            count: 2,
+            started_at: None,
+            ended_at: None,
+        }],
+        subagents: vec![SubagentEntry {
+            name: "research".to_string(),
+            role: Some("Auditor".to_string()),
+            model: None,
+            status: SubagentStatus::Running,
+            started_at: Some(1_699_999_970_000),
+            ended_at: None,
+        }],
+        todos: vec![TodoItem {
+            text: "Test ASCII mode".to_string(),
+            status: TodoStatus::InProgress,
+        }],
+        session_started_at: Some(1_699_999_400_000),
+        last_step_at: Some(1_699_999_990_000),
+        step_count: 5,
+        ..Default::default()
+    };
+
+    // 1. Pure 7-bit ASCII mode check
+    let mut ascii_cfg = HudConfig::default();
+    ascii_cfg.display.glyph_mode = GlyphMode::Ascii;
+    ascii_cfg.display.show_title = true;
+    ascii_cfg.display.show_plan_tier = true;
+    ascii_cfg.display.effort_format = EffortFormatMode::Symbol;
+    let ascii_lines = render_hud_lines(RenderInput {
+        stdin: Some(&stdin),
+        config: &ascii_cfg,
+        transcript: &tx,
+        vcs: None,
+        memory: None,
+        cached_quota: None,
+        columns: Some(120),
+        now_ms: 1_700_000_000_000,
+    });
+    for line in &ascii_lines {
+        assert!(
+            line.is_ascii(),
+            "Non-ASCII char leaked in glyphMode=ascii: {}",
+            strip_ansi(line)
+        );
+    }
+    let ascii_plain = ascii_lines
+        .iter()
+        .map(|l| strip_ansi(l))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(ascii_plain.contains("~$0.004"));
+    assert!(ascii_plain.contains("Pro"));
+    assert!(!ascii_plain.contains("Google AI Pro"));
+    assert!(ascii_plain.contains("\"Implement pure Rust H...\""));
+
+    // 2. Progressive priority degradation across widths never overflows column budget
+    let mut rich_cfg = HudConfig::default();
+    rich_cfg.display.show_title = true;
+    rich_cfg.display.custom_tag = "TEAM-INFRA".to_string();
+    for width in [140usize, 108, 92, 78, 64, 48] {
+        let lines = render_hud_lines(RenderInput {
+            stdin: Some(&stdin),
+            config: &rich_cfg,
+            transcript: &tx,
+            vcs: None,
+            memory: None,
+            cached_quota: None,
+            columns: Some(width),
+            now_ms: 1_700_000_000_000,
+        });
+        for line in &lines {
+            assert!(
+                text_width(line) <= width,
+                "Exceeded width {width} (got {}): {}",
+                text_width(line),
+                strip_ansi(line)
+            );
+        }
+    }
 }

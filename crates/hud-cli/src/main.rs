@@ -1,25 +1,28 @@
 #![forbid(unsafe_code)]
 
 use hud_cli::collector::{
-    MAX_TASK_MD_BYTES, SystemProbeRunner, collect_render_inputs, read_bounded_string,
-    read_stdin_payload, read_transcript_slices,
+    MAX_TASK_MD_BYTES, SystemProbeRunner, collect_render_inputs, drain_stdin_nested,
+    exec_file_safe, read_bounded_string, read_stdin_payload, read_transcript_slices,
 };
 use hud_cli::install::{install_status_line, uninstall_status_line};
 use hud_cli::paths::{
     AgyPaths, atomic_write_bytes, build_logic_paths, canonical_or_parent, derive_task_md_path,
     existing_data_dir, prepare_data_dir, undo_config, write_config_with_undo,
 };
+use hud_cli::quota_refresh::{maybe_spawn_background_quota_refresh, run_quota_subcommand};
 use hud_core::ansi::terminal_filter;
 use hud_core::commands::{CommandContext, execute_subcommand};
 use hud_core::config::{MAX_CONFIG_BYTES, parse_config_str};
-use hud_core::probes::{parse_memory_info, parse_vcs_info};
+use hud_core::probes::{parse_cached_quota_info, parse_memory_info, parse_vcs_info};
 use hud_core::render::{RenderInput, render_hud_lines};
-use hud_core::types::{AgyStdinData, DoctorFacts, HeartbeatInfo, PluginFacts, RuntimeFacts};
+use hud_core::types::{
+    AgyStdinData, DoctorFacts, HeartbeatInfo, InstalledPluginFacts, PluginFacts, RuntimeFacts,
+};
 use serde_json::{Value, json};
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -28,12 +31,13 @@ const HELP_LINES: &[&str] = &[
     "",
     "Usage:",
     "  agy-hud                                 (statusLine mode: reads JSON from stdin)",
-    "  agy-hud doctor                          Check setup, binary, settings.json, and health",
+    "  agy-hud doctor [--pretty]               Check setup, binary, settings.json, and glyph alignment",
     "  agy-hud install [--replace] [--stack]   Deploy native binary & configure settings.json",
     "  agy-hud uninstall [--keep-config] [--reset-default]  Cleanly remove HUD & restore official default",
     "  agy-hud preview [options]               Render live previews (--state showcase|idle|tool_use|confirm|high-context, --width N, --set k=v, --last)",
     "  agy-hud schema [query]                  List configurable HUD keys and descriptions",
     "  agy-hud set <k=v...>|--undo             Update or undo HUD configuration",
+    "  agy-hud quota refresh                   Manually refresh official `/usage` quota cache",
     "  agy-hud report [--note text]            Generate a privacy-scrubbed diagnostic report",
     "  agy-hud --version                       Print version",
 ];
@@ -51,6 +55,137 @@ pub fn is_hud_disabled() -> bool {
     };
     let trimmed = raw.trim().to_ascii_lowercase();
     !trimmed.is_empty() && !matches!(trimmed.as_str(), "0" | "false" | "off" | "no")
+}
+
+fn is_nested_hud() -> bool {
+    std::env::var("AGY_HUD_NESTED").as_deref() == Ok("1")
+}
+
+fn detect_platform() -> String {
+    if cfg!(windows) {
+        "windows".to_string()
+    } else if cfg!(target_os = "macos") {
+        "macos".to_string()
+    } else if cfg!(target_os = "linux") {
+        "linux".to_string()
+    } else {
+        std::env::consts::OS.to_string()
+    }
+}
+
+fn detect_terminal() -> String {
+    if let Ok(tp) = std::env::var("TERM_PROGRAM")
+        && !tp.trim().is_empty()
+    {
+        return tp.trim().to_string();
+    }
+    if std::env::var_os("WT_SESSION").is_some() {
+        return "Windows Terminal".to_string();
+    }
+    if std::env::var_os("KITTY_WINDOW_ID").is_some() {
+        return "kitty".to_string();
+    }
+    if std::env::var_os("ALACRITTY_WINDOW_ID").is_some() {
+        return "Alacritty".to_string();
+    }
+    if let Ok(term) = std::env::var("TERM")
+        && !term.trim().is_empty()
+    {
+        return term.trim().to_string();
+    }
+    "unknown".to_string()
+}
+
+fn detect_remote_session() -> bool {
+    std::env::var_os("SSH_CONNECTION").is_some()
+        || std::env::var_os("SSH_TTY").is_some()
+        || std::env::var_os("SSH_CLIENT").is_some()
+}
+
+fn parse_plugin_list_json(raw: &str) -> Option<(String, Option<InstalledPluginFacts>)> {
+    let val: Value = serde_json::from_str(raw.trim()).ok()?;
+    let arr = val
+        .as_array()
+        .or_else(|| val.get("plugins").and_then(Value::as_array))?;
+    for item in arr {
+        let name = item.get("name").and_then(Value::as_str).unwrap_or("");
+        if name == "agy-hud" {
+            let version = item
+                .get("version")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let path = item
+                .get("path")
+                .or_else(|| item.get("installPath"))
+                .or_else(|| item.get("root"))
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let enabled = item.get("enabled").and_then(Value::as_bool).unwrap_or(true);
+            return Some((
+                "installed".to_string(),
+                Some(InstalledPluginFacts {
+                    version,
+                    path,
+                    enabled,
+                }),
+            ));
+        }
+    }
+    Some(("not-installed".to_string(), None))
+}
+
+fn detect_installed_plugin(paths: &AgyPaths) -> (String, Option<InstalledPluginFacts>) {
+    if let Ok(override_json) = std::env::var("AGY_HUD_PLUGIN_LIST_JSON")
+        && let Some(res) = parse_plugin_list_json(&override_json)
+    {
+        return res;
+    }
+
+    // Fast filesystem check under `~/.gemini/config/plugins/agy-hud/plugin.json`
+    let default_plugin_dir = paths
+        .home
+        .join(".gemini")
+        .join("config")
+        .join("plugins")
+        .join("agy-hud");
+    let manifest = default_plugin_dir.join("plugin.json");
+    if let Some(raw) = read_bounded_string(&manifest, 32 * 1024)
+        && let Ok(val) = serde_json::from_str::<Value>(&raw)
+    {
+        let version = val
+            .get("version")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        return (
+            "installed".to_string(),
+            Some(InstalledPluginFacts {
+                version,
+                path: canonical_or_parent(&default_plugin_dir)
+                    .to_string_lossy()
+                    .into_owned(),
+                enabled: true,
+            }),
+        );
+    }
+
+    if std::env::var("AGY_SKIP_PLUGIN_INSTALL").as_deref() != Ok("1") {
+        let args = vec![
+            "plugin".to_string(),
+            "list".to_string(),
+            "--json".to_string(),
+        ];
+        let tmp = std::env::temp_dir();
+        if let Some(out) = exec_file_safe("agy", &args, Some(&tmp))
+            && let Some(res) = parse_plugin_list_json(&out)
+        {
+            return res;
+        }
+    }
+
+    ("unavailable".to_string(), None)
 }
 
 fn print_filtered<S: AsRef<str>>(lines: &[S]) {
@@ -158,6 +293,22 @@ fn run() -> u8 {
         }
     }
 
+    if sub == Some("quota") {
+        match run_quota_subcommand(&paths, &argv[1..], now_epoch_ms()) {
+            Ok(Some(report)) => {
+                let pretty = serde_json::to_string_pretty(&report).unwrap_or_default();
+                let lines: Vec<&str> = pretty.lines().collect();
+                print_filtered(&lines);
+                return 0;
+            }
+            Ok(None) => return 0,
+            Err(err) => {
+                print_filtered(&[format!("quota refresh failed: {err}")]);
+                return 1;
+            }
+        }
+    }
+
     if sub == Some("set") && argv.iter().any(|a| a == "--undo") {
         match undo_config(&paths) {
             Ok(()) => {
@@ -180,11 +331,23 @@ fn run() -> u8 {
         let logic_paths = build_logic_paths(&paths, None, data_real.as_deref());
         let plugin_root = resolve_plugin_root(&current_exe, &paths);
 
+        let (installed_plugin_status, installed_plugin) = if cmd_name == "doctor" {
+            detect_installed_plugin(&paths)
+        } else {
+            (String::new(), None)
+        };
+
         let facts = DoctorFacts {
             cwd: std::env::current_dir()
                 .unwrap_or_else(|_| PathBuf::from("."))
                 .to_string_lossy()
                 .into_owned(),
+            home_dir: canonical_or_parent(&paths.home)
+                .to_string_lossy()
+                .into_owned(),
+            platform: detect_platform(),
+            terminal: detect_terminal(),
+            remote_session: detect_remote_session(),
             runtime: RuntimeFacts {
                 engine: "rust-native".to_string(),
                 version: VERSION.to_string(),
@@ -199,6 +362,8 @@ fn run() -> u8 {
                     .into_owned(),
                 version: read_plugin_version(&plugin_root),
             },
+            installed_plugin_status,
+            installed_plugin,
             config_path: logic_paths.config.clone(),
             heartbeat: read_heartbeat(&paths.heartbeat_path),
         };
@@ -258,6 +423,10 @@ fn run() -> u8 {
     }
 
     // Live Antigravity CLI `statusLine` render mode
+    if is_nested_hud() {
+        drain_stdin_nested(Duration::from_millis(150));
+        return 0;
+    }
     if is_hud_disabled() {
         return 0;
     }
@@ -289,6 +458,7 @@ fn run() -> u8 {
 
     let vcs = parse_vcs_info(Some(&stdin_payload), &collected.probes);
     let memory = parse_memory_info(&collected.probes);
+    let cached_quota = parse_cached_quota_info(&collected.probes);
     let columns = stdin_payload.terminal_width.filter(|&w| w > 0);
 
     let lines = render_hud_lines(RenderInput {
@@ -297,6 +467,7 @@ fn run() -> u8 {
         transcript: &collected.transcript,
         vcs: vcs.as_ref(),
         memory: memory.as_ref(),
+        cached_quota: cached_quota.as_ref(),
         columns,
         now_ms: started_ms,
     });
@@ -329,6 +500,11 @@ fn run() -> u8 {
     );
 
     print_filtered(&lines);
+
+    if loaded_cfg.config.quota.background_refresh {
+        maybe_spawn_background_quota_refresh(&paths, &current_exe, &stdin_payload, started_ms);
+    }
+
     0
 }
 

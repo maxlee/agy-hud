@@ -1,3 +1,5 @@
+use crate::types::GlyphMode;
+
 pub const RESET: &str = "\x1b[0m";
 pub const BOLD: &str = "\x1b[1m";
 pub const DIM: &str = "\x1b[2m";
@@ -124,6 +126,36 @@ pub fn sanitize_text(input: &str) -> String {
     out
 }
 
+/// Sanitizes free-form `conversation_title` text to a single plain line: strips ANSI escapes,
+/// control/bidi overrides, and invisible format characters (`U+200B`, `U+FEFF`, `U+2060`), while
+/// preserving ZWNJ (`U+200C`), ZWJ (`U+200D`), variation selectors, and emoji tag characters.
+pub fn sanitize_title_text(input: &str) -> String {
+    let stripped = strip_ansi(input);
+    let mut out = String::with_capacity(stripped.len());
+    let mut prev_space = true;
+    for ch in stripped.chars() {
+        let cp = ch as u32;
+        if is_unsafe_control_or_bidi(ch) || ch.is_whitespace() {
+            if !prev_space {
+                out.push(' ');
+                prev_space = true;
+            }
+            continue;
+        }
+        // Drop invisible format chars except ZWNJ, ZWJ, variation selectors, and emoji tags
+        let drop_invisible = matches!(cp, 0x00ad | 0x200b | 0x2060..=0x2064 | 0xfeff | 0xe0001);
+        if drop_invisible {
+            continue;
+        }
+        out.push(ch);
+        prev_space = false;
+    }
+    if out.ends_with(' ') {
+        out.pop();
+    }
+    out
+}
+
 /// Removes all CSI, OSC, and 2-byte ANSI escape sequences.
 pub fn strip_ansi(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
@@ -152,6 +184,7 @@ pub fn code_point_width(ch: char) -> usize {
         || (0x1ab0..=0x1aff).contains(&cp)
         || (0x200b..=0x200f).contains(&cp)
         || (0xfe00..=0xfe0f).contains(&cp)
+        || (0xe0020..=0xe007f).contains(&cp)
         || (0xe0100..=0xe01ef).contains(&cp)
     {
         return 0;
@@ -264,6 +297,25 @@ pub fn render_bar(
     critical_at: f64,
     normal_color: &str,
 ) -> String {
+    render_bar_with_mode(
+        percent,
+        length,
+        warning_at,
+        critical_at,
+        normal_color,
+        GlyphMode::Unicode,
+    )
+}
+
+/// Builds a progress bar using either fine-grained Unicode blocks (`█▓▒░·`) or 7-bit ASCII (`#=-`).
+pub fn render_bar_with_mode(
+    percent: f64,
+    length: usize,
+    warning_at: f64,
+    critical_at: f64,
+    normal_color: &str,
+    glyph_mode: GlyphMode,
+) -> String {
     let clamped = if percent.is_finite() {
         percent.clamp(0.0, 100.0)
     } else {
@@ -281,23 +333,28 @@ pub fn render_bar(
         normal_color
     };
 
+    let (full_ch, c75, c50, c25, empty_ch) = match glyph_mode {
+        GlyphMode::Ascii => ('#', '#', '=', '=', '-'),
+        GlyphMode::Unicode | GlyphMode::Nerd => ('█', '▓', '▒', '░', '·'),
+    };
+
     let mut filled_part = String::new();
     let mut empty_part = String::new();
     for i in 0..length {
         if i < full {
-            filled_part.push('█');
+            filled_part.push(full_ch);
         } else if i == full && clamped > 0.0 {
             if rem >= 75.0 {
-                filled_part.push('▓');
+                filled_part.push(c75);
             } else if rem >= 50.0 {
-                filled_part.push('▒');
+                filled_part.push(c50);
             } else if rem >= 25.0 {
-                filled_part.push('░');
+                filled_part.push(c25);
             } else {
-                empty_part.push('·');
+                empty_part.push(empty_ch);
             }
         } else {
-            empty_part.push('·');
+            empty_part.push(empty_ch);
         }
     }
 
