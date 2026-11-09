@@ -1,4 +1,4 @@
-# AGY HUD (`agy-hud`) v1.2.0 — 100% Pure Rust Edition
+# AGY HUD (`agy-hud`) v1.3.0 — 100% Pure Rust Edition
 
 [![CI](https://github.com/maxlee/agy-hud/actions/workflows/ci.yml/badge.svg)](https://github.com/maxlee/agy-hud/actions/workflows/ci.yml)
 [![Release](https://github.com/maxlee/agy-hud/actions/workflows/release.yml/badge.svg)](https://github.com/maxlee/agy-hud/releases)
@@ -13,9 +13,11 @@ Displays live agent state, execution mode (`PLAN` / `AUTO` / `ACCEPT` + Vim mode
 ## Preview
 
 ```text
-╭─ 🔧 TOOL │ [AUTO] │ [Gemini 4 Argon · med] │ agy-hud git:(feat/rust-hud* ↑2) │ ⏱ 12m
-├─ Ctx ██░····· 28.4% (152k/1.0M) · ⚡75% Cache │ Quota(weekly) ▓···· 16% (4d 18h) │ ~$0.38 · agents 1/2
-├─ ◐ run_command: Cargo test execution · ✓ edit_file ×2: render.rs · ✓ read_file ×5: SKILL.md │ Skills: hud
+╭─ 🔧 TOOL │ [AUTO] │ [Gemini 4 Argon · med] Pro · ~64 tok/s │ agy-hud git:(feat/rust-hud* ↑2) │ ⏱ 12m
+├─ Ctx ██░····· 28.4% (152k/1.0M) · ⚡ 75% Cache │ ~$0.38 · agents 1/2 · tasks 1 · art 2 · 🛡 Sandbox ON
+├─ Quota(weekly) ▓···· 16% (4d 18h)
+├─ ◐ run_command: Cargo test execution · ✓ edit_file ×2: render.rs · ✓ read_file ×5: SKILL.md
+├─ Skills: hud, agy-customizations │ MCP: context7
 ├─ ◐ CLI Docs Researcher [research] (1m 15s) │ ✓ Security Auditor [self] (1m)
 ╰─ ▸ Verify compile-time arch_guard boundaries (2/4 · 50%)
 ```
@@ -74,11 +76,13 @@ Once installed (`~/.gemini/antigravity-cli/agy-hud/bin/agy-hud` or `./scripts/ag
 ./scripts/agy-hud doctor --pretty                           # Human-readable diagnostics (~ paths + glyph alignment probe)
 ./scripts/agy-hud preview --state showcase                  # Preview all 5 layout/language scenarios
 ./scripts/agy-hud preview --set language=zh-Hans            # Preview Simplified Chinese UI
-./scripts/agy-hud schema                                    # List all 42 configurable keys and types
+./scripts/agy-hud schema                                    # List all 43 configurable keys and types
 ./scripts/agy-hud update --check                            # Check GitHub Releases for a newer version
 ./scripts/agy-hud update                                    # SHA-256 verified self-upgrade (preserves --stack & config)
 ./scripts/agy-hud set updates.enabled=false                 # Optional: disable 6h background update check & badge
 ./scripts/agy-hud set display.glyphMode=nerd                # Switch glyph set: unicode | nerd | ascii
+./scripts/agy-hud set display.showPlanTier=false            # Optional: hide normalized subscription tier badge (Pro/Ultra)
+./scripts/agy-hud set display.showSpeed=false               # Optional: hide estimated output throughput (~tok/s) badge
 ./scripts/agy-hud set display.showTitle=true                # Show sanitized conversation title (<=24 cols)
 ./scripts/agy-hud set quota.backgroundRefresh=true          # Optional background `agy -p /usage` refresh (default: false)
 ./scripts/agy-hud quota refresh                             # Manually refresh official `/usage` quota cache once

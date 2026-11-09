@@ -146,6 +146,92 @@ pub fn derive_task_md_path(transcript_path: &Path) -> Option<PathBuf> {
     Some(logs_dir.join("task.md"))
 }
 
+fn is_safe_conv_id(raw: &str) -> bool {
+    let s = raw.trim();
+    !s.is_empty()
+        && s != "."
+        && s != ".."
+        && !s.contains(['/', '\\', '\0'])
+        && !s.chars().any(char::is_control)
+}
+
+fn extract_conv_id_from_transcript_path(raw_path: &str) -> Option<&str> {
+    let norm = raw_path.trim();
+    let suffix = "/.system_generated/logs/transcript.jsonl";
+    let win_suffix = "\\.system_generated\\logs\\transcript.jsonl";
+    let before = norm
+        .strip_suffix(suffix)
+        .or_else(|| norm.strip_suffix(win_suffix))?;
+    let (_, conv_id) = before.rsplit_once(['/', '\\'])?;
+    is_safe_conv_id(conv_id).then_some(conv_id)
+}
+
+/// Resolves the live `transcript.jsonl` path, automatically recovering when `agy` CLI reports an
+/// IDE-scoped `~/.gemini/antigravity/brain/<id>` path while storing CLI logs under `<cli_dir>/brain/<id>`.
+pub fn resolve_transcript_path(paths: &AgyPaths, stdin: Option<&AgyStdinData>) -> Option<PathBuf> {
+    let raw_tp = stdin
+        .and_then(|s| s.transcript_path.as_deref())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    if let Some(tp_str) = raw_tp {
+        let p = Path::new(tp_str);
+        if p.is_absolute() && fs::metadata(p).is_ok_and(|m| m.is_file()) {
+            return Some(canonical_or_parent(p));
+        }
+    }
+
+    let conv_id = stdin
+        .and_then(|s| s.conversation_id.as_deref())
+        .map(str::trim)
+        .filter(|id| is_safe_conv_id(id))
+        .or_else(|| {
+            stdin
+                .and_then(|s| s.session_id.as_deref())
+                .map(str::trim)
+                .filter(|id| is_safe_conv_id(id))
+        })
+        .or_else(|| raw_tp.and_then(extract_conv_id_from_transcript_path));
+
+    if let Some(id) = conv_id {
+        let rel_tail = Path::new("brain")
+            .join(id)
+            .join(".system_generated")
+            .join("logs")
+            .join("transcript.jsonl");
+        let candidate_bases = [
+            paths.cli_dir.clone(),
+            paths.home.join(".gemini").join("antigravity-cli"),
+            paths.home.join(".gemini").join("antigravity"),
+        ];
+        for base in candidate_bases {
+            let candidate = base.join(&rel_tail);
+            if fs::metadata(&candidate).is_ok_and(|m| m.is_file()) {
+                return Some(canonical_or_parent(&candidate));
+            }
+        }
+    }
+
+    if let Some(tp_str) = raw_tp {
+        let p = Path::new(tp_str);
+        if p.is_absolute() {
+            return Some(canonical_or_parent(p));
+        }
+    }
+
+    conv_id.map(|id| {
+        canonical_or_parent(
+            &paths
+                .cli_dir
+                .join("brain")
+                .join(id)
+                .join(".system_generated")
+                .join("logs")
+                .join("transcript.jsonl"),
+        )
+    })
+}
+
 pub fn create_private_dir_all(dir: &Path) -> std::io::Result<()> {
     fs::create_dir_all(dir)?;
     #[cfg(unix)]
@@ -243,7 +329,7 @@ pub fn build_logic_paths(
         Some(canonical_or_parent(&env_cwd))
     });
 
-    let transcript_buf = abs_norm(stdin.and_then(|s| s.transcript_path.as_deref()));
+    let transcript_buf = resolve_transcript_path(paths, stdin);
     let task_md_buf = transcript_buf
         .as_deref()
         .and_then(derive_task_md_path)
@@ -266,6 +352,8 @@ pub fn build_logic_paths(
             .map(|d| d.join("quota-cache.json").to_string_lossy().into_owned()),
         update_cache: data_real_dir
             .map(|d| d.join("update-cache.json").to_string_lossy().into_owned()),
+        speed_cache: data_real_dir
+            .map(|d| d.join("speed-cache.json").to_string_lossy().into_owned()),
         cli_settings: canonical_or_parent(&paths.cli_settings_path)
             .to_string_lossy()
             .into_owned(),

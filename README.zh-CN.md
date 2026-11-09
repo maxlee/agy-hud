@@ -1,4 +1,4 @@
-# AGY HUD (`agy-hud`) v1.2.0 — 100% 纯 Rust 极速版指南
+# AGY HUD (`agy-hud`) v1.3.0 — 100% 纯 Rust 极速版指南
 
 [![CI](https://github.com/maxlee/agy-hud/actions/workflows/ci.yml/badge.svg)](https://github.com/maxlee/agy-hud/actions/workflows/ci.yml)
 [![Release](https://github.com/maxlee/agy-hud/actions/workflows/release.yml/badge.svg)](https://github.com/maxlee/agy-hud/releases)
@@ -15,9 +15,11 @@
 ## 界面预览
 
 ```text
-╭─ 🔧 调用工具 │ [自动] │ [Gemini 4 Argon · med] │ agy-hud git:(feat/rust-hud* ↑2) │ ⏱ 12m
-├─ 上下文 ██░····· 28.4% (152k/1.0M) · ⚡75% 缓存 │ 配额(weekly) ▓···· 16% (4d 18h) │ ~$0.38 · 子代理 1/2
-├─ ◐ run_command: Cargo test execution · ✓ edit_file ×2: render.rs · ✓ read_file ×5: SKILL.md │ 技能: hud
+╭─ 🔧 调用工具 │ [自动] │ [Gemini 4 Argon · med] Pro · ~64 tok/s │ agy-hud git:(feat/rust-hud* ↑2) │ ⏱ 12m
+├─ 上下文 ██░····· 28.4% (152k/1.0M) · ⚡ 75% 缓存 │ ~$0.38 · 子代理 1/2 · 后台 1 · 产物 2 · 🛡 沙箱开启
+├─ 配额(weekly) ▓···· 16% (4d 18h)
+├─ ◐ run_command: Cargo test execution · ✓ edit_file ×2: render.rs · ✓ read_file ×5: SKILL.md
+├─ 技能: hud, agy-customizations │ MCP: context7
 ├─ ◐ CLI Docs Researcher [research] (1m 15s) │ ✓ Security Auditor [self] (1m)
 ╰─ ▸ Verify compile-time arch_guard boundaries (2/4 · 50%)
 ```
@@ -79,11 +81,13 @@ curl -fsSL https://raw.githubusercontent.com/maxlee/agy-hud/main/uninstall.sh | 
 ./scripts/agy-hud doctor                                      # 输出结构化 JSON 诊断报告（供插件与排障使用）
 ./scripts/agy-hud doctor --pretty                             # 人类可读诊断面板（自动缩写 ~ 路径 + 3 模式图标对齐探针）
 ./scripts/agy-hud preview --state showcase                    # 预览 5 种典型宽度、状态与中英文布局
-./scripts/agy-hud schema                                      # 查看全部 42 个可配置项、类型及说明
+./scripts/agy-hud schema                                      # 查看全部 43 个可配置项、类型及说明
 ./scripts/agy-hud update --check                              # 检查 GitHub Releases 是否有新版本
 ./scripts/agy-hud update                                      # 自动下载并校验 SHA-256 升级至最新版（保留 --stack 与配置）
 ./scripts/agy-hud set updates.enabled=false                   # 可选：关闭每 6 小时后台新版本检查与顶栏提示徽章
 ./scripts/agy-hud set display.glyphMode=nerd                  # 切换字符集模式：unicode | nerd | ascii（纯 7-bit）
+./scripts/agy-hud set display.showPlanTier=false              # 可选：隐藏顶栏归一化订阅档位徽章（Pro/Ultra）
+./scripts/agy-hud set display.showSpeed=false                 # 可选：隐藏模型右侧估算输出速率（~tok/s）徽章
 ./scripts/agy-hud set display.showTitle=true                  # 在顶栏展示当前会话标题（自动脱敏裁剪至 <=24 列）
 ./scripts/agy-hud set quota.backgroundRefresh=true            # 可选开启后台 `/usage` 官方配额自动刷新（默认关闭 false）
 ./scripts/agy-hud quota refresh                               # 手动触发一次官方 `/usage` 配额快照同步

@@ -282,6 +282,8 @@ pub struct AgyStdinData {
     pub vim: Option<VimStdin>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cost: Option<CostStdin>,
+    #[serde(flatten, skip_serializing_if = "BTreeMap::is_empty", default)]
+    pub extra: BTreeMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -334,6 +336,18 @@ pub struct TodoItem {
     pub status: TodoStatus,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlannerStepTiming {
+    pub step_index: usize,
+    pub output_tokens: u64,
+    pub started_at_ms: i64,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub ended_at_ms: Option<i64>,
+    #[serde(default)]
+    pub has_trailing_user_input: bool,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TranscriptSummary {
     pub tools: Vec<ToolEntry>,
@@ -342,6 +356,12 @@ pub struct TranscriptSummary {
     pub mcp_errors: Vec<String>,
     pub subagents: Vec<SubagentEntry>,
     pub todos: Vec<TodoItem>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub active_slash_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub completed_step_tps_x10: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub latest_planner_step: Option<PlannerStepTiming>,
     pub session_started_at: Option<i64>,
     pub last_step_at: Option<i64>,
     pub step_count: usize,
@@ -434,6 +454,17 @@ pub struct UpdateCacheSnapshot {
     pub release_url: Option<String>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SpeedCacheSnapshot {
+    pub session_key: String,
+    pub step_index: usize,
+    pub output_tokens: u64,
+    pub started_at_ms: i64,
+    pub ended_at_ms: i64,
+    pub tps_x10: u32,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ProbeAnswers {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -444,6 +475,8 @@ pub struct ProbeAnswers {
     pub quota_cache: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub update_cache: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub speed_cache: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -515,6 +548,8 @@ pub struct LogicPaths {
     pub quota_cache: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub update_cache: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub speed_cache: Option<String>,
     pub cli_settings: String,
     pub transcript: Option<String>,
     pub task_md: Option<String>,

@@ -49,6 +49,10 @@ impl Default for VcsConfig {
     }
 }
 
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DisplayConfig {
@@ -76,6 +80,8 @@ pub struct DisplayConfig {
     pub show_sandbox: bool,
     pub show_counts: bool,
     pub show_plan_tier: bool,
+    #[serde(default = "default_true")]
+    pub show_speed: bool,
     pub show_memory: bool,
     pub show_duration: bool,
     pub show_tools: bool,
@@ -110,11 +116,12 @@ impl Default for DisplayConfig {
             show_cost: true,
             show_sandbox: true,
             show_counts: true,
-            show_plan_tier: false,
+            show_plan_tier: true,
+            show_speed: true,
             show_memory: false,
             show_duration: true,
             show_tools: true,
-            tools_max_visible: 4,
+            tools_max_visible: 3,
             show_skills_and_mcp: true,
             show_subagents: true,
             show_todos: true,
@@ -355,7 +362,12 @@ pub const CONFIG_SCHEMA: &[SchemaEntry] = &[
     SchemaEntry {
         key: "display.showPlanTier",
         kind: SchemaValueKind::Boolean,
-        description: "Show subscription tier badge (e.g. Pro).",
+        description: "Show subscription tier badge (e.g. Pro, Ultra).",
+    },
+    SchemaEntry {
+        key: "display.showSpeed",
+        kind: SchemaValueKind::Boolean,
+        description: "Show estimated output generation throughput (~tok/s) next to model badge.",
     },
     SchemaEntry {
         key: "display.showMemory",
@@ -380,7 +392,7 @@ pub const CONFIG_SCHEMA: &[SchemaEntry] = &[
     SchemaEntry {
         key: "display.showSkillsAndMcp",
         kind: SchemaValueKind::Boolean,
-        description: "Show activated skills and MCP servers alongside tool activity.",
+        description: "Show activated skills and MCP servers line parsed from transcript.jsonl.",
     },
     SchemaEntry {
         key: "display.showSubagents",

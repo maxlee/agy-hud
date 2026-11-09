@@ -20,8 +20,8 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 
 pub const MAX_STDIN_BYTES: usize = 256 * 1024;
 pub const STDIN_READ_TIMEOUT_MS: u64 = 1_000;
-pub const HEAD_READ_BYTES: usize = 8 * 1024;
-pub const TAIL_READ_BYTES: u64 = 256 * 1024;
+pub const HEAD_READ_BYTES: usize = 32 * 1024;
+pub const TAIL_READ_BYTES: u64 = 512 * 1024;
 pub const MAX_TASK_MD_BYTES: u64 = 64 * 1024;
 pub const PROBE_TIMEOUT_MS: u64 = 1_200;
 pub const PROBE_MAX_BUFFER: u64 = 512 * 1024;
@@ -838,6 +838,15 @@ pub fn collect_render_inputs(
             None
         };
 
+        let speed_cache = if config.display.show_speed {
+            logic_paths
+                .speed_cache
+                .as_deref()
+                .and_then(|p| read_bounded_string(Path::new(p), 8 * 1024))
+        } else {
+            None
+        };
+
         CollectedRenderData {
             transcript: tx_handle.join().unwrap_or_default(),
             probes: ProbeAnswers {
@@ -845,6 +854,7 @@ pub fn collect_render_inputs(
                 memory: mem_handle.join().ok().flatten(),
                 quota_cache,
                 update_cache,
+                speed_cache,
             },
         }
     })

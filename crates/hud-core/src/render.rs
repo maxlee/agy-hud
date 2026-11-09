@@ -1,10 +1,10 @@
 use crate::ansi::{
-    BOLD, ITALIC, RESET, colors, file_link, paint, render_bar_with_mode, sanitize_text,
+    BOLD, DIM, ITALIC, RESET, colors, file_link, paint, render_bar_with_mode, sanitize_text,
     sanitize_title_text, text_width, truncate_ansi_with_ellipsis,
 };
 use crate::config::HudConfig;
 use crate::i18n::{Labels, get_labels};
-use crate::probes::{is_newer_semver, normalize_semver_tag};
+use crate::probes::{is_newer_semver, normalize_semver_tag, resolve_output_speed};
 use crate::stdin::{
     extract_context_metrics, extract_quota_buckets_reconciled, format_compact_tokens,
     format_duration_seconds, format_model_name_with_glyphs, format_session_cost,
@@ -30,15 +30,15 @@ pub struct RenderInput<'a> {
 
 fn sep(gm: GlyphMode) -> String {
     match gm {
-        GlyphMode::Ascii => format!("{} | {RESET}", colors::GRAY),
-        GlyphMode::Unicode | GlyphMode::Nerd => format!("{} │ {RESET}", colors::GRAY),
+        GlyphMode::Ascii => format!("{DIM} | {RESET}"),
+        GlyphMode::Unicode | GlyphMode::Nerd => format!("{DIM} │ {RESET}"),
     }
 }
 
 fn dot(gm: GlyphMode) -> String {
     match gm {
-        GlyphMode::Ascii => format!("{} . {RESET}", colors::GRAY),
-        GlyphMode::Unicode | GlyphMode::Nerd => format!("{} · {RESET}", colors::GRAY),
+        GlyphMode::Ascii => format!("{DIM} . {RESET}"),
+        GlyphMode::Unicode | GlyphMode::Nerd => format!("{DIM} · {RESET}"),
     }
 }
 
@@ -58,7 +58,7 @@ fn render_state_badge(stdin: Option<&AgyStdinData>, labels: &Labels, gm: GlyphMo
         let icon = if ascii { "!" } else { "⚠" };
         return paint(
             &format!("{icon} {}", labels.state.confirm),
-            &[colors::BRIGHT_YELLOW, BOLD],
+            &[colors::YELLOW, BOLD],
         );
     }
     let state = stdin
@@ -69,7 +69,7 @@ fn render_state_badge(stdin: Option<&AgyStdinData>, labels: &Labels, gm: GlyphMo
     match state.as_str() {
         "idle" => paint(
             &format!("{} {}", if ascii { "*" } else { "●" }, labels.state.idle),
-            &[colors::BRIGHT_GREEN, BOLD],
+            &[colors::GREEN, BOLD],
         ),
         "thinking" => paint(
             &format!(
@@ -77,11 +77,11 @@ fn render_state_badge(stdin: Option<&AgyStdinData>, labels: &Labels, gm: GlyphMo
                 if ascii { "~" } else { "◆" },
                 labels.state.thinking
             ),
-            &[colors::BRIGHT_YELLOW, BOLD],
+            &[colors::YELLOW, BOLD],
         ),
         "working" => paint(
             &format!("{} {}", if ascii { "*" } else { "⚙" }, labels.state.working),
-            &[colors::BRIGHT_CYAN, BOLD],
+            &[colors::CYAN, BOLD],
         ),
         "tool_use" => paint(
             &format!(
@@ -89,7 +89,7 @@ fn render_state_badge(stdin: Option<&AgyStdinData>, labels: &Labels, gm: GlyphMo
                 if ascii { ">" } else { "🔧" },
                 labels.state.tool_use
             ),
-            &[colors::BRIGHT_MAGENTA, BOLD],
+            &[colors::MAGENTA, BOLD],
         ),
         "reviewing" => paint(
             &format!(
@@ -97,7 +97,7 @@ fn render_state_badge(stdin: Option<&AgyStdinData>, labels: &Labels, gm: GlyphMo
                 if ascii { "?" } else { "👁" },
                 labels.state.reviewing
             ),
-            &[colors::BRIGHT_BLUE, BOLD],
+            &[colors::BLUE, BOLD],
         ),
         "authenticating" => paint(
             &format!(
@@ -117,7 +117,7 @@ fn render_state_badge(stdin: Option<&AgyStdinData>, labels: &Labels, gm: GlyphMo
         ),
         "error" => paint(
             &format!("{} {}", if ascii { "X" } else { "✖" }, labels.state.error),
-            &[colors::BRIGHT_RED, BOLD],
+            &[colors::RED, BOLD],
         ),
         other => {
             let clean = sanitize_text(other).to_ascii_uppercase();
@@ -128,28 +128,36 @@ fn render_state_badge(stdin: Option<&AgyStdinData>, labels: &Labels, gm: GlyphMo
             };
             paint(
                 &format!("{} {text}", if ascii { "*" } else { "●" }),
-                &[colors::WHITE, BOLD],
+                &[BOLD],
             )
         }
     }
 }
 
-fn render_mode_badges(stdin: Option<&AgyStdinData>, labels: &Labels) -> String {
+fn render_mode_badges(
+    stdin: Option<&AgyStdinData>,
+    transcript: &TranscriptSummary,
+    labels: &Labels,
+) -> String {
     let mut parts = Vec::new();
-    let cycle = sanitize_text(stdin.and_then(|s| s.cycle_mode.as_deref()).unwrap_or(""))
-        .to_ascii_lowercase();
+    let raw_mode = stdin
+        .and_then(|s| s.cycle_mode.as_deref())
+        .filter(|s| !s.trim().is_empty())
+        .or(transcript.active_slash_mode.as_deref())
+        .unwrap_or("");
+    let cycle = sanitize_text(raw_mode).to_ascii_lowercase();
     match cycle.as_str() {
         "plan" => parts.push(paint(
             &format!("[{}]", labels.mode.plan),
-            &[colors::BRIGHT_CYAN, BOLD],
+            &[colors::CYAN, BOLD],
         )),
         "auto" => parts.push(paint(
             &format!("[{}]", labels.mode.auto),
-            &[colors::BRIGHT_GREEN, BOLD],
+            &[colors::GREEN, BOLD],
         )),
         "accept-edits" => parts.push(paint(
             &format!("[{}]", labels.mode.accept_edits),
-            &[colors::BRIGHT_YELLOW],
+            &[colors::YELLOW, BOLD],
         )),
         _ => {}
     }
@@ -162,11 +170,11 @@ fn render_mode_badges(stdin: Option<&AgyStdinData>, labels: &Labels) -> String {
     );
     if !vim_mode.is_empty() {
         let vim_color = if vim_mode == "INSERT" {
-            colors::BRIGHT_GREEN
+            colors::GREEN
         } else if vim_mode.starts_with("VISUAL") {
-            colors::BRIGHT_MAGENTA
+            colors::MAGENTA
         } else {
-            colors::BRIGHT_BLUE
+            colors::BLUE
         };
         parts.push(paint(&format!("[{vim_mode}]"), &[vim_color, BOLD]));
     }
@@ -199,14 +207,14 @@ fn render_vcs_segment(
 
     let prefix = vcs.vcs_type.as_str();
     let dirty_mark = if config.vcs.show_dirty && vcs.dirty {
-        paint("*", &[colors::BRIGHT_YELLOW, BOLD])
+        paint("*", &[colors::YELLOW, BOLD])
     } else {
         String::new()
     };
     let branch_color = if vcs.dirty && config.vcs.show_dirty {
-        colors::BRIGHT_RED
+        colors::RED
     } else {
-        colors::BRIGHT_BLUE
+        colors::BLUE
     };
 
     let (up_arrow, down_arrow) = match gm {
@@ -228,10 +236,7 @@ fn render_vcs_segment(
         }
     }
     if vcs.conflicts > 0 {
-        extras.push(paint(
-            &format!("!{}", vcs.conflicts),
-            &[colors::BRIGHT_RED, BOLD],
-        ));
+        extras.push(paint(&format!("!{}", vcs.conflicts), &[colors::RED, BOLD]));
     }
     if show_extras && config.vcs.show_file_stats {
         let mut stats = Vec::new();
@@ -263,9 +268,9 @@ fn render_vcs_segment(
 
     format!(
         "{nerd_prefix}{}{}{dirty_mark}{extra_text}{}",
-        paint(&format!("{prefix}:("), &[colors::GRAY]),
-        paint(&vcs.branch, &[branch_color]),
-        paint(")", &[colors::GRAY]),
+        paint(&format!("{prefix}:("), &[DIM]),
+        paint(&vcs.branch, &[branch_color, BOLD]),
+        paint(")", &[DIM]),
     )
 }
 
@@ -278,6 +283,7 @@ struct HeaderOpts {
     path_levels: PathLevels,
     model_format: ModelFormatMode,
     show_plan_tier: bool,
+    show_speed: bool,
     show_vcs_extras: bool,
     show_folder: bool,
     show_vcs: bool,
@@ -323,13 +329,39 @@ fn render_context_segment(
     };
 
     let value_text = match opts.context_value {
-        ContextValueMode::Tokens => tok_str.unwrap_or(pct_str),
-        ContextValueMode::Remaining => rem_str,
-        ContextValueMode::Both => match tok_str {
-            Some(tok) => format!("{pct_str} {}", paint(&format!("({tok})"), &[colors::GRAY])),
-            None => pct_str,
-        },
-        ContextValueMode::Percent => pct_str,
+        ContextValueMode::Tokens => paint(&tok_str.unwrap_or(pct_str), &[BOLD]),
+        ContextValueMode::Remaining => paint(&rem_str, &[BOLD]),
+        ContextValueMode::Both => {
+            let num_styles: &[&str] = if metrics.used_percent
+                >= (config.display.context_critical_threshold as f64)
+            {
+                &[colors::RED, BOLD]
+            } else if metrics.used_percent >= (config.display.context_warning_threshold as f64) {
+                &[colors::YELLOW, BOLD]
+            } else {
+                &[BOLD]
+            };
+            match tok_str {
+                Some(tok) => format!(
+                    "{} {}",
+                    paint(&pct_str, num_styles),
+                    paint(&format!("({tok})"), &[DIM])
+                ),
+                None => paint(&pct_str, num_styles),
+            }
+        }
+        ContextValueMode::Percent => {
+            let num_styles: &[&str] = if metrics.used_percent
+                >= (config.display.context_critical_threshold as f64)
+            {
+                &[colors::RED, BOLD]
+            } else if metrics.used_percent >= (config.display.context_warning_threshold as f64) {
+                &[colors::YELLOW, BOLD]
+            } else {
+                &[BOLD]
+            };
+            paint(&pct_str, num_styles)
+        }
     };
 
     let bar_len =
@@ -350,7 +382,7 @@ fn render_context_segment(
                 bar_len,
                 warn_at,
                 crit_at,
-                colors::BRIGHT_GREEN,
+                colors::GREEN,
                 gm,
             )
         )
@@ -358,23 +390,15 @@ fn render_context_segment(
         String::new()
     };
 
-    let num_color = if metrics.used_percent >= crit_at {
-        colors::BRIGHT_RED
-    } else if metrics.used_percent >= warn_at {
-        colors::BRIGHT_YELLOW
-    } else {
-        colors::BRIGHT_WHITE
-    };
-
     let over_200k = if opts.show_200k && metrics.exceeds_200k {
-        format!(" {}", paint("200k+", &[colors::BRIGHT_YELLOW]))
+        format!(" {}", paint("200k+", &[colors::YELLOW, BOLD]))
     } else {
         String::new()
     };
 
     let cache_part = match (opts.show_cache_hit_rate, metrics.cache_hit_percent) {
         (true, Some(hit)) => {
-            let prefix = if gm == GlyphMode::Ascii { "" } else { "⚡" };
+            let prefix = if gm == GlyphMode::Ascii { "" } else { "⚡ " };
             format!(
                 "{}{}",
                 dot(gm),
@@ -388,9 +412,8 @@ fn render_context_segment(
     };
 
     format!(
-        "{} {bar}{}{over_200k}{cache_part}",
-        paint(labels.metrics.context, &[colors::GRAY]),
-        paint(&value_text, &[num_color, BOLD]),
+        "{} {bar}{value_text}{over_200k}{cache_part}",
+        paint(labels.metrics.context, &[DIM]),
     )
 }
 
@@ -435,10 +458,17 @@ fn render_quota_segment(
                     }
                     QuotaValueMode::Used => format!("{:.0}%", used),
                 };
+                let pct_styles: &[&str] = if used >= 90.0 {
+                    &[colors::RED, BOLD]
+                } else if used >= 70.0 {
+                    &[colors::YELLOW, BOLD]
+                } else {
+                    &[BOLD]
+                };
                 let mini_bar = if opts.quota_bar_enabled {
                     format!(
                         "{} ",
-                        render_bar_with_mode(used, mini_len, 70.0, 90.0, colors::BRIGHT_CYAN, gm)
+                        render_bar_with_mode(used, mini_len, 70.0, 90.0, colors::CYAN, gm)
                     )
                 } else {
                     String::new()
@@ -451,14 +481,14 @@ fn render_quota_segment(
                         } else {
                             format!("({dur})")
                         };
-                        format!(" {}", paint(&inner, &[colors::GRAY]))
+                        format!(" {}", paint(&inner, &[DIM]))
                     }
                     _ => String::new(),
                 };
                 format!(
                     "{} {mini_bar}{}{reset}",
-                    paint(&label, &[colors::GRAY]),
-                    paint(&display_pct, &[colors::BRIGHT_WHITE, BOLD]),
+                    paint(&label, &[DIM]),
+                    paint(&display_pct, pct_styles),
                 )
             } else {
                 let amt = b
@@ -471,20 +501,17 @@ fn render_quota_segment(
                         }
                     })
                     .unwrap_or_default();
-                format!(
-                    "{} {}",
-                    paint(&label, &[colors::GRAY]),
-                    paint(&amt, &[colors::BRIGHT_WHITE, BOLD]),
-                )
+                format!("{} {}", paint(&label, &[DIM]), paint(&amt, &[BOLD]),)
             }
         })
         .collect();
 
-    rendered.join(&dot(gm))
+    rendered.join(&sep(gm))
 }
 
 fn render_counts_and_meta(
     stdin: Option<&AgyStdinData>,
+    transcript: &TranscriptSummary,
     memory: Option<&MemoryProbeInfo>,
     config: &HudConfig,
     labels: &Labels,
@@ -508,12 +535,34 @@ fn render_counts_and_meta(
         };
         items.push(paint(
             &format!("{prefix}{formatted_usd}"),
-            &[colors::YELLOW],
+            &[colors::YELLOW, BOLD],
         ));
     }
 
     if config.display.show_counts {
-        if let Some(subagents) = stdin.and_then(|s| s.subagents.as_ref())
+        if !transcript.subagents.is_empty() {
+            let running = transcript
+                .subagents
+                .iter()
+                .filter(|s| s.status == SubagentStatus::Running)
+                .count();
+            let total = transcript.subagents.len();
+            let agent_label = if running > 0 {
+                format!("{running}/{total}")
+            } else {
+                total.to_string()
+            };
+            let val_styles: &[&str] = if running > 0 {
+                &[colors::CYAN, BOLD]
+            } else {
+                &[BOLD]
+            };
+            items.push(format!(
+                "{} {}",
+                paint(labels.metrics.subagents, &[DIM]),
+                paint(&agent_label, val_styles),
+            ));
+        } else if let Some(subagents) = stdin.and_then(|s| s.subagents.as_ref())
             && !subagents.is_empty()
         {
             let running = subagents
@@ -526,15 +575,15 @@ fn render_counts_and_meta(
             } else {
                 total.to_string()
             };
-            let color = if running > 0 {
-                colors::BRIGHT_CYAN
+            let val_styles: &[&str] = if running > 0 {
+                &[colors::CYAN, BOLD]
             } else {
-                colors::BRIGHT_WHITE
+                &[BOLD]
             };
             items.push(format!(
                 "{} {}",
-                paint(labels.metrics.subagents, &[colors::GRAY]),
-                paint(&agent_label, &[color, BOLD]),
+                paint(labels.metrics.subagents, &[DIM]),
+                paint(&agent_label, val_styles),
             ));
         }
 
@@ -543,8 +592,8 @@ fn render_counts_and_meta(
         {
             items.push(format!(
                 "{} {}",
-                paint(labels.metrics.tasks, &[colors::GRAY]),
-                paint(&tasks.to_string(), &[colors::BRIGHT_CYAN, BOLD]),
+                paint(labels.metrics.tasks, &[DIM]),
+                paint(&tasks.to_string(), &[colors::CYAN, BOLD]),
             ));
         }
 
@@ -554,8 +603,8 @@ fn render_counts_and_meta(
         {
             items.push(format!(
                 "{} {}",
-                paint(labels.metrics.artifacts, &[colors::GRAY]),
-                paint(&arts.to_string(), &[colors::BRIGHT_WHITE, BOLD]),
+                paint(labels.metrics.artifacts, &[DIM]),
+                paint(&arts.to_string(), &[BOLD]),
             ));
         }
 
@@ -564,7 +613,7 @@ fn render_counts_and_meta(
         {
             items.push(paint(
                 &format!("+{queued} {}", labels.metrics.queued),
-                &[colors::BRIGHT_YELLOW, BOLD],
+                &[colors::YELLOW, BOLD],
             ));
         }
     }
@@ -572,116 +621,139 @@ fn render_counts_and_meta(
     if config.display.show_memory
         && let Some(mem) = memory
     {
-        let mem_color = if mem.used_percent >= 90 {
-            colors::BRIGHT_RED
+        let mem_styles: &[&str] = if mem.used_percent >= 90 {
+            &[colors::RED, BOLD]
         } else if mem.used_percent >= 75 {
-            colors::BRIGHT_YELLOW
+            &[colors::YELLOW, BOLD]
         } else {
-            colors::BRIGHT_WHITE
+            &[BOLD]
         };
         items.push(format!(
             "{} {}",
-            paint(labels.metrics.memory, &[colors::GRAY]),
-            paint(&format!("{}%", mem.used_percent), &[mem_color]),
+            paint(labels.metrics.memory, &[DIM]),
+            paint(&format!("{}%", mem.used_percent), mem_styles),
         ));
     }
 
     if config.display.show_sandbox
-        && let Some(enabled) = stdin
+        && stdin
             .and_then(|s| s.sandbox.as_ref())
             .and_then(|sb| sb.enabled)
+            == Some(true)
     {
-        if enabled {
-            let badge = match gm {
-                GlyphMode::Ascii => labels.metrics.sandbox_on.to_string(),
-                GlyphMode::Nerd => format!("\u{f0a3} {}", labels.metrics.sandbox_on),
-                GlyphMode::Unicode => format!("🛡 {}", labels.metrics.sandbox_on),
-            };
-            items.push(paint(&badge, &[colors::BRIGHT_GREEN, BOLD]));
-        } else if !opts.compact_meta {
-            items.push(paint(labels.metrics.sandbox_off, &[colors::GRAY]));
-        }
+        let badge = match gm {
+            GlyphMode::Ascii => labels.metrics.sandbox_on.to_string(),
+            GlyphMode::Nerd => format!("\u{f0a3} {}", labels.metrics.sandbox_on),
+            GlyphMode::Unicode => format!("🛡 {}", labels.metrics.sandbox_on),
+        };
+        items.push(paint(&badge, &[colors::GREEN, BOLD]));
     }
 
     items.join(&dot(gm))
 }
 
-fn render_tools_activity_line(
+fn build_tools_line_with_limit(
+    transcript: &TranscriptSummary,
+    config: &HudConfig,
+    max_tools: usize,
+) -> Option<String> {
+    if !config.display.show_tools || transcript.tools.is_empty() || max_tools == 0 {
+        return None;
+    }
+    let gm = config.display.glyph_mode;
+    let ascii = gm == GlyphMode::Ascii;
+
+    let formatted: Vec<String> = transcript
+        .tools
+        .iter()
+        .take(max_tools)
+        .map(|t| {
+            let (icon, name_styles): (String, &[&str]) = match t.status {
+                ToolStatus::Running => (
+                    paint(if ascii { "~" } else { "◐" }, &[colors::CYAN, BOLD]),
+                    &[BOLD],
+                ),
+                ToolStatus::Error => (
+                    paint(if ascii { "x" } else { "✗" }, &[colors::RED, BOLD]),
+                    &[colors::RED, BOLD],
+                ),
+                ToolStatus::Completed => {
+                    (paint(if ascii { "+" } else { "✓" }, &[colors::GREEN]), &[])
+                }
+            };
+            let count_part = if t.count > 1 {
+                let mult = if ascii { "x" } else { "×" };
+                paint(&format!(" {mult}{}", t.count), &[colors::CYAN])
+            } else {
+                String::new()
+            };
+            let target_part = match t.target.as_deref() {
+                Some(tgt) if !tgt.is_empty() => paint(&format!(": {tgt}"), &[DIM]),
+                _ => String::new(),
+            };
+            format!(
+                "{icon} {}{count_part}{target_part}",
+                paint(&t.name, name_styles)
+            )
+        })
+        .collect();
+
+    (!formatted.is_empty()).then(|| formatted.join(&dot(gm)))
+}
+
+fn render_tools_line(
+    transcript: &TranscriptSummary,
+    config: &HudConfig,
+    line_budget: Option<usize>,
+) -> Option<String> {
+    let max_visible = config.display.tools_max_visible;
+    let candidate = build_tools_line_with_limit(transcript, config, max_visible)?;
+    if let Some(budget) = line_budget
+        && text_width(&candidate) > budget
+        && max_visible > 2
+    {
+        return build_tools_line_with_limit(transcript, config, 2);
+    }
+    Some(candidate)
+}
+
+fn render_skills_mcp_line(
     transcript: &TranscriptSummary,
     config: &HudConfig,
     labels: &Labels,
 ) -> Option<String> {
+    if !config.display.show_skills_and_mcp {
+        return None;
+    }
     let gm = config.display.glyph_mode;
-    let ascii = gm == GlyphMode::Ascii;
     let mut parts = Vec::new();
 
-    if config.display.show_tools && !transcript.tools.is_empty() {
-        let formatted: Vec<String> = transcript
-            .tools
+    if !transcript.skills.is_empty() {
+        let start = transcript.skills.len().saturating_sub(4);
+        let shown = transcript.skills[start..].join(", ");
+        parts.push(format!(
+            "{} {}",
+            paint(&format!("{}:", labels.metrics.skills), &[DIM]),
+            paint(&shown, &[colors::MAGENTA]),
+        ));
+    }
+    if !transcript.mcp_servers.is_empty() {
+        let start = transcript.mcp_servers.len().saturating_sub(4);
+        let mcp_items: Vec<String> = transcript.mcp_servers[start..]
             .iter()
-            .take(config.display.tools_max_visible)
-            .map(|t| {
-                let (icon, name_color) = match t.status {
-                    ToolStatus::Running => (
-                        paint(if ascii { "~" } else { "◐" }, &[colors::BRIGHT_CYAN, BOLD]),
-                        colors::BRIGHT_WHITE,
-                    ),
-                    ToolStatus::Error => (
-                        paint(if ascii { "x" } else { "✗" }, &[colors::BRIGHT_RED, BOLD]),
-                        colors::BRIGHT_RED,
-                    ),
-                    ToolStatus::Completed => (
-                        paint(if ascii { "+" } else { "✓" }, &[colors::BRIGHT_GREEN]),
-                        colors::WHITE,
-                    ),
-                };
-                let count_part = if t.count > 1 {
-                    let mult = if ascii { "x" } else { "×" };
-                    paint(&format!(" {mult}{}", t.count), &[colors::CYAN])
+            .map(|srv| {
+                if transcript.mcp_errors.contains(srv) {
+                    paint(&format!("{srv}!"), &[colors::RED, BOLD])
                 } else {
-                    String::new()
-                };
-                let target_part = match t.target.as_deref() {
-                    Some(tgt) if !tgt.is_empty() => paint(&format!(": {tgt}"), &[colors::GRAY]),
-                    _ => String::new(),
-                };
-                format!(
-                    "{icon} {}{count_part}{target_part}",
-                    paint(&t.name, &[name_color])
-                )
+                    paint(srv, &[colors::CYAN])
+                }
             })
             .collect();
-        parts.push(formatted.join(&dot(gm)));
-    }
-
-    if config.display.show_skills_and_mcp {
-        if !transcript.skills.is_empty() {
-            let start = transcript.skills.len().saturating_sub(3);
-            let shown = transcript.skills[start..].join(", ");
-            parts.push(format!(
-                "{} {}",
-                paint(&format!("{}:", labels.metrics.skills), &[colors::GRAY]),
-                paint(&shown, &[colors::MAGENTA]),
-            ));
-        }
-        if !transcript.mcp_servers.is_empty() {
-            let start = transcript.mcp_servers.len().saturating_sub(3);
-            let mcp_items: Vec<String> = transcript.mcp_servers[start..]
-                .iter()
-                .map(|srv| {
-                    if transcript.mcp_errors.contains(srv) {
-                        paint(&format!("{srv}!"), &[colors::BRIGHT_RED, BOLD])
-                    } else {
-                        paint(srv, &[colors::CYAN])
-                    }
-                })
-                .collect();
-            parts.push(format!(
-                "{} {}",
-                paint(&format!("{}:", labels.metrics.mcp), &[colors::GRAY]),
-                mcp_items.join(", "),
-            ));
-        }
+        parts.push(format!(
+            "{} {}",
+            paint(&format!("{}:", labels.metrics.mcp), &[DIM]),
+            mcp_items.join(", "),
+        ));
     }
 
     (!parts.is_empty()).then(|| parts.join(&sep(gm)))
@@ -705,18 +777,26 @@ fn render_subagents_line(
         .map(|ag| {
             let running = ag.status == SubagentStatus::Running;
             let icon = if running {
-                paint(if ascii { "~" } else { "◐" }, &[colors::BRIGHT_CYAN, BOLD])
+                paint(if ascii { "~" } else { "◐" }, &[colors::CYAN, BOLD])
             } else {
-                paint(if ascii { "+" } else { "✓" }, &[colors::BRIGHT_GREEN])
+                paint(if ascii { "+" } else { "✓" }, &[colors::GREEN])
             };
             let title = match ag.role.as_deref() {
                 Some(role) if !role.is_empty() => {
-                    format!(
-                        "{role} {}",
-                        paint(&format!("[{}]", ag.name), &[colors::GRAY])
-                    )
+                    let styled_role = if running {
+                        paint(role, &[BOLD])
+                    } else {
+                        role.to_string()
+                    };
+                    format!("{styled_role} {}", paint(&format!("[{}]", ag.name), &[DIM]))
                 }
-                _ => ag.name.clone(),
+                _ => {
+                    if running {
+                        paint(&ag.name, &[BOLD])
+                    } else {
+                        ag.name.clone()
+                    }
+                }
             };
             let elapsed = if let Some(start) = ag.started_at {
                 let end = ag.ended_at.unwrap_or(now_ms);
@@ -728,7 +808,7 @@ fn render_subagents_line(
                                 "({})",
                                 format_duration_seconds(((end - start) as f64) / 1000.0)
                             ),
-                            &[colors::GRAY],
+                            &[DIM],
                         )
                     )
                 } else {
@@ -737,12 +817,7 @@ fn render_subagents_line(
             } else {
                 String::new()
             };
-            let styled_title = if running {
-                paint(&title, &[colors::BRIGHT_WHITE])
-            } else {
-                title
-            };
-            format!("{icon} {styled_title}{elapsed}")
+            format!("{icon} {title}{elapsed}")
         })
         .collect();
 
@@ -780,24 +855,24 @@ fn render_todos_line(
     let Some(active) = active else {
         return Some(format!(
             "{} {}",
-            paint(if ascii { "+" } else { "✓" }, &[colors::BRIGHT_GREEN, BOLD]),
+            paint(if ascii { "+" } else { "✓" }, &[colors::GREEN, BOLD]),
             paint(
                 &format!("{}: {completed}/{total} (100%)", labels.metrics.todos),
-                &[colors::BRIGHT_GREEN]
+                &[colors::GREEN, BOLD]
             ),
         ));
     };
 
     let pct = ((completed as f64 / total as f64) * 100.0).round() as usize;
     let icon = if active.status == TodoStatus::InProgress {
-        paint(if ascii { ">" } else { "▸" }, &[colors::BRIGHT_CYAN, BOLD])
+        paint(if ascii { ">" } else { "▸" }, &[colors::CYAN, BOLD])
     } else {
-        paint(if ascii { "-" } else { "◦" }, &[colors::GRAY])
+        paint(if ascii { "-" } else { "◦" }, &[DIM])
     };
     let mid_dot = if ascii { "." } else { "·" };
     Some(format!(
         "{icon} {} {}",
-        paint(&active.text, &[colors::BRIGHT_WHITE]),
+        paint(&active.text, &[BOLD]),
         paint(
             &format!("({completed}/{total} {mid_dot} {pct}%)"),
             &[colors::CYAN]
@@ -819,11 +894,11 @@ fn join_with_rail(lines: Vec<String>, use_box_rail: bool, gm: GlyphMode) -> Vec<
         .enumerate()
         .map(|(idx, line)| {
             if idx == 0 {
-                format!("{}{top}{RESET} {line}", colors::GRAY)
+                format!("{DIM}{top}{RESET} {line}")
             } else if idx == last {
-                format!("{}{bot}{RESET} {line}", colors::GRAY)
+                format!("{DIM}{bot}{RESET} {line}")
             } else {
-                format!("{}{mid}{RESET} {line}", colors::GRAY)
+                format!("{DIM}{mid}{RESET} {line}")
             }
         })
         .collect()
@@ -845,7 +920,7 @@ fn build_header_line(input: &RenderInput<'_>, labels: &Labels, opts: &HeaderOpts
         header_parts.push(render_state_badge(stdin, labels, gm));
     }
     if opts.show_mode {
-        let modes = render_mode_badges(stdin, labels);
+        let modes = render_mode_badges(stdin, transcript, labels);
         if !modes.is_empty() {
             header_parts.push(modes);
         }
@@ -867,14 +942,30 @@ fn build_header_line(input: &RenderInput<'_>, labels: &Labels, opts: &HeaderOpts
                     if norm.is_empty() {
                         String::new()
                     } else {
-                        format!(" {}", paint(&norm, &[colors::YELLOW]))
+                        format!(" {}", paint(&norm, &[colors::YELLOW, BOLD]))
                     }
                 }
                 _ => String::new(),
             };
+            let speed_suffix = if opts.show_speed {
+                match resolve_output_speed(stdin, transcript, None, now_ms).0 {
+                    Some((tps, estimated)) => {
+                        let prefix = if estimated { "~" } else { "" };
+                        format!(
+                            "{}{} {}",
+                            dot(gm),
+                            paint(&format!("{prefix}{tps:.0}"), &[colors::CYAN, BOLD]),
+                            paint("tok/s", &[DIM]),
+                        )
+                    }
+                    None => String::new(),
+                }
+            } else {
+                String::new()
+            };
             header_parts.push(format!(
-                "{}{tier}",
-                paint(&format!("[{model_str}]"), &[colors::BRIGHT_MAGENTA, ITALIC])
+                "{}{tier}{speed_suffix}",
+                paint(&format!("[{model_str}]"), &[colors::MAGENTA, ITALIC])
             ));
         }
     }
@@ -897,17 +988,13 @@ fn build_header_line(input: &RenderInput<'_>, labels: &Labels, opts: &HeaderOpts
             match raw_dir {
                 Some(dir) if !short_dir.is_empty() => {
                     let folder_prefix = if gm == GlyphMode::Nerd {
-                        paint("\u{f07c} ", &[colors::BRIGHT_WHITE])
+                        paint("\u{f07c} ", &[colors::BLUE])
                     } else {
                         String::new()
                     };
                     format!(
                         "{folder_prefix}{}",
-                        file_link(
-                            dir,
-                            &paint(&short_dir, &[colors::BRIGHT_WHITE, BOLD]),
-                            config.hyperlinks,
-                        )
+                        file_link(dir, &paint(&short_dir, &[BOLD]), config.hyperlinks)
                     )
                 }
                 _ => String::new(),
@@ -934,7 +1021,7 @@ fn build_header_line(input: &RenderInput<'_>, labels: &Labels, opts: &HeaderOpts
         let clean_title = sanitize_title_text(raw_title);
         if !clean_title.is_empty() {
             let clipped = truncate_ansi_with_ellipsis(&clean_title, 24, ellipsis(gm));
-            header_parts.push(paint(&format!("\"{clipped}\""), &[colors::WHITE]));
+            header_parts.push(format!("\"{clipped}\""));
         }
     }
     if opts.show_duration
@@ -949,7 +1036,7 @@ fn build_header_line(input: &RenderInput<'_>, labels: &Labels, opts: &HeaderOpts
                 GlyphMode::Nerd => format!("\u{ee9c} {dur}"),
                 GlyphMode::Unicode => format!("⏱ {dur}"),
             };
-            header_parts.push(paint(&badge, &[colors::GRAY]));
+            header_parts.push(paint(&badge, &[DIM]));
         }
     }
     if opts.show_custom_tag && !config.display.custom_tag.is_empty() {
@@ -971,7 +1058,7 @@ fn build_header_line(input: &RenderInput<'_>, labels: &Labels, opts: &HeaderOpts
         };
         header_parts.push(paint(
             &format!("{icon} v{norm} {mid} /hud-update"),
-            &[colors::BRIGHT_YELLOW, BOLD],
+            &[colors::YELLOW, BOLD],
         ));
     }
 
@@ -983,6 +1070,54 @@ fn build_header_line(input: &RenderInput<'_>, labels: &Labels, opts: &HeaderOpts
         .join(&sep_str)
 }
 
+fn build_context_meta_line(
+    input: &RenderInput<'_>,
+    labels: &Labels,
+    effective_width: Option<usize>,
+    opts: &MetricsOpts,
+) -> String {
+    let RenderInput {
+        stdin,
+        transcript,
+        memory,
+        config,
+        ..
+    } = *input;
+    let gm = config.display.glyph_mode;
+    let sep_str = sep(gm);
+    let ctx_seg = render_context_segment(stdin, config, labels, effective_width, opts);
+    let meta_seg = render_counts_and_meta(stdin, transcript, memory, config, labels, opts);
+    [ctx_seg, meta_seg]
+        .into_iter()
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join(&sep_str)
+}
+
+fn build_quota_line(
+    input: &RenderInput<'_>,
+    labels: &Labels,
+    effective_width: Option<usize>,
+    opts: &MetricsOpts,
+) -> String {
+    let RenderInput {
+        stdin,
+        cached_quota,
+        config,
+        now_ms,
+        ..
+    } = *input;
+    render_quota_segment(
+        stdin,
+        cached_quota,
+        now_ms,
+        config,
+        labels,
+        effective_width,
+        opts,
+    )
+}
+
 fn build_metrics_line(
     input: &RenderInput<'_>,
     labels: &Labels,
@@ -991,6 +1126,7 @@ fn build_metrics_line(
 ) -> String {
     let RenderInput {
         stdin,
+        transcript,
         cached_quota,
         memory,
         config,
@@ -1019,7 +1155,7 @@ fn build_metrics_line(
     if !quota_seg.is_empty() {
         metrics_parts.push(quota_seg);
     }
-    let meta_seg = render_counts_and_meta(stdin, memory, config, labels, opts);
+    let meta_seg = render_counts_and_meta(stdin, transcript, memory, config, labels, opts);
     if !meta_seg.is_empty() {
         metrics_parts.push(meta_seg);
     }
@@ -1083,6 +1219,7 @@ pub fn render_hud_lines(input: RenderInput<'_>) -> Vec<String> {
             config.display.model_format
         },
         show_plan_tier: config.display.show_plan_tier,
+        show_speed: config.display.show_speed && layout_mode != LineLayout::Compact,
         show_vcs_extras: true,
         show_folder: config.display.show_project,
         show_vcs: config.display.show_project,
@@ -1102,6 +1239,7 @@ pub fn render_hud_lines(input: RenderInput<'_>) -> Vec<String> {
                 if o.model_format == ModelFormatMode::Full {
                     o.model_format = ModelFormatMode::Compact;
                 }
+                o.show_speed = false;
                 o.show_plan_tier = false;
             },
             |o| o.show_update = false,
@@ -1124,7 +1262,7 @@ pub fn render_hud_lines(input: RenderInput<'_>) -> Vec<String> {
         }
     }
 
-    let mut metrics_opts = MetricsOpts {
+    let base_metrics_opts = MetricsOpts {
         compact_meta: layout_mode == LineLayout::Compact,
         show_cache_hit_rate: config.display.show_cache_hit_rate,
         quota_bar_enabled: config.display.quota_bar_enabled,
@@ -1141,41 +1279,42 @@ pub fn render_hud_lines(input: RenderInput<'_>) -> Vec<String> {
         show_meta: true,
     };
 
-    let mut line2 = build_metrics_line(&input, labels, effective_width, &metrics_opts);
-    if let Some(budget) = line_budget {
-        let metrics_steps: [fn(&mut MetricsOpts); 5] = [
-            |o| {
-                o.compact_meta = true;
-                o.show_cache_hit_rate = false;
-            },
-            |o| {
-                o.quota_bar_enabled = false;
-                if o.context_value == ContextValueMode::Both {
-                    o.context_value = ContextValueMode::Percent;
-                }
-            },
-            |o| {
-                o.show_200k = false;
-                o.show_cost = false;
-                o.max_quota_buckets = 1;
-            },
-            |o| {
-                o.show_context_bar = false;
-                o.show_quota_reset = false;
-            },
-            |o| o.show_meta = false,
-        ];
-        for apply_step in metrics_steps {
-            if text_width(&line2) <= budget {
-                break;
-            }
-            apply_step(&mut metrics_opts);
-            line2 = build_metrics_line(&input, labels, effective_width, &metrics_opts);
-        }
-    }
-
     let sep_str = sep(gm);
     let raw_lines = if layout_mode == LineLayout::Compact {
+        let mut compact_opts = base_metrics_opts;
+        let mut line2 = build_metrics_line(&input, labels, effective_width, &compact_opts);
+        if let Some(budget) = line_budget {
+            let compact_steps: [fn(&mut MetricsOpts); 5] = [
+                |o| {
+                    o.compact_meta = true;
+                    o.show_cache_hit_rate = false;
+                },
+                |o| {
+                    o.quota_bar_enabled = false;
+                    if o.context_value == ContextValueMode::Both {
+                        o.context_value = ContextValueMode::Percent;
+                    }
+                },
+                |o| {
+                    o.show_200k = false;
+                    o.show_cost = false;
+                    o.max_quota_buckets = 1;
+                },
+                |o| {
+                    o.show_context_bar = false;
+                    o.show_quota_reset = false;
+                },
+                |o| o.show_meta = false,
+            ];
+            for apply_step in compact_steps {
+                if text_width(&line2) <= budget {
+                    break;
+                }
+                apply_step(&mut compact_opts);
+                line2 = build_metrics_line(&input, labels, effective_width, &compact_opts);
+            }
+        }
+
         let single_candidate = [&line1, &line2]
             .into_iter()
             .filter(|s| !s.is_empty())
@@ -1202,20 +1341,67 @@ pub fn render_hud_lines(input: RenderInput<'_>) -> Vec<String> {
                 .target
                 .as_deref()
                 .filter(|t| !t.is_empty())
-                .map(|t| paint(&format!(": {t}"), &[colors::GRAY]))
+                .map(|t| paint(&format!(": {t}"), &[DIM]))
                 .unwrap_or_default();
             let run_icon = if gm == GlyphMode::Ascii { "~" } else { "◐" };
             out.push(format!(
                 "{} {}{target}",
-                paint(run_icon, &[colors::BRIGHT_CYAN, BOLD]),
-                running_tool.name,
+                paint(run_icon, &[colors::CYAN, BOLD]),
+                paint(&running_tool.name, &[BOLD]),
             ));
         }
         out
     } else {
+        let mut ctx_opts = base_metrics_opts;
+        let mut ctx_line = build_context_meta_line(&input, labels, effective_width, &ctx_opts);
+        if let Some(budget) = line_budget {
+            let ctx_steps: [fn(&mut MetricsOpts); 5] = [
+                |o| o.compact_meta = true,
+                |o| o.show_cache_hit_rate = false,
+                |o| {
+                    if o.context_value == ContextValueMode::Both {
+                        o.context_value = ContextValueMode::Percent;
+                    }
+                    o.show_200k = false;
+                    o.show_cost = false;
+                },
+                |o| o.show_context_bar = false,
+                |o| o.show_meta = false,
+            ];
+            for apply_step in ctx_steps {
+                if text_width(&ctx_line) <= budget {
+                    break;
+                }
+                apply_step(&mut ctx_opts);
+                ctx_line = build_context_meta_line(&input, labels, effective_width, &ctx_opts);
+            }
+        }
+
+        let mut quota_opts = base_metrics_opts;
+        let mut quota_line = build_quota_line(&input, labels, effective_width, &quota_opts);
+        if let Some(budget) = line_budget
+            && !quota_line.is_empty()
+        {
+            let quota_steps: [fn(&mut MetricsOpts); 3] = [
+                |o| o.quota_bar_enabled = false,
+                |o| o.max_quota_buckets = 1,
+                |o| o.show_quota_reset = false,
+            ];
+            for apply_step in quota_steps {
+                if text_width(&quota_line) <= budget {
+                    break;
+                }
+                apply_step(&mut quota_opts);
+                quota_line = build_quota_line(&input, labels, effective_width, &quota_opts);
+            }
+        }
+
         let mut activity_lines = Vec::new();
-        if let Some(tl) = render_tools_activity_line(transcript, config, labels) {
+        if let Some(tl) = render_tools_line(transcript, config, line_budget) {
             activity_lines.push(tl);
+        }
+        if let Some(sml) = render_skills_mcp_line(transcript, config, labels) {
+            activity_lines.push(sml);
         }
         if let Some(sl) = render_subagents_line(transcript, config, now_ms) {
             activity_lines.push(sl);
@@ -1226,9 +1412,11 @@ pub fn render_hud_lines(input: RenderInput<'_>) -> Vec<String> {
 
         if config.line_layout == LineLayout::Adaptive
             && activity_lines.is_empty()
-            && effective_width.is_some_and(|w| w >= 132)
+            && effective_width.is_some_and(|w| w >= 180)
         {
-            let wide_line = [&line1, &line2]
+            let merged_metrics =
+                build_metrics_line(&input, labels, effective_width, &base_metrics_opts);
+            let wide_line = [&line1, &merged_metrics]
                 .into_iter()
                 .filter(|s| !s.is_empty())
                 .cloned()
@@ -1238,7 +1426,7 @@ pub fn render_hud_lines(input: RenderInput<'_>) -> Vec<String> {
                 vec![wide_line]
             } else {
                 join_with_rail(
-                    [line1, line2]
+                    [line1, ctx_line, quota_line]
                         .into_iter()
                         .filter(|s| !s.is_empty())
                         .collect(),
@@ -1247,12 +1435,15 @@ pub fn render_hud_lines(input: RenderInput<'_>) -> Vec<String> {
                 )
             }
         } else {
-            let mut all = Vec::with_capacity(2 + activity_lines.len());
+            let mut all = Vec::with_capacity(3 + activity_lines.len());
             if !line1.is_empty() {
                 all.push(line1);
             }
-            if !line2.is_empty() {
-                all.push(line2);
+            if !ctx_line.is_empty() {
+                all.push(ctx_line);
+            }
+            if !quota_line.is_empty() {
+                all.push(quota_line);
             }
             all.extend(activity_lines);
             join_with_rail(all, true, gm)

@@ -981,3 +981,118 @@ fn install_sh_version_logging_and_self_update_e2e() {
         serde_json::from_str(&fs::read_to_string(cli_upd.join("settings.json")).unwrap()).unwrap();
     assert_eq!(settings_after["statusLine"]["stack_with_default"], true);
 }
+
+#[test]
+fn resolve_transcript_path_recovers_cli_brain_when_stdin_points_to_ide_dir() {
+    let tmp = TempDir::new("transcript-fallback");
+    let cli_dir = tmp.path.join("antigravity-cli");
+    let hud_dir = tmp.path.join("hud-home");
+    let conv_id = "22f8ab3a-1a0d-46a3-b895-0b28433d01d0";
+
+    let conv_root = cli_dir.join("brain").join(conv_id);
+    let logs_dir = conv_root.join(".system_generated").join("logs");
+    fs::create_dir_all(&logs_dir).unwrap();
+
+    let steps = [
+        json!({
+            "step_index": 0,
+            "source": "USER_EXPLICIT",
+            "type": "USER_INPUT",
+            "status": "DONE",
+            "created_at": "2026-11-09T01:41:18Z",
+            "content": "<USER_REQUEST>\n/plan Compare showcase vs live HUD\n</USER_REQUEST>"
+        }),
+        json!({
+            "step_index": 1,
+            "source": "MODEL",
+            "type": "PLANNER_RESPONSE",
+            "status": "DONE",
+            "created_at": "2026-11-09T01:42:00Z",
+            "tool_calls": [
+                { "name": "edit_file", "args": { "Path": "/Users/dev/agy-hud/render.rs" } },
+                { "name": "edit_file", "args": { "Path": "/Users/dev/agy-hud/paths.rs" } },
+                { "name": "invoke_subagent", "args": { "TypeName": "research", "Role": "Transcript Auditor" } }
+            ]
+        }),
+        json!({ "step_index": 2, "source": "MODEL", "type": "GENERIC", "status": "DONE", "created_at": "2026-11-09T01:42:01Z", "content": "ok" }),
+        json!({ "step_index": 3, "source": "MODEL", "type": "GENERIC", "status": "DONE", "created_at": "2026-11-09T01:42:02Z", "content": "ok" }),
+        json!({ "step_index": 4, "source": "MODEL", "type": "GENERIC", "status": "DONE", "created_at": "2026-11-09T01:42:30Z", "content": "done" }),
+    ];
+    let transcript_body = steps
+        .iter()
+        .map(serde_json::to_string)
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+        .join("\n");
+    fs::write(logs_dir.join("transcript.jsonl"), transcript_body).unwrap();
+    fs::write(
+        conv_root.join("task.md"),
+        "# Tasks\n- [x] Diagnose missing lines\n- [/] Recover real CLI transcript path\n",
+    )
+    .unwrap();
+
+    // `agy` v1.5.3 bug: `transcript_path` points to nonexistent `.gemini/antigravity/brain/<id>/...`
+    let bogus_ide_transcript = tmp
+        .path
+        .join("nonexistent-ide")
+        .join(".gemini/antigravity/brain")
+        .join(conv_id)
+        .join(".system_generated/logs/transcript.jsonl");
+
+    let payload = json!({
+        "session_id": conv_id,
+        "conversation_id": conv_id,
+        "transcript_path": bogus_ide_transcript.to_string_lossy(),
+        "cwd": tmp.path.to_string_lossy(),
+        "model": { "id": "Gemini 4 Argon (Medium)", "display_name": "Gemini 4 Argon (Medium)", "effort": "medium" },
+        "context_window": { "used_percentage": 22.1, "context_window_size": 1048576 },
+        "agent_state": "idle",
+        "plan_tier": "Google AI Ultra",
+        "sandbox": { "enabled": false },
+        "terminal_width": 130
+    })
+    .to_string();
+
+    let env_vars = [
+        ("AGY_CLI_DIR", cli_dir.as_path()),
+        ("AGY_HUD_HOME", hud_dir.as_path()),
+    ];
+    let (ok_live, live_stdout) = run_bin(&[], &env_vars, Some(&payload));
+    assert!(ok_live, "live statusLine failed: {live_stdout}");
+    let plain_live = hud_core::ansi::strip_ansi(&live_stdout);
+    assert!(
+        plain_live.contains("[PLAN]"),
+        "missing [PLAN]: {plain_live}"
+    );
+    assert!(
+        plain_live.contains("Ultra"),
+        "missing Ultra tier: {plain_live}"
+    );
+    assert!(
+        !plain_live.contains("Sandbox off"),
+        "unexpected Sandbox off: {plain_live}"
+    );
+    assert!(
+        plain_live.contains("edit_file ×2: paths.rs"),
+        "missing folded tools: {plain_live}"
+    );
+    assert!(
+        plain_live.contains("Skills: plan"),
+        "missing skills: {plain_live}"
+    );
+    assert!(
+        plain_live.contains("Transcript Auditor"),
+        "missing subagent line: {plain_live}"
+    );
+    assert!(
+        plain_live.contains("Recover real CLI transcript path"),
+        "missing task.md todo line: {plain_live}"
+    );
+
+    // `preview --last` must also resolve the recovered transcript & task.md
+    let (ok_prev, prev_stdout) = run_bin(&["preview", "--last"], &env_vars, None);
+    assert!(ok_prev, "preview --last failed: {prev_stdout}");
+    let plain_prev = hud_core::ansi::strip_ansi(&prev_stdout);
+    assert!(plain_prev.contains("edit_file ×2: paths.rs"));
+    assert!(plain_prev.contains("Recover real CLI transcript path"));
+}

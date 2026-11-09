@@ -1,7 +1,7 @@
 use crate::ansi::sanitize_text;
 use crate::types::{
-    AgyStdinData, SubagentEntry, SubagentStatus, TodoItem, TodoStatus, ToolEntry, ToolStatus,
-    TranscriptSummary,
+    AgyStdinData, PlannerStepTiming, SubagentEntry, SubagentStatus, TodoItem, TodoStatus,
+    ToolEntry, ToolStatus, TranscriptSummary,
 };
 use serde::Deserialize;
 use serde_json::{Map, Value};
@@ -20,6 +20,7 @@ struct RawStep {
     step_type: Option<String>,
     status: Option<String>,
     created_at: Option<String>,
+    output_tokens: Option<u64>,
     content: Option<Value>,
     tool_calls: Option<Vec<RawToolCall>>,
 }
@@ -126,7 +127,11 @@ pub fn parse_iso_ms(iso: &str) -> Option<i64> {
 }
 
 fn char_slice(s: &str, max_chars: usize) -> String {
-    s.chars().take(max_chars).collect()
+    s.chars()
+        .take(max_chars)
+        .collect::<String>()
+        .trim_end()
+        .to_string()
 }
 
 fn file_basename(path_str: &str) -> &str {
@@ -149,12 +154,12 @@ fn summarize_tool_target(name: &str, args: Option<&Map<String, Value>>) -> Optio
     if name == "run_command" {
         let summary = unwrap_arg_value(args.get("toolSummary"));
         if !summary.is_empty() {
-            return Some(char_slice(&summary, 28));
+            return Some(char_slice(&summary, 20));
         }
         let cmd = unwrap_arg_value(args.get("CommandLine"));
         if !cmd.is_empty() {
             let short = cmd.split_whitespace().take(2).collect::<Vec<_>>().join(" ");
-            return Some(char_slice(&short, 24));
+            return Some(char_slice(&short, 20));
         }
         return None;
     }
@@ -200,33 +205,69 @@ fn detect_skill_from_path(file_path: &str) -> Option<String> {
     None
 }
 
-fn extract_slash_command(input: &str) -> Option<String> {
-    for token in input.split_whitespace() {
-        if let Some(cmd_raw) = token.strip_prefix('/') {
-            let len = cmd_raw.len();
-            if !(2..=33).contains(&len) {
-                continue;
-            }
-            let bytes = cmd_raw.as_bytes();
-            if !bytes[0].is_ascii_alphanumeric() {
-                continue;
-            }
-            if !bytes
-                .iter()
-                .all(|b| b.is_ascii_alphanumeric() || *b == b'_' || *b == b'-')
-            {
-                continue;
-            }
-            let lower = cmd_raw.to_ascii_lowercase();
-            if !matches!(
-                lower.as_str(),
-                "exit" | "quit" | "help" | "clear" | "config" | "model" | "statusline"
-            ) {
-                return Some(lower);
-            }
+fn extract_user_request_body(input: &str) -> &str {
+    const OPEN: &str = "<USER_REQUEST>";
+    const CLOSE: &str = "</USER_REQUEST>";
+    if let Some(start_idx) = input.rfind(OPEN) {
+        let after_open = &input[start_idx + OPEN.len()..];
+        if let Some(end_idx) = after_open.find(CLOSE) {
+            return after_open[..end_idx].trim();
         }
+        return after_open.trim();
     }
-    None
+    input.trim()
+}
+
+fn extract_slash_command(input: &str) -> Option<String> {
+    let body = extract_user_request_body(input);
+    let first_token = body.split_whitespace().next()?;
+    let cmd_raw = first_token.strip_prefix('/')?;
+    let len = cmd_raw.len();
+    if !(2..=33).contains(&len) {
+        return None;
+    }
+    let bytes = cmd_raw.as_bytes();
+    if !bytes[0].is_ascii_alphanumeric() {
+        return None;
+    }
+    if !bytes
+        .iter()
+        .all(|b| b.is_ascii_alphanumeric() || *b == b'_' || *b == b'-')
+    {
+        return None;
+    }
+    let lower = cmd_raw.to_ascii_lowercase();
+    if matches!(
+        lower.as_str(),
+        "exit"
+            | "quit"
+            | "help"
+            | "clear"
+            | "config"
+            | "model"
+            | "statusline"
+            | "usage"
+            | "compact"
+    ) {
+        return None;
+    }
+    Some(lower)
+}
+
+fn extract_created_at_prefix(raw_line: &str) -> Option<i64> {
+    let prefix_end = raw_line
+        .char_indices()
+        .take_while(|&(idx, _)| idx < 1024)
+        .map(|(idx, ch)| idx + ch.len_utf8())
+        .last()
+        .unwrap_or(raw_line.len());
+    let window = &raw_line[..prefix_end];
+    let key_idx = window.find("\"created_at\"")?;
+    let after_key = window[key_idx + "\"created_at\"".len()..].trim_start();
+    let after_colon = after_key.strip_prefix(':')?.trim_start();
+    let after_quote = after_colon.strip_prefix('"')?;
+    let end_quote = after_quote.find('"')?;
+    parse_iso_ms(&after_quote[..end_quote])
 }
 
 fn strip_markdown_inline(raw: &str) -> String {
@@ -315,6 +356,17 @@ fn has_nonzero_exit_code(content: &str) -> bool {
     false
 }
 
+pub fn compute_tps_x10(output_tokens: u64, dt_ms: i64) -> Option<u32> {
+    if output_tokens < 20 || !(2_000..=180_000).contains(&dt_ms) {
+        return None;
+    }
+    let tps = (output_tokens as f64) / ((dt_ms as f64) / 1000.0);
+    if !(1.0..=500.0).contains(&tps) {
+        return None;
+    }
+    Some((tps * 10.0).round() as u32)
+}
+
 /// Pure parser for Antigravity `transcript.jsonl` (head first-line + bounded tail lines) and `task.md`.
 pub fn parse_transcript_and_tasks(
     head_line: Option<&str>,
@@ -327,9 +379,13 @@ pub fn parse_transcript_and_tasks(
     let mut session_started_at = head_line
         .map(str::trim)
         .filter(|l| !l.is_empty())
-        .and_then(|l| serde_json::from_str::<RawStep>(l).ok())
-        .and_then(|s| s.created_at)
-        .and_then(|iso| parse_iso_ms(&iso));
+        .and_then(|l| {
+            serde_json::from_str::<RawStep>(l)
+                .ok()
+                .and_then(|s| s.created_at)
+                .and_then(|iso| parse_iso_ms(&iso))
+                .or_else(|| extract_created_at_prefix(l))
+        });
 
     let mut steps = Vec::new();
     if let Some(tail) = tail_text {
@@ -355,11 +411,13 @@ pub fn parse_transcript_and_tasks(
     let mut skills_seen = BTreeSet::new();
     let mut mcp_vec = Vec::new();
     let mut mcp_seen = BTreeSet::new();
-    let mut mcp_err_vec = Vec::new();
-    let mut mcp_err_seen = BTreeSet::new();
+    let mut mcp_last_status = HashMap::new();
 
     let mut raw_tools: Vec<ToolEntry> = Vec::new();
     let mut transcript_agents: Vec<SubagentEntry> = Vec::new();
+    let mut active_slash_mode: Option<String> = None;
+    let mut completed_step_tps_x10: Option<u32> = None;
+    let mut latest_planner_step: Option<PlannerStepTiming> = None;
     let mut last_step_at: Option<i64> = None;
     let mut max_step_idx: usize = 0;
 
@@ -380,12 +438,48 @@ pub fn parse_transcript_and_tasks(
         }
 
         let step_type = step.step_type.as_deref().unwrap_or("");
-        if step_type == "USER_INPUT"
-            && let Some(Value::String(text)) = step.content.as_ref()
-            && let Some(cmd) = extract_slash_command(text)
-            && skills_seen.insert(cmd.clone())
+        if step_type == "USER_INPUT" {
+            if let Some(ref mut lp) = latest_planner_step {
+                lp.has_trailing_user_input = true;
+            }
+            if let Some(Value::String(text)) = step.content.as_ref() {
+                if let Some(cmd) = extract_slash_command(text) {
+                    if cmd == "plan" {
+                        active_slash_mode = Some("plan".to_string());
+                    } else {
+                        active_slash_mode = None;
+                    }
+                    if skills_seen.insert(cmd.clone()) {
+                        skills_vec.push(cmd);
+                    }
+                } else {
+                    active_slash_mode = None;
+                }
+            }
+        }
+
+        if step_type == "PLANNER_RESPONSE"
+            && let (Some(out_tok), Some(start_ms)) = (step.output_tokens.filter(|&t| t > 0), ts)
         {
-            skills_vec.push(cmd);
+            let ended_at_ms = steps.get(i + 1).and_then(|next_step| {
+                if next_step.step_type.as_deref() == Some("GENERIC") {
+                    next_step.created_at.as_deref().and_then(parse_iso_ms)
+                } else {
+                    None
+                }
+            });
+            if let Some(end_ms) = ended_at_ms
+                && let Some(x10) = compute_tps_x10(out_tok, end_ms - start_ms)
+            {
+                completed_step_tps_x10 = Some(x10);
+            }
+            latest_planner_step = Some(PlannerStepTiming {
+                step_index: step.step_index.unwrap_or(i),
+                output_tokens: out_tok,
+                started_at_ms: start_ms,
+                ended_at_ms,
+                has_trailing_user_input: false,
+            });
         }
 
         if step_type == "PLANNER_RESPONSE"
@@ -455,9 +549,7 @@ pub fn parse_transcript_and_tasks(
                     if mcp_seen.insert(mcp_server.clone()) {
                         mcp_vec.push(mcp_server.clone());
                     }
-                    if status == ToolStatus::Error && mcp_err_seen.insert(mcp_server.clone()) {
-                        mcp_err_vec.push(mcp_server);
-                    }
+                    mcp_last_status.insert(mcp_server, status);
                 }
 
                 if raw_name == "invoke_subagent"
@@ -507,27 +599,62 @@ pub fn parse_transcript_and_tasks(
         }
     }
 
-    // Fold completed tools by name (iterating newest-first) while keeping running/error prominent
+    // Fold tools newest-first: keep active `Running` entries distinct, supersede historical
+    // `Error` calls when a newer invocation of the same tool succeeded or is currently running,
+    // and fold unresolved `Error` or `Completed` invocations by tool name while preserving the
+    // most recent target summary.
     let mut aggregated: Vec<ToolEntry> = Vec::new();
     let mut completed_idx_by_name: HashMap<String, usize> = HashMap::new();
+    let mut error_idx_by_name: HashMap<String, usize> = HashMap::new();
+    let mut seen_newer_active_or_ok: BTreeSet<String> = BTreeSet::new();
 
     for item in raw_tools.into_iter().rev() {
-        if matches!(item.status, ToolStatus::Running | ToolStatus::Error) {
-            aggregated.push(item);
-        } else if let Some(&agg_idx) = completed_idx_by_name.get(&item.name) {
-            let existing = &mut aggregated[agg_idx];
-            existing.count += 1;
-            if existing.target.is_some() && existing.target != item.target {
-                existing.target = None;
+        match item.status {
+            ToolStatus::Running => {
+                seen_newer_active_or_ok.insert(item.name.clone());
+                aggregated.push(item);
             }
-        } else {
-            let idx = aggregated.len();
-            completed_idx_by_name.insert(item.name.clone(), idx);
-            aggregated.push(item);
+            ToolStatus::Completed => {
+                seen_newer_active_or_ok.insert(item.name.clone());
+                if let Some(&agg_idx) = completed_idx_by_name.get(&item.name) {
+                    let existing = &mut aggregated[agg_idx];
+                    existing.count += 1;
+                    if existing.target.is_none() && item.target.is_some() {
+                        existing.target = item.target;
+                    }
+                } else {
+                    let idx = aggregated.len();
+                    completed_idx_by_name.insert(item.name.clone(), idx);
+                    aggregated.push(item);
+                }
+            }
+            ToolStatus::Error => {
+                if seen_newer_active_or_ok.contains(&item.name) {
+                    if let Some(&agg_idx) = completed_idx_by_name.get(&item.name) {
+                        aggregated[agg_idx].count += 1;
+                    }
+                } else if let Some(&err_idx) = error_idx_by_name.get(&item.name) {
+                    let existing = &mut aggregated[err_idx];
+                    existing.count += 1;
+                    if existing.target.is_none() && item.target.is_some() {
+                        existing.target = item.target;
+                    }
+                } else {
+                    let idx = aggregated.len();
+                    error_idx_by_name.insert(item.name.clone(), idx);
+                    aggregated.push(item);
+                }
+            }
         }
     }
 
     aggregated.sort_by_key(|t| t.status);
+
+    let mcp_err_vec: Vec<String> = mcp_vec
+        .iter()
+        .filter(|srv| mcp_last_status.get(*srv) == Some(&ToolStatus::Error))
+        .cloned()
+        .collect();
 
     // Merge authoritative live `stdin.subagents` with transcript subagent timestamps/models
     let mut merged_subagents = Vec::new();
@@ -581,6 +708,9 @@ pub fn parse_transcript_and_tasks(
         mcp_errors: mcp_err_vec,
         subagents: merged_subagents,
         todos,
+        active_slash_mode,
+        completed_step_tps_x10,
+        latest_planner_step,
         session_started_at,
         last_step_at,
         step_count: if max_step_idx > 0 {
@@ -704,7 +834,7 @@ mod tests {
             .find(|t| t.name == "read_file")
             .unwrap();
         assert_eq!(read_tool.count, 2);
-        assert_eq!(read_tool.target, None);
+        assert_eq!(read_tool.target.as_deref(), Some("README.md"));
 
         assert_eq!(summary.subagents.len(), 1);
         assert_eq!(summary.subagents[0].status, SubagentStatus::Running);
@@ -715,5 +845,108 @@ mod tests {
         assert_eq!(summary.todos[0].status, TodoStatus::Completed);
         assert_eq!(summary.todos[1].status, TodoStatus::InProgress);
         assert_eq!(summary.todos[2].status, TodoStatus::Pending);
+    }
+
+    #[test]
+    fn user_request_slash_mode_and_truncated_head_timestamp_recovery() {
+        let truncated_head = r#"{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","created_at":"2026-11-09T01:41:18Z","content":"<USER_REQUEST>\nvery long..."#;
+        let tail_steps = [
+            json!({
+                "step_index": 10,
+                "source": "USER_EXPLICIT",
+                "type": "USER_INPUT",
+                "status": "DONE",
+                "created_at": "2026-11-09T02:10:00Z",
+                "content": "<USER_REQUEST>\nMissing /hub-update command in logs\n</USER_REQUEST>"
+            }),
+            json!({
+                "step_index": 11,
+                "source": "USER_EXPLICIT",
+                "type": "USER_INPUT",
+                "status": "DONE",
+                "created_at": "2026-11-09T02:45:00Z",
+                "content": "<CONTEXT_SUMMARY>\nOld /boost summary\n</CONTEXT_SUMMARY>\n<USER_REQUEST>\n/plan Compare screenshots and fix\n</USER_REQUEST>"
+            }),
+        ];
+        let tail = tail_steps
+            .iter()
+            .map(serde_json::to_string)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+            .join("\n");
+
+        let summary = parse_transcript_and_tasks(Some(truncated_head), Some(&tail), None, None);
+        assert_eq!(
+            summary.session_started_at,
+            parse_iso_ms("2026-11-09T01:41:18Z")
+        );
+        assert_eq!(summary.skills, vec!["plan"]);
+        assert_eq!(summary.active_slash_mode.as_deref(), Some("plan"));
+
+        // Subsequent non-plan prompt clears `active_slash_mode`
+        let follow_up = format!(
+            "{tail}\n{}",
+            json!({
+                "step_index": 12,
+                "source": "USER_EXPLICIT",
+                "type": "USER_INPUT",
+                "status": "DONE",
+                "created_at": "2026-11-09T02:56:56Z",
+                "content": "<USER_REQUEST>\nApprove and proceed\n</USER_REQUEST>"
+            })
+        );
+        let summary_after =
+            parse_transcript_and_tasks(Some(truncated_head), Some(&follow_up), None, None);
+        assert_eq!(summary_after.active_slash_mode, None);
+        assert_eq!(summary_after.skills, vec!["plan"]);
+    }
+
+    #[test]
+    fn superseded_tool_errors_and_recovered_mcp_servers_fold_cleanly() {
+        let steps = [
+            json!({
+                "step_index": 0,
+                "source": "MODEL",
+                "type": "PLANNER_RESPONSE",
+                "status": "DONE",
+                "created_at": "2026-11-09T02:00:00Z",
+                "tool_calls": [
+                    { "name": "run_command", "args": { "CommandLine": "\"cargo test\"", "toolSummary": "\"Failing compile\"" } },
+                    { "name": "call_mcp_tool", "args": { "ServerName": "\"context7\"", "ToolName": "\"query-docs\"" } }
+                ]
+            }),
+            json!({ "step_index": 1, "source": "MODEL", "type": "GENERIC", "status": "DONE", "created_at": "2026-11-09T02:00:02Z", "content": "Command exited with code 101." }),
+            json!({ "step_index": 2, "source": "MODEL", "type": "GENERIC", "status": "ERROR", "created_at": "2026-11-09T02:00:03Z", "content": "Error: timeout" }),
+            json!({
+                "step_index": 3,
+                "source": "MODEL",
+                "type": "PLANNER_RESPONSE",
+                "status": "DONE",
+                "created_at": "2026-11-09T02:01:00Z",
+                "tool_calls": [
+                    { "name": "run_command", "args": { "CommandLine": "\"cargo test\"", "toolSummary": "\"Passing tests\"" } },
+                    { "name": "call_mcp_tool", "args": { "ServerName": "\"context7\"", "ToolName": "\"query-docs\"" } }
+                ]
+            }),
+            json!({ "step_index": 4, "source": "MODEL", "type": "GENERIC", "status": "DONE", "created_at": "2026-11-09T02:01:05Z", "content": "Command exited with code 0." }),
+            json!({ "step_index": 5, "source": "MODEL", "type": "GENERIC", "status": "DONE", "created_at": "2026-11-09T02:01:06Z", "content": "docs ok" }),
+        ];
+        let jsonl = steps
+            .iter()
+            .map(serde_json::to_string)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+            .join("\n");
+        let summary = parse_transcript_and_tasks(jsonl.lines().next(), Some(&jsonl), None, None);
+        assert!(summary.mcp_errors.is_empty());
+        assert_eq!(summary.mcp_servers, vec!["context7"]);
+        let run_tool = summary
+            .tools
+            .iter()
+            .find(|t| t.name == "run_command")
+            .unwrap();
+        assert_eq!(run_tool.status, ToolStatus::Completed);
+        assert_eq!(run_tool.count, 2);
+        assert_eq!(run_tool.target.as_deref(), Some("Passing tests"));
     }
 }

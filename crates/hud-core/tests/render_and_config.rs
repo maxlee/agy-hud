@@ -2,10 +2,12 @@ use hud_core::ansi::{sanitize_title_text, strip_ansi, text_width};
 use hud_core::commands::{CommandContext, execute_subcommand};
 use hud_core::config::{CONFIG_SCHEMA, HudConfig, parse_config_str, parse_set_pairs};
 use hud_core::probes::{
-    is_newer_semver, parse_github_latest_release, parse_usage_command_output, parse_vcs_info,
+    apply_speed_cache, is_newer_semver, parse_github_latest_release, parse_usage_command_output,
+    parse_vcs_info,
 };
 use hud_core::render::{RenderInput, render_hud_lines};
 use hud_core::stdin::{extract_quota_buckets_reconciled, format_session_cost, normalize_plan_tier};
+use hud_core::transcript::parse_transcript_and_tasks;
 use hud_core::types::{
     AgyStdinData, CachedQuotaSnapshot, ContextWindowStdin, CostStdin, CurrentUsageStdin,
     DoctorFacts, EffortFormatMode, GlyphMode, InstalledPluginFacts, Language, LogicPaths,
@@ -94,6 +96,7 @@ fn adaptive_layout_handles_ultrawide_standard_narrow_and_zh_hans() {
         memory: None,
         quota_cache: None,
         update_cache: None,
+        ..Default::default()
     };
 
     // 1. Ultra-wide 200 cols -> collapses to 1 sleek line when idle without active tools/todos
@@ -173,11 +176,12 @@ fn adaptive_layout_handles_ultrawide_standard_narrow_and_zh_hans() {
 }
 
 #[test]
-fn config_schema_validates_all_42_keys_and_preview_showcase_renders_5_scenarios() {
-    assert_eq!(CONFIG_SCHEMA.len(), 42);
+fn config_schema_validates_all_43_keys_and_preview_showcase_renders_5_scenarios() {
+    assert_eq!(CONFIG_SCHEMA.len(), 43);
     let default_cfg = HudConfig::default();
     assert!(!default_cfg.quota.background_refresh);
     assert!(default_cfg.updates.enabled);
+    assert!(default_cfg.display.show_speed);
     assert!(!default_cfg.display.show_title);
     assert_eq!(default_cfg.display.glyph_mode, GlyphMode::Unicode);
 
@@ -631,4 +635,194 @@ fn update_semver_parsing_badge_rendering_and_doctor_findings() {
     let doc_val: serde_json::Value = serde_json::from_str(&doc.lines.join("\n")).unwrap();
     assert_eq!(doc_val["updates"]["updateAvailable"], true);
     assert_eq!(doc_val["updates"]["latestVersion"], "9.9.0");
+}
+
+#[test]
+fn theme_adaptive_palette_plan_tier_default_sandbox_suppression_and_slash_mode() {
+    let default_cfg = HudConfig::default();
+    assert!(default_cfg.display.show_plan_tier);
+    assert_eq!(default_cfg.display.tools_max_visible, 3);
+
+    let mut stdin = sample_stdin(120);
+    stdin.cycle_mode = None;
+    stdin.plan_tier = Some("Google AI Ultra".to_string());
+    stdin.sandbox = Some(SandboxStdin {
+        enabled: Some(false),
+    });
+
+    let tx = TranscriptSummary {
+        tools: vec![
+            ToolEntry {
+                id: "1".to_string(),
+                name: "edit_file".to_string(),
+                target: Some("render.rs".to_string()),
+                status: ToolStatus::Completed,
+                count: 5,
+                started_at: None,
+                ended_at: None,
+            },
+            ToolEntry {
+                id: "2".to_string(),
+                name: "read_file".to_string(),
+                target: Some("transcript.rs".to_string()),
+                status: ToolStatus::Completed,
+                count: 8,
+                started_at: None,
+                ended_at: None,
+            },
+        ],
+        skills: vec!["plan".to_string(), "hud".to_string()],
+        active_slash_mode: Some("plan".to_string()),
+        session_started_at: Some(1_699_999_280_000),
+        last_step_at: Some(1_699_999_990_000),
+        step_count: 14,
+        ..Default::default()
+    };
+
+    let lines = render_hud_lines(RenderInput {
+        stdin: Some(&stdin),
+        config: &default_cfg,
+        transcript: &tx,
+        vcs: None,
+        memory: None,
+        cached_quota: None,
+        update_info: None,
+        columns: Some(120),
+        now_ms: 1_700_000_000_000,
+    });
+
+    // Zero hardcoded white (`37m`/`97m`) or grey (`90m`) foreground codes that turn invisible on Solarized Light
+    for line in &lines {
+        assert!(
+            !line.contains("\x1b[97m"),
+            "Leaked BRIGHT_WHITE in: {line:?}"
+        );
+        assert!(!line.contains("\x1b[37m"), "Leaked WHITE in: {line:?}");
+        assert!(!line.contains("\x1b[90m"), "Leaked GRAY in: {line:?}");
+    }
+
+    let plain_lines: Vec<String> = lines.iter().map(|l| strip_ansi(l)).collect();
+    assert_eq!(
+        plain_lines.len(),
+        5,
+        "Expected 5 semantic rows: {plain_lines:#?}"
+    );
+    assert!(plain_lines[0].contains("[PLAN]") && plain_lines[0].contains("Ultra"));
+    assert!(!plain_lines[0].contains("Google AI Ultra"));
+    assert!(plain_lines[1].contains("Ctx") && !plain_lines[1].contains("Quota"));
+    assert!(!plain_lines[1].contains("Sandbox off"));
+    assert!(plain_lines[2].contains("Quota(weekly)") && !plain_lines[2].contains("Ctx"));
+    assert!(
+        plain_lines[3].contains("edit_file ×5: render.rs") && !plain_lines[3].contains("Skills:")
+    );
+    assert!(plain_lines[4].contains("Skills: plan, hud"));
+}
+
+#[test]
+fn output_speed_estimation_idle_cache_locking_and_header_badge() {
+    let steps = [
+        json!({
+            "step_index": 10,
+            "source": "MODEL",
+            "type": "PLANNER_RESPONSE",
+            "status": "DONE",
+            "created_at": "2026-11-09T03:44:24Z",
+            "output_tokens": 806,
+            "tool_calls": [{ "name": "run_command", "args": { "CommandLine": "cargo test" } }]
+        }),
+        json!({
+            "step_index": 11,
+            "source": "MODEL",
+            "type": "GENERIC",
+            "status": "DONE",
+            "created_at": "2026-11-09T03:44:38Z",
+            "content": "Command exited with code 0."
+        }),
+        json!({
+            "step_index": 12,
+            "source": "MODEL",
+            "type": "PLANNER_RESPONSE",
+            "status": "DONE",
+            "created_at": "2026-11-09T03:44:40Z",
+            "output_tokens": 1980,
+            "content": "## Final response"
+        }),
+    ];
+    let jsonl = steps
+        .iter()
+        .map(serde_json::to_string)
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+        .join("\n");
+
+    let mut stdin = sample_stdin(140);
+    stdin.conversation_id = Some("conv-speed-test".to_string());
+    stdin.plan_tier = Some("Google AI Ultra".to_string());
+    stdin.agent_state = Some("idle".to_string());
+
+    // 1. First idle render at `03:45:09Z` (+29s after step 12 started -> `1980 / 29s = 68.3 tok/s`)
+    let first_idle_ms = 1_794_195_909_000i64; // 2026-11-09T03:45:09Z
+    let mut tx = parse_transcript_and_tasks(jsonl.lines().next(), Some(&jsonl), None, Some(&stdin));
+    assert_eq!(tx.completed_step_tps_x10, Some(576)); // Step 10 -> 11: 806 / 14s = 57.6 tok/s
+    let locked_cache =
+        apply_speed_cache(Some(&stdin), &mut tx, None, first_idle_ms).expect("locks final step");
+    assert_eq!(locked_cache.step_index, 12);
+    assert_eq!(locked_cache.tps_x10, 683);
+
+    let lines = render_hud_lines(RenderInput {
+        stdin: Some(&stdin),
+        config: &HudConfig::default(),
+        transcript: &tx,
+        vcs: None,
+        memory: None,
+        cached_quota: None,
+        update_info: None,
+        columns: Some(140),
+        now_ms: first_idle_ms,
+    });
+    let header_plain = strip_ansi(&lines[0]);
+    assert!(
+        header_plain.contains("[Gemini 4 Argon · med] Ultra · ~68 tok/s"),
+        "Unexpected header: {header_plain}"
+    );
+
+    // 2. Render 10 minutes later (`+600s`): locked `SpeedCacheSnapshot` prevents decay!
+    let ten_min_later = first_idle_ms + 600_000;
+    let mut tx_later =
+        parse_transcript_and_tasks(jsonl.lines().next(), Some(&jsonl), None, Some(&stdin));
+    let next_write = apply_speed_cache(
+        Some(&stdin),
+        &mut tx_later,
+        Some(&locked_cache),
+        ten_min_later,
+    );
+    assert!(next_write.is_none(), "Already locked, must not rewrite");
+    let lines_later = render_hud_lines(RenderInput {
+        stdin: Some(&stdin),
+        config: &HudConfig::default(),
+        transcript: &tx_later,
+        vcs: None,
+        memory: None,
+        cached_quota: None,
+        update_info: None,
+        columns: Some(140),
+        now_ms: ten_min_later,
+    });
+    assert!(strip_ansi(&lines_later[0]).contains("[Gemini 4 Argon · med] Ultra · ~68 tok/s"));
+
+    // 3. `display.showSpeed = false` hides the throughput badge cleanly
+    let mut hidden_cfg = HudConfig::default();
+    hidden_cfg.display.show_speed = false;
+    let hidden_lines = render_hud_lines(RenderInput {
+        stdin: Some(&stdin),
+        config: &hidden_cfg,
+        transcript: &tx_later,
+        vcs: None,
+        memory: None,
+        cached_quota: None,
+        update_info: None,
+        columns: Some(140),
+        now_ms: ten_min_later,
+    });
+    assert!(!strip_ansi(&hidden_lines[0]).contains("tok/s"));
 }

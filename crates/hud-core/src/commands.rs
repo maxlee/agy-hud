@@ -1,10 +1,10 @@
-use crate::ansi::{BOLD, colors, paint, strip_ansi};
+use crate::ansi::{BOLD, DIM, colors, paint, strip_ansi};
 use crate::config::{
     CONFIG_SCHEMA, SchemaValueKind, get_dot_value, parse_config_str, parse_set_pairs, set_dot_value,
 };
 use crate::probes::{
-    is_newer_semver, normalize_semver_tag, parse_cached_quota_info, parse_memory_info,
-    parse_update_cache_info, parse_vcs_info,
+    apply_speed_cache, is_newer_semver, normalize_semver_tag, parse_cached_quota_info,
+    parse_memory_info, parse_speed_cache_info, parse_update_cache_info, parse_vcs_info,
 };
 use crate::render::{RenderInput, render_hud_lines};
 use crate::transcript::parse_transcript_and_tasks;
@@ -315,7 +315,7 @@ fn run_doctor(args: &[String], ctx: &CommandContext<'_>) -> CommandOutput {
                 "agy-hud doctor (v{} · {})",
                 ctx.facts.plugin.version, ctx.facts.runtime.engine
             ),
-            &[colors::BRIGHT_CYAN, BOLD],
+            &[colors::CYAN, BOLD],
         ));
         out.push(format!(
             "  Runtime          : {}",
@@ -375,11 +375,11 @@ fn run_doctor(args: &[String], ctx: &CommandContext<'_>) -> CommandOutput {
         out.push(String::new());
         out.push(paint(
             "Glyph Alignment Probe (right '|' bars should align vertically):",
-            &[colors::BRIGHT_WHITE, BOLD],
+            &[BOLD],
         ));
         out.push("  unicode : |● READY │ █▓▒░· │ ⏱ 12m|".to_string());
-        out.push("  nerd    : |\u{f07c} READY │ █▓▒░· │ \u{ee9c} 12m|".to_string());
-        out.push("  ascii   : |* READY | ##==- | t 12m|".to_string());
+        out.push("  nerd    : |\u{f07c} READY │ █▓▒░· │ \u{ee9c}  12m|".to_string());
+        out.push("  ascii   : |* READY | ##==- | tt 12m|".to_string());
         if ctx.facts.remote_session && loaded.config.display.glyph_mode != GlyphMode::Ascii {
             out.push(paint(
                 "  Tip: SSH session detected; if glyphs misalign, run `agy-hud set display.glyphMode=ascii`.",
@@ -388,11 +388,11 @@ fn run_doctor(args: &[String], ctx: &CommandContext<'_>) -> CommandOutput {
         } else {
             out.push(paint(
                 "  Tip: switch via `agy-hud set display.glyphMode=unicode|nerd|ascii`.",
-                &[colors::GRAY],
+                &[DIM],
             ));
         }
         out.push(String::new());
-        out.push(paint("Findings:", &[colors::BRIGHT_WHITE, BOLD]));
+        out.push(paint("Findings:", &[BOLD]));
         for f in &final_findings {
             out.push(format!("  - {}", abbreviate_home_path(f, home)));
         }
@@ -520,9 +520,9 @@ fn run_schema(words: &[String], ctx: &CommandContext<'_>) -> CommandOutput {
             };
             format!(
                 "{} = {} {} — {}",
-                paint(m.key, &[colors::BRIGHT_CYAN, BOLD]),
-                paint(&current_val, &[colors::BRIGHT_YELLOW]),
-                paint(&range, &[colors::GRAY]),
+                paint(m.key, &[colors::CYAN, BOLD]),
+                paint(&current_val, &[colors::YELLOW, BOLD]),
+                paint(&range, &[DIM]),
                 m.description,
             )
         })
@@ -671,6 +671,9 @@ fn sample_presets(now_ms: i64) -> HashMap<&'static str, SamplePreset> {
         session_started_at: Some(now_ms - 740_000),
         last_step_at: Some(now_ms - 2_000),
         step_count: 24,
+        active_slash_mode: None,
+        completed_step_tps_x10: Some(640),
+        latest_planner_step: None,
     };
 
     let rich_probes = ProbeAnswers {
@@ -699,6 +702,7 @@ fn sample_presets(now_ms: i64) -> HashMap<&'static str, SamplePreset> {
         ),
         quota_cache: None,
         update_cache: None,
+        ..Default::default()
     };
 
     let mut presets = HashMap::new();
@@ -847,11 +851,18 @@ fn run_preview(args: &[String], ctx: &CommandContext<'_>) -> CommandOutput {
                 config_to_write: None,
             };
         };
-        let transcript = parse_transcript_and_tasks(
+        let mut transcript = parse_transcript_and_tasks(
             ctx.transcript_head,
             ctx.transcript_tail,
             ctx.task_md_text,
             snap.stdin.as_ref(),
+        );
+        let speed_cache = parse_speed_cache_info(&snap.probes);
+        let _ = apply_speed_cache(
+            snap.stdin.as_ref(),
+            &mut transcript,
+            speed_cache.as_ref(),
+            ctx.now_ms,
         );
         let vcs = parse_vcs_info(snap.stdin.as_ref(), &snap.probes);
         let memory = parse_memory_info(&snap.probes);
@@ -891,25 +902,25 @@ fn run_preview(args: &[String], ctx: &CommandContext<'_>) -> CommandOutput {
                 "1) Standard Expanded / Active Multi-Agent + Tools + Checklist (108 cols)",
                 "tool_use",
                 108,
-                None,
+                Some(Language::En),
             ),
             (
                 "2) Pending Tool Confirmation + Plan Mode + Vim Badge (108 cols)",
                 "confirm",
                 108,
-                None,
+                Some(Language::En),
             ),
             (
                 "3) Ultra-Wide Adaptive Single-Line Idle (208 cols)",
                 "idle",
                 208,
-                None,
+                Some(Language::En),
             ),
             (
                 "4) Narrow Terminal Auto-Compact + Critical Context Alert (68 cols)",
                 "high-context",
                 68,
-                None,
+                Some(Language::En),
             ),
             (
                 "5) 简体中文界面模式 (`language=zh-Hans`, 108 cols)",
@@ -926,7 +937,7 @@ fn run_preview(args: &[String], ctx: &CommandContext<'_>) -> CommandOutput {
             if let Some(lang) = lang_override {
                 cfg.language = *lang;
             }
-            out.push(paint(&format!("── {title} ──"), &[colors::GRAY, BOLD]));
+            out.push(paint(&format!("── {title} ──"), &[DIM, BOLD]));
             let vcs = parse_vcs_info(Some(&p.stdin), &p.probes);
             let memory = parse_memory_info(&p.probes);
             let rendered = render_hud_lines(RenderInput {
@@ -1074,6 +1085,7 @@ fn scrub_stdin(stdin: Option<&AgyStdinData>) -> Option<AgyStdinData> {
             project_dir: Some("/redacted/project".to_string()),
         });
     }
+    out.extra.clear();
     Some(out)
 }
 

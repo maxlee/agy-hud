@@ -6,8 +6,8 @@ use hud_cli::collector::{
 };
 use hud_cli::install::{install_status_line, uninstall_status_line};
 use hud_cli::paths::{
-    AgyPaths, atomic_write_bytes, build_logic_paths, canonical_or_parent, derive_task_md_path,
-    existing_data_dir, prepare_data_dir, undo_config, write_config_with_undo,
+    AgyPaths, atomic_write_bytes, build_logic_paths, canonical_or_parent, existing_data_dir,
+    prepare_data_dir, undo_config, write_config_with_undo,
 };
 use hud_cli::quota_refresh::{maybe_spawn_background_quota_refresh, run_quota_subcommand};
 use hud_cli::update::{maybe_spawn_background_update_check, run_update_subcommand};
@@ -15,7 +15,8 @@ use hud_core::ansi::terminal_filter;
 use hud_core::commands::{CommandContext, execute_subcommand};
 use hud_core::config::{MAX_CONFIG_BYTES, parse_config_str};
 use hud_core::probes::{
-    parse_cached_quota_info, parse_memory_info, parse_update_cache_info, parse_vcs_info,
+    apply_speed_cache, parse_cached_quota_info, parse_memory_info, parse_speed_cache_info,
+    parse_update_cache_info, parse_vcs_info,
 };
 use hud_core::render::{RenderInput, render_hud_lines};
 use hud_core::types::{
@@ -407,19 +408,17 @@ fn run() -> u8 {
             && argv.iter().any(|a| a == "--last")
             && let Some(raw_snap) = last_snapshot_text.as_deref()
             && let Ok(val) = serde_json::from_str::<Value>(raw_snap)
-            && let Some(tp_str) = val
-                .get("stdin")
-                .and_then(|s| s.get("transcript_path"))
-                .and_then(Value::as_str)
+            && let Some(stdin_val) = val.get("stdin")
+            && let Ok(snap_stdin) = serde_json::from_value::<AgyStdinData>(stdin_val.clone())
         {
-            let tp = Path::new(tp_str);
-            if tp.is_absolute() {
-                let (h, t) = read_transcript_slices(tp);
+            let snap_paths = build_logic_paths(&paths, Some(&snap_stdin), data_real.as_deref());
+            if let Some(tp_str) = snap_paths.transcript.as_deref() {
+                let (h, t) = read_transcript_slices(Path::new(tp_str));
                 tx_head = h;
                 tx_tail = t;
-                if let Some(tm) = derive_task_md_path(tp) {
-                    task_md_text = read_bounded_string(&tm, MAX_TASK_MD_BYTES);
-                }
+            }
+            if let Some(tm_str) = snap_paths.task_md.as_deref() {
+                task_md_text = read_bounded_string(Path::new(tm_str), MAX_TASK_MD_BYTES);
             }
         }
 
@@ -472,7 +471,7 @@ fn run() -> u8 {
     let config_text = read_bounded_string(&paths.config_path, MAX_CONFIG_BYTES as u64);
     let loaded_cfg = parse_config_str(config_text.as_deref());
 
-    let collected = collect_render_inputs(
+    let mut collected = collect_render_inputs(
         &paths,
         &logic_paths,
         &loaded_cfg.config,
@@ -480,6 +479,22 @@ fn run() -> u8 {
         started_ms,
         &SystemProbeRunner,
     );
+
+    if loaded_cfg.config.display.show_speed {
+        let existing_speed_cache = parse_speed_cache_info(&collected.probes);
+        if let Some(next_speed_cache) = apply_speed_cache(
+            Some(&stdin_payload),
+            &mut collected.transcript,
+            existing_speed_cache.as_ref(),
+            started_ms,
+        ) && let Ok(speed_json) = serde_json::to_string(&next_speed_cache)
+        {
+            if let Some(ref sc_path) = logic_paths.speed_cache {
+                let _ = atomic_write_bytes(Path::new(sc_path), speed_json.as_bytes(), 0o600);
+            }
+            collected.probes.speed_cache = Some(speed_json);
+        }
+    }
 
     let vcs = parse_vcs_info(Some(&stdin_payload), &collected.probes);
     let memory = parse_memory_info(&collected.probes);

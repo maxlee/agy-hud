@@ -191,8 +191,41 @@ pub fn code_point_width(ch: char) -> usize {
     }
     if cp >= 0x1100
         && (cp <= 0x115f
-            || cp == 0x2329
-            || cp == 0x232a
+            || matches!(
+                cp,
+                0x231a..=0x231b
+                    | 0x2329..=0x232a
+                    | 0x23e9..=0x23f3
+                    | 0x25fd..=0x25fe
+                    | 0x2614..=0x2615
+                    | 0x2648..=0x2653
+                    | 0x267f
+                    | 0x2693
+                    | 0x26a1
+                    | 0x26aa..=0x26ab
+                    | 0x26bd..=0x26be
+                    | 0x26c4..=0x26c5
+                    | 0x26ce
+                    | 0x26d4
+                    | 0x26ea
+                    | 0x26f2..=0x26f3
+                    | 0x26f5
+                    | 0x26fa
+                    | 0x26fd
+                    | 0x2705
+                    | 0x270a..=0x270b
+                    | 0x2728
+                    | 0x274c
+                    | 0x274e
+                    | 0x2753..=0x2755
+                    | 0x2757
+                    | 0x2795..=0x2797
+                    | 0x27b0
+                    | 0x27bf
+                    | 0x2b1b..=0x2b1c
+                    | 0x2b50
+                    | 0x2b55
+            )
             || (0x2e80..=0x303e).contains(&cp)
             || ((0x3040..=0xa4cf).contains(&cp) && cp != 0x303f)
             || (0xac00..=0xd7a3).contains(&cp)
@@ -280,6 +313,9 @@ pub fn paint(text: &str, codes: &[&str]) -> String {
     if text.is_empty() {
         return String::new();
     }
+    if codes.is_empty() {
+        return text.to_string();
+    }
     let mut out = String::with_capacity(text.len() + codes.len() * 6 + RESET.len());
     for c in codes {
         out.push_str(c);
@@ -326,9 +362,9 @@ pub fn render_bar_with_mode(
     let rem = (exact - (full as f64)) * 100.0;
 
     let bar_color = if clamped >= critical_at {
-        colors::BRIGHT_RED
+        colors::RED
     } else if clamped >= warning_at {
-        colors::BRIGHT_YELLOW
+        colors::YELLOW
     } else {
         normal_color
     };
@@ -358,10 +394,7 @@ pub fn render_bar_with_mode(
         }
     }
 
-    format!(
-        "{bar_color}{filled_part}{}{empty_part}{RESET}",
-        colors::GRAY
-    )
+    format!("{bar_color}{filled_part}{RESET}{DIM}{empty_part}{RESET}")
 }
 
 fn path_to_file_url(abs_path: &str) -> Option<String> {
@@ -465,15 +498,10 @@ mod tests {
         assert_eq!(text_width("hello"), 5);
         assert_eq!(text_width("简体中文"), 8);
         assert_eq!(text_width("🔧 TOOL"), 7);
-        assert_eq!(
-            text_width(&paint("上下文 100%", &[colors::BRIGHT_GREEN])),
-            11
-        );
-        let linked = file_link(
-            "/Users/dev/agy-hud",
-            &paint("agy-hud", &[colors::BRIGHT_WHITE]),
-            true,
-        );
+        assert_eq!(text_width("⏱ 12m"), 6);
+        assert_eq!(text_width("⚡ 98%"), 6);
+        assert_eq!(text_width(&paint("上下文 100%", &[colors::GREEN])), 11);
+        let linked = file_link("/Users/dev/agy-hud", &paint("agy-hud", &[BOLD]), true);
         assert_eq!(text_width(&linked), 7);
     }
 

@@ -1,8 +1,8 @@
 use crate::ansi::sanitize_text;
-use crate::transcript::parse_iso_ms;
+use crate::transcript::{compute_tps_x10, parse_iso_ms};
 use crate::types::{
     AgyStdinData, CachedQuotaSnapshot, MemoryProbeInfo, ProbeAnswers, RawQuotaBucket,
-    UpdateCacheSnapshot, VcsProbeInfo, VcsType,
+    SpeedCacheSnapshot, TranscriptSummary, UpdateCacheSnapshot, VcsProbeInfo, VcsType,
 };
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -408,6 +408,146 @@ pub fn parse_update_cache_info(answers: &ProbeAnswers) -> Option<UpdateCacheSnap
         .map(sanitize_text)
         .filter(|u| u.starts_with("https://github.com/"));
     Some(parsed)
+}
+
+pub fn parse_speed_cache_info(answers: &ProbeAnswers) -> Option<SpeedCacheSnapshot> {
+    let raw_json = answers.speed_cache.as_deref()?;
+    let mut parsed = serde_json::from_str::<SpeedCacheSnapshot>(raw_json).ok()?;
+    parsed.session_key = sanitize_text(&parsed.session_key);
+    if !(10..=5_000).contains(&parsed.tps_x10) {
+        return None;
+    }
+    Some(parsed)
+}
+
+fn extract_native_stdin_tps(stdin: Option<&AgyStdinData>) -> Option<f64> {
+    let extra = &stdin?.extra;
+    for top_key in ["output_tokens_per_sec", "tokens_per_second"] {
+        if let Some(v) = extra.get(top_key).and_then(Value::as_f64)
+            && v.is_finite()
+            && (0.1..=2_000.0).contains(&v)
+        {
+            return Some(v);
+        }
+    }
+    if let Some(tel) = extra.get("telemetry").and_then(Value::as_object) {
+        for k in [
+            "output_tokens_per_sec",
+            "tokens_per_second",
+            "outputTokensPerSec",
+        ] {
+            if let Some(v) = tel.get(k).and_then(Value::as_f64)
+                && v.is_finite()
+                && (0.1..=2_000.0).contains(&v)
+            {
+                return Some(v);
+            }
+        }
+    }
+    None
+}
+
+/// Resolves output generation throughput `(tokens_per_sec, is_estimated)` and returns an updated
+/// `SpeedCacheSnapshot` whenever a newly completed `PLANNER_RESPONSE` step should be locked to disk.
+pub fn resolve_output_speed(
+    stdin: Option<&AgyStdinData>,
+    transcript: &TranscriptSummary,
+    speed_cache: Option<&SpeedCacheSnapshot>,
+    now_ms: i64,
+) -> (Option<(f64, bool)>, Option<SpeedCacheSnapshot>) {
+    if let Some(exact) = extract_native_stdin_tps(stdin) {
+        return (Some((exact, false)), None);
+    }
+
+    let session_key = stdin
+        .and_then(|s| s.conversation_id.as_deref().or(s.session_id.as_deref()))
+        .map(sanitize_text)
+        .unwrap_or_default();
+
+    let is_idle = stdin
+        .and_then(|s| s.agent_state.as_deref())
+        .is_some_and(|st| st.eq_ignore_ascii_case("idle"));
+
+    if let Some(ref lp) = transcript.latest_planner_step {
+        if let Some(end_ms) = lp.ended_at_ms {
+            if let Some(x10) = compute_tps_x10(lp.output_tokens, end_ms - lp.started_at_ms) {
+                let candidate = (!session_key.is_empty()).then(|| SpeedCacheSnapshot {
+                    session_key: session_key.clone(),
+                    step_index: lp.step_index,
+                    output_tokens: lp.output_tokens,
+                    started_at_ms: lp.started_at_ms,
+                    ended_at_ms: end_ms,
+                    tps_x10: x10,
+                });
+                let to_persist = candidate.filter(|cand| speed_cache != Some(cand));
+                return (Some((x10 as f64 / 10.0, true)), to_persist);
+            }
+        } else {
+            if !session_key.is_empty()
+                && let Some(sc) = speed_cache
+                && sc.session_key == session_key
+                && sc.step_index == lp.step_index
+                && (10..=5_000).contains(&sc.tps_x10)
+            {
+                return (Some((sc.tps_x10 as f64 / 10.0, true)), None);
+            }
+            if !lp.has_trailing_user_input
+                && is_idle
+                && let Some(x10) = compute_tps_x10(lp.output_tokens, now_ms - lp.started_at_ms)
+            {
+                let locked = (!session_key.is_empty()).then(|| SpeedCacheSnapshot {
+                    session_key: session_key.clone(),
+                    step_index: lp.step_index,
+                    output_tokens: lp.output_tokens,
+                    started_at_ms: lp.started_at_ms,
+                    ended_at_ms: now_ms,
+                    tps_x10: x10,
+                });
+                return (Some((x10 as f64 / 10.0, true)), locked);
+            }
+        }
+    }
+
+    if let Some(x10) = transcript.completed_step_tps_x10
+        && (10..=5_000).contains(&x10)
+    {
+        return (Some((x10 as f64 / 10.0, true)), None);
+    }
+
+    if !session_key.is_empty()
+        && let Some(sc) = speed_cache
+        && sc.session_key == session_key
+        && (10..=5_000).contains(&sc.tps_x10)
+    {
+        return (Some((sc.tps_x10 as f64 / 10.0, true)), None);
+    }
+
+    (None, None)
+}
+
+pub fn apply_speed_cache(
+    stdin: Option<&AgyStdinData>,
+    transcript: &mut TranscriptSummary,
+    speed_cache: Option<&SpeedCacheSnapshot>,
+    now_ms: i64,
+) -> Option<SpeedCacheSnapshot> {
+    let (resolved, next_cache) = resolve_output_speed(stdin, transcript, speed_cache, now_ms);
+    if let Some((tps, true)) = resolved {
+        let x10 = (tps * 10.0).round() as u32;
+        if (10..=5_000).contains(&x10) {
+            transcript.completed_step_tps_x10 = Some(x10);
+            if let Some(ref mut lp) = transcript.latest_planner_step
+                && lp.ended_at_ms.is_none()
+                && let Some(end_ms) = next_cache
+                    .as_ref()
+                    .map(|c| c.ended_at_ms)
+                    .or_else(|| speed_cache.map(|c| c.ended_at_ms))
+            {
+                lp.ended_at_ms = Some(end_ms);
+            }
+        }
+    }
+    next_cache
 }
 
 #[cfg(test)]
