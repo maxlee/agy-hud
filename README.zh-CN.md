@@ -1,4 +1,4 @@
-# AGY HUD (`agy-hud`) v1.1.0 — 100% 纯 Rust 极速版指南
+# AGY HUD (`agy-hud`) v1.2.0 — 100% 纯 Rust 极速版指南
 
 [![CI](https://github.com/maxlee/agy-hud/actions/workflows/ci.yml/badge.svg)](https://github.com/maxlee/agy-hud/actions/workflows/ci.yml)
 [![Release](https://github.com/maxlee/agy-hud/actions/workflows/release.yml/badge.svg)](https://github.com/maxlee/agy-hud/releases)
@@ -43,7 +43,7 @@ curl -fsSL https://raw.githubusercontent.com/maxlee/agy-hud/main/install.sh | sh
 curl -fsSL https://raw.githubusercontent.com/maxlee/agy-hud/main/install.sh | sh -s -- --stack
 ```
 
-启用后，在 `agy` 会话中可随时输入 `/hud` 用自然语言调整显示项（例如 `/hud 切换成简体中文并显示文件增删统计`），或使用内置 `/statusline` 开关状态栏。
+启用后，在 `agy` 会话中可随时输入 `/hud` 用自然语言调整显示项（例如 `/hud 切换成简体中文并显示文件增删统计`），当状态栏提示新版本时输入 `/hud-update` 一键校验升级，或使用内置 `/statusline` 开关状态栏。
 
 ### 方式二：手动下载预编译包（支持 macOS / Linux / Windows）
 
@@ -79,7 +79,10 @@ curl -fsSL https://raw.githubusercontent.com/maxlee/agy-hud/main/uninstall.sh | 
 ./scripts/agy-hud doctor                                      # 输出结构化 JSON 诊断报告（供插件与排障使用）
 ./scripts/agy-hud doctor --pretty                             # 人类可读诊断面板（自动缩写 ~ 路径 + 3 模式图标对齐探针）
 ./scripts/agy-hud preview --state showcase                    # 预览 5 种典型宽度、状态与中英文布局
-./scripts/agy-hud schema                                      # 查看全部 41 个可配置项、类型及说明
+./scripts/agy-hud schema                                      # 查看全部 42 个可配置项、类型及说明
+./scripts/agy-hud update --check                              # 检查 GitHub Releases 是否有新版本
+./scripts/agy-hud update                                      # 自动下载并校验 SHA-256 升级至最新版（保留 --stack 与配置）
+./scripts/agy-hud set updates.enabled=false                   # 可选：关闭每 6 小时后台新版本检查与顶栏提示徽章
 ./scripts/agy-hud set display.glyphMode=nerd                  # 切换字符集模式：unicode | nerd | ascii（纯 7-bit）
 ./scripts/agy-hud set display.showTitle=true                  # 在顶栏展示当前会话标题（自动脱敏裁剪至 <=24 列）
 ./scripts/agy-hud set quota.backgroundRefresh=true            # 可选开启后台 `/usage` 官方配额自动刷新（默认关闭 false）

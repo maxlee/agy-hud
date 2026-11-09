@@ -1,8 +1,8 @@
 use crate::ansi::sanitize_text;
 use crate::transcript::parse_iso_ms;
 use crate::types::{
-    AgyStdinData, CachedQuotaSnapshot, MemoryProbeInfo, ProbeAnswers, RawQuotaBucket, VcsProbeInfo,
-    VcsType,
+    AgyStdinData, CachedQuotaSnapshot, MemoryProbeInfo, ProbeAnswers, RawQuotaBucket,
+    UpdateCacheSnapshot, VcsProbeInfo, VcsType,
 };
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -335,6 +335,79 @@ pub fn parse_usage_command_output(stdout: &str) -> Option<BTreeMap<String, RawQu
 pub fn parse_cached_quota_info(answers: &ProbeAnswers) -> Option<CachedQuotaSnapshot> {
     let raw_json = answers.quota_cache.as_deref()?;
     serde_json::from_str::<CachedQuotaSnapshot>(raw_json).ok()
+}
+
+fn parse_semver_core(raw: &str, allow_prerelease_strip: bool) -> Option<(u64, u64, u64)> {
+    let trimmed = raw.trim();
+    let without_v = trimmed
+        .strip_prefix('v')
+        .or_else(|| trimmed.strip_prefix('V'))
+        .unwrap_or(trimmed);
+    let without_build = without_v.split('+').next().unwrap_or(without_v);
+    let core = if allow_prerelease_strip {
+        without_build.split('-').next().unwrap_or(without_build)
+    } else if without_build.contains('-') {
+        return None;
+    } else {
+        without_build
+    };
+    let mut parts = core.split('.');
+    let major = parts.next()?.parse::<u64>().ok()?;
+    let minor = parts.next()?.parse::<u64>().ok()?;
+    let patch = parts.next()?.parse::<u64>().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((major, minor, patch))
+}
+
+/// Normalizes a stable release tag such as `"v1.2.0"` or `"1.2.0"` into `"1.2.0"`,
+/// rejecting pre-release tags (`-alpha`, `-rc.1`) and non-semver strings.
+pub fn normalize_semver_tag(raw: &str) -> Option<String> {
+    let (maj, min, pat) = parse_semver_core(raw, false)?;
+    Some(format!("{maj}.{min}.{pat}"))
+}
+
+/// Returns `true` strictly when `candidate` is a valid stable semver newer than `current`.
+pub fn is_newer_semver(current: &str, candidate: &str) -> bool {
+    let Some(cur) = parse_semver_core(current, true) else {
+        return false;
+    };
+    let Some(cand) = parse_semver_core(candidate, false) else {
+        return false;
+    };
+    cand > cur
+}
+
+/// Parses GitHub Releases API `/releases/latest` JSON into `(normalized_version, optional_html_url)`,
+/// skipping drafts and pre-releases.
+pub fn parse_github_latest_release(raw_json: &str) -> Option<(String, Option<String>)> {
+    let val: Value = serde_json::from_str(raw_json.trim()).ok()?;
+    if val.get("draft").and_then(Value::as_bool) == Some(true)
+        || val.get("prerelease").and_then(Value::as_bool) == Some(true)
+    {
+        return None;
+    }
+    let tag = val.get("tag_name").and_then(Value::as_str)?;
+    let version = normalize_semver_tag(tag)?;
+    let url = val
+        .get("html_url")
+        .and_then(Value::as_str)
+        .map(sanitize_text)
+        .filter(|u| u.starts_with("https://github.com/"));
+    Some((version, url))
+}
+
+pub fn parse_update_cache_info(answers: &ProbeAnswers) -> Option<UpdateCacheSnapshot> {
+    let raw_json = answers.update_cache.as_deref()?;
+    let mut parsed = serde_json::from_str::<UpdateCacheSnapshot>(raw_json).ok()?;
+    parsed.latest_version = normalize_semver_tag(&parsed.latest_version)?;
+    parsed.release_url = parsed
+        .release_url
+        .as_deref()
+        .map(sanitize_text)
+        .filter(|u| u.starts_with("https://github.com/"));
+    Some(parsed)
 }
 
 #[cfg(test)]

@@ -1,4 +1,4 @@
-# `agy-hud` v1.1.0 — 100% Pure Rust Single-Engine Architecture
+# `agy-hud` v1.2.0 — 100% Pure Rust Single-Engine Architecture
 
 `agy-hud` is a **100% Pure Rust** native statusLine HUD for the Google Antigravity CLI (`agy`). There is **zero Node.js / TypeScript runtime or wrapper code** in the repository.
 
@@ -32,7 +32,7 @@ Instead of spawning a second runtime VM per render, `agy-hud` enforces capabilit
 flowchart TD
   subgraph CLI["crates/hud-cli (Native Capability Binary: agy-hud)"]
     cli_main["Binary Entry: main.rs"]
-    cli_lib["CLI Modules: lib.rs collector.rs install.rs paths.rs quota_refresh.rs"]
+    cli_lib["CLI Modules: lib.rs collector.rs install.rs paths.rs quota_refresh.rs update.rs"]
   end
 
   subgraph CORE["crates/hud-core (Zero-I/O Pure Crate)"]

@@ -1,4 +1,4 @@
-# AGY HUD (`agy-hud`) v1.1.0 — 100% Pure Rust Edition
+# AGY HUD (`agy-hud`) v1.2.0 — 100% Pure Rust Edition
 
 [![CI](https://github.com/maxlee/agy-hud/actions/workflows/ci.yml/badge.svg)](https://github.com/maxlee/agy-hud/actions/workflows/ci.yml)
 [![Release](https://github.com/maxlee/agy-hud/actions/workflows/release.yml/badge.svg)](https://github.com/maxlee/agy-hud/releases)
@@ -41,7 +41,7 @@ Need to stack below the built-in status line or replace an existing custom `stat
 curl -fsSL https://raw.githubusercontent.com/maxlee/agy-hud/main/install.sh | sh -s -- --stack
 ```
 
-Inside `agy` CLI, run `/hud` anytime to customize layouts, language, or elements interactively, or `/statusline` to toggle the bar on/off.
+Inside `agy` CLI, run `/hud` anytime to customize layouts, language, or elements interactively, `/hud-update` to check and upgrade to the latest verified GitHub release in one step, or `/statusline` to toggle the bar on/off.
 
 ### Option B: Prebuilt Release Archives (macOS / Linux / Windows)
 
@@ -74,7 +74,10 @@ Once installed (`~/.gemini/antigravity-cli/agy-hud/bin/agy-hud` or `./scripts/ag
 ./scripts/agy-hud doctor --pretty                           # Human-readable diagnostics (~ paths + glyph alignment probe)
 ./scripts/agy-hud preview --state showcase                  # Preview all 5 layout/language scenarios
 ./scripts/agy-hud preview --set language=zh-Hans            # Preview Simplified Chinese UI
-./scripts/agy-hud schema                                    # List all 41 configurable keys and types
+./scripts/agy-hud schema                                    # List all 42 configurable keys and types
+./scripts/agy-hud update --check                            # Check GitHub Releases for a newer version
+./scripts/agy-hud update                                    # SHA-256 verified self-upgrade (preserves --stack & config)
+./scripts/agy-hud set updates.enabled=false                 # Optional: disable 6h background update check & badge
 ./scripts/agy-hud set display.glyphMode=nerd                # Switch glyph set: unicode | nerd | ascii
 ./scripts/agy-hud set display.showTitle=true                # Show sanitized conversation title (<=24 cols)
 ./scripts/agy-hud set quota.backgroundRefresh=true          # Optional background `agy -p /usage` refresh (default: false)

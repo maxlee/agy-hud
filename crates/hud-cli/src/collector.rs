@@ -829,6 +829,14 @@ pub fn collect_render_inputs(
             .quota_cache
             .as_deref()
             .and_then(|p| read_bounded_string(Path::new(p), 64 * 1024));
+        let update_cache = if config.updates.enabled {
+            logic_paths
+                .update_cache
+                .as_deref()
+                .and_then(|p| read_bounded_string(Path::new(p), 16 * 1024))
+        } else {
+            None
+        };
 
         CollectedRenderData {
             transcript: tx_handle.join().unwrap_or_default(),
@@ -836,6 +844,7 @@ pub fn collect_render_inputs(
                 vcs: vcs_handle.join().ok().flatten(),
                 memory: mem_handle.join().ok().flatten(),
                 quota_cache,
+                update_cache,
             },
         }
     })

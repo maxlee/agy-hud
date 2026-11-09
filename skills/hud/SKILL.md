@@ -35,6 +35,11 @@ Use `sh scripts/hud-cli.sh` (relative to this skill directory) to inspect, previ
      ```bash
      sh scripts/hud-cli.sh uninstall
      ```
+   - Check or upgrade to the latest release (also available directly via `/hud-update`):
+     ```bash
+     sh scripts/hud-cli.sh update --check
+     sh scripts/hud-cli.sh update
+     ```
 
 3. **Explore & Preview customizations (`schema` & `preview`)**
    - Look up valid configuration keys before changing anything:

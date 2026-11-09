@@ -2,14 +2,17 @@ use crate::ansi::{BOLD, colors, paint, strip_ansi};
 use crate::config::{
     CONFIG_SCHEMA, SchemaValueKind, get_dot_value, parse_config_str, parse_set_pairs, set_dot_value,
 };
-use crate::probes::{parse_cached_quota_info, parse_memory_info, parse_vcs_info};
+use crate::probes::{
+    is_newer_semver, normalize_semver_tag, parse_cached_quota_info, parse_memory_info,
+    parse_update_cache_info, parse_vcs_info,
+};
 use crate::render::{RenderInput, render_hud_lines};
 use crate::transcript::parse_transcript_and_tasks;
 use crate::types::{
     AgyStdinData, CommandOutput, ContextWindowStdin, CostStdin, CurrentUsageStdin, DoctorFacts,
     GlyphMode, Language, LogicPaths, ModelStdin, ProbeAnswers, RawQuotaBucket, SandboxStdin,
     SubagentEntry, SubagentStatus, SubagentStdin, TodoItem, TodoStatus, ToolEntry, ToolStatus,
-    TranscriptSummary, VimStdin, WorkspaceStdin,
+    TranscriptSummary, UpdateCacheSnapshot, VimStdin, WorkspaceStdin,
 };
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
@@ -22,6 +25,7 @@ pub struct CommandContext<'a> {
     pub config_text: Option<&'a str>,
     pub cli_settings_text: Option<&'a str>,
     pub last_snapshot_text: Option<&'a str>,
+    pub update_cache_text: Option<&'a str>,
     pub transcript_head: Option<&'a str>,
     pub transcript_tail: Option<&'a str>,
     pub task_md_text: Option<&'a str>,
@@ -239,6 +243,24 @@ fn run_doctor(args: &[String], ctx: &CommandContext<'_>) -> CommandOutput {
         ));
     }
 
+    let cached_update: Option<UpdateCacheSnapshot> = ctx
+        .update_cache_text
+        .and_then(|s| serde_json::from_str::<UpdateCacheSnapshot>(s).ok())
+        .and_then(|mut u| {
+            u.latest_version = normalize_semver_tag(&u.latest_version)?;
+            Some(u)
+        });
+    let update_available = loaded.config.updates.enabled
+        && cached_update
+            .as_ref()
+            .is_some_and(|u| is_newer_semver(&ctx.facts.runtime.version, &u.latest_version));
+    if update_available && let Some(ref u) = cached_update {
+        findings.push(format!(
+            "New agy-hud release available: v{} (current: v{}). Fix: run `/hud-update` inside agy CLI or `agy-hud update`.",
+            u.latest_version, ctx.facts.runtime.version
+        ));
+    }
+
     for p in &loaded.problems {
         findings.push(format!(
             "Config issue: {p} Fix: run `agy-hud set <key>=<value>` or `agy-hud schema`."
@@ -321,10 +343,24 @@ fn run_doctor(args: &[String], ctx: &CommandContext<'_>) -> CommandOutput {
             out.push(format!("  Installed Plugin : {plugin_status}"));
         }
         out.push(format!(
-            "  Config           : {} (glyphMode={glyph_str}, quota.backgroundRefresh={})",
+            "  Config           : {} (glyphMode={glyph_str}, updates.enabled={}, quota.backgroundRefresh={})",
             abbreviate_home_path(&ctx.paths.config, home),
+            loaded.config.updates.enabled,
             loaded.config.quota.background_refresh
         ));
+        if let Some(ref u) = cached_update {
+            if update_available {
+                out.push(format!(
+                    "  Updates          : v{} available! (current v{} -> run `/hud-update` or `agy-hud update`)",
+                    u.latest_version, ctx.facts.runtime.version
+                ));
+            } else {
+                out.push(format!(
+                    "  Updates          : up to date (latest checked: v{})",
+                    u.latest_version
+                ));
+            }
+        }
         if let Some(hb) = ctx.facts.heartbeat.as_ref() {
             let secs = ((ctx.now_ms - hb.at).max(0) as f64 / 1000.0).round() as u64;
             out.push(format!(
@@ -409,10 +445,19 @@ fn run_doctor(args: &[String], ctx: &CommandContext<'_>) -> CommandOutput {
             "stackWithDefault": stack_with_default,
         },
         "lastRender": last_render,
+        "updates": {
+            "enabled": loaded.config.updates.enabled,
+            "currentVersion": ctx.facts.runtime.version,
+            "latestVersion": cached_update.as_ref().map(|u| u.latest_version.as_str()),
+            "releaseUrl": cached_update.as_ref().and_then(|u| u.release_url.as_deref()),
+            "checkedAt": cached_update.as_ref().map(|u| u.checked_at),
+            "updateAvailable": update_available,
+        },
         "config": {
             "path": ctx.paths.config,
             "vcsCacheTtlMs": loaded.config.vcs.cache_ttl_ms,
             "glyphMode": loaded.config.display.glyph_mode,
+            "updatesEnabled": loaded.config.updates.enabled,
             "quotaBackgroundRefresh": loaded.config.quota.background_refresh,
             "problems": loaded.problems,
         },
@@ -653,6 +698,7 @@ fn sample_presets(now_ms: i64) -> HashMap<&'static str, SamplePreset> {
             .to_string(),
         ),
         quota_cache: None,
+        update_cache: None,
     };
 
     let mut presets = HashMap::new();
@@ -810,6 +856,7 @@ fn run_preview(args: &[String], ctx: &CommandContext<'_>) -> CommandOutput {
         let vcs = parse_vcs_info(snap.stdin.as_ref(), &snap.probes);
         let memory = parse_memory_info(&snap.probes);
         let cached_quota = parse_cached_quota_info(&snap.probes);
+        let update_info = parse_update_cache_info(&snap.probes);
         let cols = explicit_width
             .or_else(|| snap.stdin.as_ref().and_then(|s| s.terminal_width))
             .or(Some(100));
@@ -820,6 +867,7 @@ fn run_preview(args: &[String], ctx: &CommandContext<'_>) -> CommandOutput {
             vcs: vcs.as_ref(),
             memory: memory.as_ref(),
             cached_quota: cached_quota.as_ref(),
+            update_info: update_info.as_ref(),
             columns: cols,
             now_ms: ctx.now_ms,
         });
@@ -888,6 +936,7 @@ fn run_preview(args: &[String], ctx: &CommandContext<'_>) -> CommandOutput {
                 vcs: vcs.as_ref(),
                 memory: memory.as_ref(),
                 cached_quota: None,
+                update_info: None,
                 columns: Some(explicit_width.unwrap_or(*width)),
                 now_ms: ctx.now_ms,
             });
@@ -914,6 +963,7 @@ fn run_preview(args: &[String], ctx: &CommandContext<'_>) -> CommandOutput {
             vcs: vcs.as_ref(),
             memory: memory.as_ref(),
             cached_quota: None,
+            update_info: None,
             columns: cols,
             now_ms: ctx.now_ms,
         });
@@ -936,6 +986,7 @@ fn run_preview(args: &[String], ctx: &CommandContext<'_>) -> CommandOutput {
             vcs: vcs.as_ref(),
             memory: None,
             cached_quota: None,
+            update_info: None,
             columns: cols,
             now_ms: ctx.now_ms,
         });
@@ -1053,6 +1104,7 @@ fn run_report(args: &[String], ctx: &CommandContext<'_>) -> CommandOutput {
         vcs: vcs.as_ref(),
         memory: None,
         cached_quota: None,
+        update_info: None,
         columns: cols,
         now_ms: ctx.now_ms,
     })
@@ -1088,7 +1140,7 @@ pub fn execute_subcommand(name: &str, args: &[String], ctx: &CommandContext<'_>)
         other => CommandOutput {
             lines: vec![
                 format!("Unknown subcommand \"{other}\"."),
-                "Available commands: doctor, install, uninstall, preview, schema, set, quota, report"
+                "Available commands: doctor, install, uninstall, update, preview, schema, set, quota, report"
                     .to_string(),
             ],
             failed: true,

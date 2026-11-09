@@ -4,15 +4,16 @@ use crate::ansi::{
 };
 use crate::config::HudConfig;
 use crate::i18n::{Labels, get_labels};
+use crate::probes::{is_newer_semver, normalize_semver_tag};
 use crate::stdin::{
     extract_context_metrics, extract_quota_buckets_reconciled, format_compact_tokens,
     format_duration_seconds, format_model_name_with_glyphs, format_session_cost,
     format_workspace_path, normalize_plan_tier,
 };
 use crate::types::{
-    AgyStdinData, CachedQuotaSnapshot, ContextValueMode, GlyphMode, LineLayout, MemoryProbeInfo,
-    ModelFormatMode, PathLevels, QuotaValueMode, SubagentStatus, TodoStatus, ToolStatus,
-    TranscriptSummary, VcsProbeInfo,
+    AgyStdinData, CachedQuotaSnapshot, ContextValueMode, GlyphMode, HUD_VERSION, LineLayout,
+    MemoryProbeInfo, ModelFormatMode, PathLevels, QuotaValueMode, SubagentStatus, TodoStatus,
+    ToolStatus, TranscriptSummary, UpdateCacheSnapshot, VcsProbeInfo,
 };
 
 pub struct RenderInput<'a> {
@@ -22,6 +23,7 @@ pub struct RenderInput<'a> {
     pub vcs: Option<&'a VcsProbeInfo>,
     pub memory: Option<&'a MemoryProbeInfo>,
     pub cached_quota: Option<&'a CachedQuotaSnapshot>,
+    pub update_info: Option<&'a UpdateCacheSnapshot>,
     pub columns: Option<usize>,
     pub now_ms: i64,
 }
@@ -272,6 +274,7 @@ struct HeaderOpts {
     show_title: bool,
     show_custom_tag: bool,
     show_duration: bool,
+    show_update: bool,
     path_levels: PathLevels,
     model_format: ModelFormatMode,
     show_plan_tier: bool,
@@ -832,6 +835,7 @@ fn build_header_line(input: &RenderInput<'_>, labels: &Labels, opts: &HeaderOpts
         config,
         transcript,
         vcs,
+        update_info,
         now_ms,
         ..
     } = *input;
@@ -954,6 +958,22 @@ fn build_header_line(input: &RenderInput<'_>, labels: &Labels, opts: &HeaderOpts
             header_parts.push(paint(&tag, &[colors::CYAN]));
         }
     }
+    if opts.show_update
+        && config.updates.enabled
+        && let Some(upd) = update_info
+        && is_newer_semver(HUD_VERSION, &upd.latest_version)
+        && let Some(norm) = normalize_semver_tag(&upd.latest_version)
+    {
+        let (icon, mid) = match gm {
+            GlyphMode::Ascii => ("^", "."),
+            GlyphMode::Nerd => ("\u{f062}", "·"),
+            GlyphMode::Unicode => ("↑", "·"),
+        };
+        header_parts.push(paint(
+            &format!("{icon} v{norm} {mid} /hud-update"),
+            &[colors::BRIGHT_YELLOW, BOLD],
+        ));
+    }
 
     let sep_str = sep(gm);
     header_parts
@@ -1051,6 +1071,7 @@ pub fn render_hud_lines(input: RenderInput<'_>) -> Vec<String> {
         show_title: config.display.show_title,
         show_custom_tag: true,
         show_duration: config.display.show_duration,
+        show_update: config.updates.enabled,
         path_levels: if layout_mode == LineLayout::Compact {
             PathLevels::One
         } else {
@@ -1070,7 +1091,7 @@ pub fn render_hud_lines(input: RenderInput<'_>) -> Vec<String> {
 
     let mut line1 = build_header_line(&input, labels, &header_opts);
     if let Some(budget) = line_budget {
-        let header_steps: [fn(&mut HeaderOpts); 6] = [
+        let header_steps: [fn(&mut HeaderOpts); 7] = [
             |o| o.show_title = false,
             |o| {
                 o.show_custom_tag = false;
@@ -1083,6 +1104,7 @@ pub fn render_hud_lines(input: RenderInput<'_>) -> Vec<String> {
                 }
                 o.show_plan_tier = false;
             },
+            |o| o.show_update = false,
             |o| {
                 o.model_format = ModelFormatMode::Short;
                 o.show_vcs_extras = false;

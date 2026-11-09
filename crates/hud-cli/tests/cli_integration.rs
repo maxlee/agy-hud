@@ -46,7 +46,10 @@ fn run_bin(
 ) -> (bool, String) {
     let bin = env!("CARGO_BIN_EXE_agy-hud");
     let mut cmd = Command::new(bin);
-    cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
+    cmd.args(args)
+        .env("AGY_HUD_DISABLE_BG_UPDATE", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     for (k, v) in env_overrides {
         cmd.env(k, v);
     }
@@ -372,6 +375,9 @@ fn full_binary_cli_lifecycle_install_render_doctor_set_undo_report_uninstall() {
     assert!(ok_inst);
     let inst_json: Value = serde_json::from_str(&inst_out).unwrap();
     assert_eq!(inst_json["installed"], true);
+    assert_eq!(inst_json["version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(inst_json["previousVersion"], Value::Null);
+    assert_eq!(inst_json["stackWithDefault"], true);
     assert_eq!(inst_json["engine"], "rust-native");
     assert_eq!(inst_json["replaced"], "other");
     assert!(Path::new(inst_json["backupPath"].as_str().unwrap()).exists());
@@ -381,6 +387,13 @@ fn full_binary_cli_lifecycle_install_render_doctor_set_undo_report_uninstall() {
         "agy-hud"
     };
     assert!(hud_home.join("bin").join(expected_bin).exists());
+
+    // Re-running `install` without `--stack` preserves `stack_with_default: true` and reports `previousVersion`!
+    let (ok_reinst, reinst_out) = run_bin(&["install"], &env_vars, None);
+    assert!(ok_reinst);
+    let reinst_json: Value = serde_json::from_str(&reinst_out).unwrap();
+    assert_eq!(reinst_json["previousVersion"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(reinst_json["stackWithDefault"], true);
 
     let updated_settings: Value =
         serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
@@ -451,7 +464,7 @@ fn full_binary_cli_lifecycle_install_render_doctor_set_undo_report_uninstall() {
     let uninst_json: Value = serde_json::from_str(&uninst_out).unwrap();
     assert_eq!(uninst_json["restoredPrevious"], true);
     assert_eq!(uninst_json["statusLineAction"], "restored-previous");
-    assert_eq!(uninst_json["removedBackups"], 1);
+    assert!(uninst_json["removedBackups"].as_u64().unwrap() >= 1);
     assert!(!backup_from_install.exists());
     assert!(
         !hud_home.exists(),
@@ -777,4 +790,194 @@ EOF
         assert!(live_out.contains("Quota(argon-weekly)"));
         assert!(live_out.contains("65%"));
     }
+}
+
+#[test]
+#[cfg(unix)]
+fn install_sh_version_logging_and_self_update_e2e() {
+    use hud_cli::update::detect_release_platform;
+    use std::os::unix::fs::PermissionsExt;
+
+    let Ok((platform, archive_name, bin_name)) = detect_release_platform() else {
+        return;
+    };
+
+    let tmp = TempDir::new("self-update-e2e");
+    let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .unwrap();
+
+    // Build a genuine release bundle tarball for v9.9.0 with SHA256SUMS
+    let stage_parent = tmp.path.join("dist");
+    let stage = stage_parent.join("agy-hud");
+    let bin_dir = stage.join("scripts/bin").join(platform);
+    fs::create_dir_all(&bin_dir).unwrap();
+    fs::create_dir_all(stage.join("skills/hud/scripts")).unwrap();
+    fs::create_dir_all(stage.join("skills/hud-update/scripts")).unwrap();
+
+    fs::write(
+        stage.join("plugin.json"),
+        serde_json::to_string_pretty(&json!({
+            "name": "agy-hud",
+            "version": "9.9.0"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::copy(workspace_root.join("install.sh"), stage.join("install.sh")).unwrap();
+    fs::copy(
+        workspace_root.join("uninstall.sh"),
+        stage.join("uninstall.sh"),
+    )
+    .unwrap();
+    fs::copy(
+        workspace_root.join("scripts/agy-hud"),
+        stage.join("scripts/agy-hud"),
+    )
+    .unwrap();
+    fs::copy(
+        workspace_root.join("skills/hud/SKILL.md"),
+        stage.join("skills/hud/SKILL.md"),
+    )
+    .unwrap();
+    fs::copy(
+        workspace_root.join("skills/hud/scripts/hud-cli.sh"),
+        stage.join("skills/hud/scripts/hud-cli.sh"),
+    )
+    .unwrap();
+    fs::copy(
+        workspace_root.join("skills/hud-update/SKILL.md"),
+        stage.join("skills/hud-update/SKILL.md"),
+    )
+    .unwrap();
+    fs::copy(
+        workspace_root.join("skills/hud-update/scripts/hud-cli.sh"),
+        stage.join("skills/hud-update/scripts/hud-cli.sh"),
+    )
+    .unwrap();
+    fs::copy(env!("CARGO_BIN_EXE_agy-hud"), bin_dir.join(bin_name)).unwrap();
+    fs::set_permissions(bin_dir.join(bin_name), fs::Permissions::from_mode(0o755)).unwrap();
+
+    let archive_path = stage_parent.join(archive_name);
+    let tar_ok = Command::new("tar")
+        .args([
+            "-C",
+            &stage_parent.to_string_lossy(),
+            "-czf",
+            &archive_path.to_string_lossy(),
+            "agy-hud",
+        ])
+        .status()
+        .unwrap()
+        .success();
+    assert!(tar_ok);
+
+    // Compute SHA256SUMS via shasum/sha256sum
+    let sha_out = Command::new("sh")
+        .arg("-c")
+        .arg(format!(
+            "(sha256sum '{0}' 2>/dev/null || shasum -a 256 '{0}') | awk '{{print $1}}'",
+            archive_path.display()
+        ))
+        .output()
+        .unwrap();
+    let hash = String::from_utf8_lossy(&sha_out.stdout).trim().to_string();
+    assert_eq!(hash.len(), 64);
+    fs::write(
+        stage_parent.join("SHA256SUMS"),
+        format!("{hash}  {archive_name}\n"),
+    )
+    .unwrap();
+
+    // 1. Verify `install.sh --stack` prints clear version logs!
+    let cli_sh = tmp.path.join("cli-sh");
+    let hud_sh = cli_sh.join("agy-hud");
+    let sh_out = Command::new("sh")
+        .arg(workspace_root.join("install.sh"))
+        .arg("--stack")
+        .env("AGY_CLI_DIR", &cli_sh)
+        .env("AGY_HUD_HOME", &hud_sh)
+        .env("AGY_HUD_ARCHIVE_DIR", &stage_parent)
+        .env("AGY_SKIP_PLUGIN_INSTALL", "1")
+        .output()
+        .unwrap();
+    let sh_stdout = String::from_utf8_lossy(&sh_out.stdout);
+    assert!(sh_out.status.success(), "install.sh failed: {sh_stdout}");
+    assert!(sh_stdout.contains("==> Installing agy-hud v9.9.0..."));
+    assert!(sh_stdout.contains("==> Deploying native agy-hud v9.9.0 statusLine binary..."));
+    assert!(sh_stdout.contains("==> Done! agy-hud v9.9.0 is active."));
+
+    // 2. Test `agy-hud update --check`, live `/hud-update` badge, and `agy-hud update` self-upgrade!
+    let cli_upd = tmp.path.join("cli-upd");
+    let hud_upd = cli_upd.join("agy-hud");
+    let upd_env: [(&str, &Path); 2] = [
+        ("AGY_CLI_DIR", cli_upd.as_path()),
+        ("AGY_HUD_HOME", hud_upd.as_path()),
+    ];
+
+    // Initial install with `--stack`
+    let (ok_init, _) = run_bin(&["install", "--stack"], &upd_env, None);
+    assert!(ok_init);
+
+    let mock_release = json!({
+        "tag_name": "v9.9.0",
+        "draft": false,
+        "prerelease": false,
+        "html_url": "https://github.com/maxlee/agy-hud/releases/tag/v9.9.0"
+    })
+    .to_string();
+
+    let check_out = Command::new(env!("CARGO_BIN_EXE_agy-hud"))
+        .args(["update", "--check"])
+        .env("AGY_CLI_DIR", &cli_upd)
+        .env("AGY_HUD_HOME", &hud_upd)
+        .env("AGY_HUD_UPDATE_CHECK_JSON", &mock_release)
+        .output()
+        .unwrap();
+    assert!(check_out.status.success());
+    let check_json: Value = serde_json::from_slice(&check_out.stdout).unwrap();
+    assert_eq!(check_json["updateAvailable"], true);
+    assert_eq!(check_json["latestVersion"], "9.9.0");
+    assert!(hud_upd.join("data/update-cache.json").exists());
+
+    // Live render now displays `↑ v9.9.0 · /hud-update` badge!
+    let live_payload = json!({
+        "cwd": "/tmp/demo",
+        "model": { "id": "Gemini 4 Argon", "display_name": "Gemini 4 Argon" },
+        "context_window": { "used_percentage": 15.0 },
+        "agent_state": "idle",
+        "terminal_width": 140
+    })
+    .to_string();
+    let (ok_badge, badge_out) = run_bin(&[], &upd_env, Some(&live_payload));
+    assert!(ok_badge);
+    assert!(badge_out.contains("/hud-update"));
+    assert!(badge_out.contains("v9.9.0"));
+
+    // Run `agy-hud update` end-to-end (without needing to re-pass `--stack`)!
+    let upgrade_out = Command::new(env!("CARGO_BIN_EXE_agy-hud"))
+        .arg("update")
+        .env("AGY_CLI_DIR", &cli_upd)
+        .env("AGY_HUD_HOME", &hud_upd)
+        .env("AGY_HUD_UPDATE_CHECK_JSON", &mock_release)
+        .env("AGY_HUD_ARCHIVE_DIR", &stage_parent)
+        .env("AGY_SKIP_PLUGIN_INSTALL", "1")
+        .output()
+        .unwrap();
+    let upgrade_stdout = String::from_utf8_lossy(&upgrade_out.stdout);
+    assert!(
+        upgrade_out.status.success(),
+        "agy-hud update failed: {upgrade_stdout}"
+    );
+    let upgrade_json: Value = serde_json::from_str(&upgrade_stdout).unwrap();
+    assert_eq!(upgrade_json["updated"], true);
+    assert_eq!(upgrade_json["version"], "9.9.0");
+    assert_eq!(upgrade_json["sha256"], hash);
+    assert_eq!(upgrade_json["stackWithDefault"], true);
+
+    // Verify `settings.json` preserved `stack_with_default: true`!
+    let settings_after: Value =
+        serde_json::from_str(&fs::read_to_string(cli_upd.join("settings.json")).unwrap()).unwrap();
+    assert_eq!(settings_after["statusLine"]["stack_with_default"], true);
 }

@@ -91,6 +91,11 @@ compute_sha256() {
 PLATFORM=$(detect_platform)
 ARCHIVE_NAME="agy-hud-${PLATFORM}.tar.gz"
 
+PREV_VERSION=""
+if [ -x "$HUD_HOME/bin/agy-hud" ]; then
+  PREV_VERSION=$("$HUD_HOME/bin/agy-hud" --version 2>/dev/null | awk '{print $2}' || true)
+fi
+
 if [ "$VERSION" = "latest" ]; then
   BASE_URL="https://github.com/${REPO}/releases/latest/download"
 else
@@ -136,8 +141,24 @@ if [ ! -f "$EXTRACTED_PLUGIN/plugin.json" ] || [ ! -f "$BIN_IN_BUNDLE" ]; then
   exit 1
 fi
 chmod 0755 "$BIN_IN_BUNDLE" "$EXTRACTED_PLUGIN/scripts/agy-hud" "$EXTRACTED_PLUGIN/skills/hud/scripts/hud-cli.sh"
+if [ -f "$EXTRACTED_PLUGIN/skills/hud-update/scripts/hud-cli.sh" ]; then
+  chmod 0755 "$EXTRACTED_PLUGIN/skills/hud-update/scripts/hud-cli.sh"
+fi
 if [ -f "$EXTRACTED_PLUGIN/uninstall.sh" ]; then
   chmod 0755 "$EXTRACTED_PLUGIN/uninstall.sh"
+fi
+
+BUNDLE_VERSION=$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$EXTRACTED_PLUGIN/plugin.json" | head -n 1)
+if [ -z "$BUNDLE_VERSION" ]; then
+  BUNDLE_VERSION=$("$BIN_IN_BUNDLE" --version 2>/dev/null | awk '{print $2}' || echo "unknown")
+fi
+
+if [ -n "$PREV_VERSION" ] && [ "$PREV_VERSION" != "$BUNDLE_VERSION" ]; then
+  printf '==> Installing agy-hud v%s (upgrading from v%s)...\n' "$BUNDLE_VERSION" "$PREV_VERSION"
+elif [ -n "$PREV_VERSION" ]; then
+  printf '==> Reinstalling agy-hud v%s...\n' "$BUNDLE_VERSION"
+else
+  printf '==> Installing agy-hud v%s...\n' "$BUNDLE_VERSION"
 fi
 
 mkdir -p "$CLI_DIR" "$HUD_HOME"
@@ -151,7 +172,7 @@ mv "${PLUGIN_STAGE}.next" "$PLUGIN_STAGE"
 
 PLUGIN_FLAG=""
 if [ "${AGY_SKIP_PLUGIN_INSTALL:-0}" != "1" ] && command -v agy >/dev/null 2>&1; then
-  printf '==> Registering Antigravity plugin (/hud skill)...\n'
+  printf '==> Registering Antigravity plugin (/hud & /hud-update skills) [v%s]...\n' "$BUNDLE_VERSION"
   if agy plugin install "$PLUGIN_STAGE"; then
     PLUGIN_FLAG="--plugin-installed"
   else
@@ -159,10 +180,10 @@ if [ "${AGY_SKIP_PLUGIN_INSTALL:-0}" != "1" ] && command -v agy >/dev/null 2>&1;
   fi
 fi
 
-printf '==> Deploying native agy-hud statusLine binary...\n'
+printf '==> Deploying native agy-hud v%s statusLine binary...\n' "$BUNDLE_VERSION"
 if [ -n "$PLUGIN_FLAG" ]; then
   "$PLUGIN_STAGE/scripts/bin/$PLATFORM/agy-hud" install "$PLUGIN_FLAG" "$@"
 else
   "$PLUGIN_STAGE/scripts/bin/$PLATFORM/agy-hud" install "$@"
 fi
-printf '==> Done! Launch `agy` and try `/hud` anytime.\n'
+printf '==> Done! agy-hud v%s is active. Launch `agy` and try `/hud` (or `/hud-update` to upgrade anytime).\n' "$BUNDLE_VERSION"

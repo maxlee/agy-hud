@@ -94,6 +94,7 @@ jobs:
             "$STAGE/uninstall.sh" \
             "$STAGE/scripts/agy-hud" \
             "$STAGE/skills/hud/scripts/hud-cli.sh" \
+            "$STAGE/skills/hud-update/scripts/hud-cli.sh" \
             "$STAGE/scripts/bin/${{ matrix.platform }}/${{ matrix.bin_name }}"
           tar -C dist -czf "dist/agy-hud-${{ matrix.platform }}.tar.gz" agy-hud
 

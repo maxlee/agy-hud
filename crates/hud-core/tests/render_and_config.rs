@@ -1,7 +1,9 @@
 use hud_core::ansi::{sanitize_title_text, strip_ansi, text_width};
 use hud_core::commands::{CommandContext, execute_subcommand};
 use hud_core::config::{CONFIG_SCHEMA, HudConfig, parse_config_str, parse_set_pairs};
-use hud_core::probes::{parse_usage_command_output, parse_vcs_info};
+use hud_core::probes::{
+    is_newer_semver, parse_github_latest_release, parse_usage_command_output, parse_vcs_info,
+};
 use hud_core::render::{RenderInput, render_hud_lines};
 use hud_core::stdin::{extract_quota_buckets_reconciled, format_session_cost, normalize_plan_tier};
 use hud_core::types::{
@@ -9,7 +11,7 @@ use hud_core::types::{
     DoctorFacts, EffortFormatMode, GlyphMode, InstalledPluginFacts, Language, LogicPaths,
     ModelStdin, PluginFacts, ProbeAnswers, RawQuotaBucket, RuntimeFacts, SandboxStdin,
     SubagentEntry, SubagentStatus, TodoItem, TodoStatus, ToolEntry, ToolStatus, TranscriptSummary,
-    VimStdin, WorkspaceStdin,
+    UpdateCacheSnapshot, VimStdin, WorkspaceStdin,
 };
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -91,6 +93,7 @@ fn adaptive_layout_handles_ultrawide_standard_narrow_and_zh_hans() {
         ),
         memory: None,
         quota_cache: None,
+        update_cache: None,
     };
 
     // 1. Ultra-wide 200 cols -> collapses to 1 sleek line when idle without active tools/todos
@@ -103,6 +106,7 @@ fn adaptive_layout_handles_ultrawide_standard_narrow_and_zh_hans() {
         vcs: vcs.as_ref(),
         memory: None,
         cached_quota: None,
+        update_info: None,
         columns: Some(200),
         now_ms: 1_700_000_000_000,
     });
@@ -124,6 +128,7 @@ fn adaptive_layout_handles_ultrawide_standard_narrow_and_zh_hans() {
         vcs: vcs.as_ref(),
         memory: None,
         cached_quota: None,
+        update_info: None,
         columns: Some(62),
         now_ms: 1_700_000_000_000,
     });
@@ -151,6 +156,7 @@ fn adaptive_layout_handles_ultrawide_standard_narrow_and_zh_hans() {
         vcs: vcs.as_ref(),
         memory: None,
         cached_quota: None,
+        update_info: None,
         columns: Some(110),
         now_ms: 1_700_000_000_000,
     });
@@ -167,10 +173,11 @@ fn adaptive_layout_handles_ultrawide_standard_narrow_and_zh_hans() {
 }
 
 #[test]
-fn config_schema_validates_all_41_keys_and_preview_showcase_renders_5_scenarios() {
-    assert_eq!(CONFIG_SCHEMA.len(), 41);
+fn config_schema_validates_all_42_keys_and_preview_showcase_renders_5_scenarios() {
+    assert_eq!(CONFIG_SCHEMA.len(), 42);
     let default_cfg = HudConfig::default();
     assert!(!default_cfg.quota.background_refresh);
+    assert!(default_cfg.updates.enabled);
     assert!(!default_cfg.display.show_title);
     assert_eq!(default_cfg.display.glyph_mode, GlyphMode::Unicode);
 
@@ -228,6 +235,7 @@ fn config_schema_validates_all_41_keys_and_preview_showcase_renders_5_scenarios(
         config_text: None,
         cli_settings_text: None,
         last_snapshot_text: None,
+        update_cache_text: None,
         transcript_head: None,
         transcript_tail: None,
         task_md_text: None,
@@ -454,6 +462,7 @@ fn sub_cent_cost_plan_tier_title_zwj_glyph_modes_and_progressive_degradation() {
         vcs: None,
         memory: None,
         cached_quota: None,
+        update_info: None,
         columns: Some(120),
         now_ms: 1_700_000_000_000,
     });
@@ -486,6 +495,7 @@ fn sub_cent_cost_plan_tier_title_zwj_glyph_modes_and_progressive_degradation() {
             vcs: None,
             memory: None,
             cached_quota: None,
+            update_info: None,
             columns: Some(width),
             now_ms: 1_700_000_000_000,
         });
@@ -498,4 +508,127 @@ fn sub_cent_cost_plan_tier_title_zwj_glyph_modes_and_progressive_degradation() {
             );
         }
     }
+}
+
+#[test]
+fn update_semver_parsing_badge_rendering_and_doctor_findings() {
+    assert!(is_newer_semver("1.1.0", "v1.2.0"));
+    assert!(is_newer_semver("v1.1.0", "2.0.0"));
+    assert!(!is_newer_semver("1.1.0", "1.1.0"));
+    assert!(!is_newer_semver("1.2.0", "1.1.9"));
+    assert!(!is_newer_semver("1.1.0", "v1.2.0-rc.1"));
+
+    assert_eq!(
+        parse_github_latest_release(
+            r#"{"tag_name":"v1.2.0","draft":false,"prerelease":false,"html_url":"https://github.com/maxlee/agy-hud/releases/tag/v1.2.0"}"#
+        ),
+        Some((
+            "1.2.0".to_string(),
+            Some("https://github.com/maxlee/agy-hud/releases/tag/v1.2.0".to_string())
+        ))
+    );
+    assert!(
+        parse_github_latest_release(r#"{"tag_name":"v1.2.0-beta.1","prerelease":true}"#).is_none()
+    );
+    assert!(parse_github_latest_release(r#"{"tag_name":"v1.2.0","draft":true}"#).is_none());
+
+    let stdin = sample_stdin(140);
+    let update = UpdateCacheSnapshot {
+        checked_at: 1_700_000_000_000,
+        latest_version: "9.9.0".to_string(),
+        release_url: Some("https://github.com/maxlee/agy-hud/releases/tag/v9.9.0".to_string()),
+    };
+
+    // 1. Unicode badge
+    let uni_lines = render_hud_lines(RenderInput {
+        stdin: Some(&stdin),
+        config: &HudConfig::default(),
+        transcript: &TranscriptSummary::default(),
+        vcs: None,
+        memory: None,
+        cached_quota: None,
+        update_info: Some(&update),
+        columns: Some(140),
+        now_ms: 1_700_000_000_000,
+    });
+    let uni_plain = strip_ansi(&uni_lines[0]);
+    assert!(uni_plain.contains("↑ v9.9.0 · /hud-update"));
+
+    // 2. ASCII badge (strictly 7-bit)
+    let mut ascii_cfg = HudConfig::default();
+    ascii_cfg.display.glyph_mode = GlyphMode::Ascii;
+    let ascii_lines = render_hud_lines(RenderInput {
+        stdin: Some(&stdin),
+        config: &ascii_cfg,
+        transcript: &TranscriptSummary::default(),
+        vcs: None,
+        memory: None,
+        cached_quota: None,
+        update_info: Some(&update),
+        columns: Some(140),
+        now_ms: 1_700_000_000_000,
+    });
+    assert!(ascii_lines[0].is_ascii());
+    assert!(strip_ansi(&ascii_lines[0]).contains("^ v9.9.0 . /hud-update"));
+
+    // 3. `updates.enabled = false` hides badge completely
+    let mut disabled_cfg = HudConfig::default();
+    disabled_cfg.updates.enabled = false;
+    let disabled_lines = render_hud_lines(RenderInput {
+        stdin: Some(&stdin),
+        config: &disabled_cfg,
+        transcript: &TranscriptSummary::default(),
+        vcs: None,
+        memory: None,
+        cached_quota: None,
+        update_info: Some(&update),
+        columns: Some(140),
+        now_ms: 1_700_000_000_000,
+    });
+    assert!(!strip_ansi(&disabled_lines[0]).contains("/hud-update"));
+
+    // 4. `doctor` surfaces available update in JSON and `--pretty`
+    let facts = DoctorFacts {
+        cwd: "/Users/alice/project".to_string(),
+        home_dir: "/Users/alice".to_string(),
+        platform: "macos".to_string(),
+        terminal: "Ghostty".to_string(),
+        remote_session: false,
+        runtime: RuntimeFacts {
+            engine: "rust-native".to_string(),
+            version: "1.1.0".to_string(),
+            exec_path: "/Users/alice/.gemini/antigravity-cli/agy-hud/bin/agy-hud".to_string(),
+            supported: true,
+        },
+        plugin: PluginFacts {
+            root: "/Users/alice/.gemini/config/plugins/agy-hud".to_string(),
+            version: "1.1.0".to_string(),
+        },
+        installed_plugin_status: "installed".to_string(),
+        installed_plugin: None,
+        config_path: "/Users/alice/.gemini/antigravity-cli/agy-hud/config.json".to_string(),
+        heartbeat: None,
+    };
+    let paths = LogicPaths {
+        config: "/Users/alice/.gemini/antigravity-cli/agy-hud/config.json".to_string(),
+        cli_settings: "/Users/alice/.gemini/antigravity-cli/settings.json".to_string(),
+        ..LogicPaths::default()
+    };
+    let cache_json = serde_json::to_string(&update).unwrap();
+    let ctx = CommandContext {
+        facts: &facts,
+        paths: &paths,
+        now_ms: 1_700_000_000_000,
+        config_text: None,
+        cli_settings_text: None,
+        last_snapshot_text: None,
+        update_cache_text: Some(&cache_json),
+        transcript_head: None,
+        transcript_tail: None,
+        task_md_text: None,
+    };
+    let doc = execute_subcommand("doctor", &[], &ctx);
+    let doc_val: serde_json::Value = serde_json::from_str(&doc.lines.join("\n")).unwrap();
+    assert_eq!(doc_val["updates"]["updateAvailable"], true);
+    assert_eq!(doc_val["updates"]["latestVersion"], "9.9.0");
 }

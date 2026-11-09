@@ -10,10 +10,13 @@ use hud_cli::paths::{
     existing_data_dir, prepare_data_dir, undo_config, write_config_with_undo,
 };
 use hud_cli::quota_refresh::{maybe_spawn_background_quota_refresh, run_quota_subcommand};
+use hud_cli::update::{maybe_spawn_background_update_check, run_update_subcommand};
 use hud_core::ansi::terminal_filter;
 use hud_core::commands::{CommandContext, execute_subcommand};
 use hud_core::config::{MAX_CONFIG_BYTES, parse_config_str};
-use hud_core::probes::{parse_cached_quota_info, parse_memory_info, parse_vcs_info};
+use hud_core::probes::{
+    parse_cached_quota_info, parse_memory_info, parse_update_cache_info, parse_vcs_info,
+};
 use hud_core::render::{RenderInput, render_hud_lines};
 use hud_core::types::{
     AgyStdinData, DoctorFacts, HeartbeatInfo, InstalledPluginFacts, PluginFacts, RuntimeFacts,
@@ -33,6 +36,7 @@ const HELP_LINES: &[&str] = &[
     "  agy-hud                                 (statusLine mode: reads JSON from stdin)",
     "  agy-hud doctor [--pretty]               Check setup, binary, settings.json, and glyph alignment",
     "  agy-hud install [--replace] [--stack]   Deploy native binary & configure settings.json",
+    "  agy-hud update [--check] [--force]      Check for updates or upgrade to the latest verified GitHub release",
     "  agy-hud uninstall [--keep-config] [--reset-default]  Cleanly remove HUD & restore official default",
     "  agy-hud preview [options]               Render live previews (--state showcase|idle|tool_use|confirm|high-context, --width N, --set k=v, --last)",
     "  agy-hud schema [query]                  List configurable HUD keys and descriptions",
@@ -293,6 +297,22 @@ fn run() -> u8 {
         }
     }
 
+    if sub == Some("update") {
+        match run_update_subcommand(&paths, &argv[1..], now_epoch_ms()) {
+            Ok(Some(report)) => {
+                let pretty = serde_json::to_string_pretty(&report).unwrap_or_default();
+                let lines: Vec<&str> = pretty.lines().collect();
+                print_filtered(&lines);
+                return 0;
+            }
+            Ok(None) => return 0,
+            Err(err) => {
+                print_filtered(&[format!("update failed: {err}")]);
+                return 1;
+            }
+        }
+    }
+
     if sub == Some("quota") {
         match run_quota_subcommand(&paths, &argv[1..], now_epoch_ms()) {
             Ok(Some(report)) => {
@@ -374,6 +394,10 @@ fn run() -> u8 {
             .last_snapshot
             .as_deref()
             .and_then(|p| read_bounded_string(Path::new(p), 256 * 1024));
+        let update_cache_text = logic_paths
+            .update_cache
+            .as_deref()
+            .and_then(|p| read_bounded_string(Path::new(p), 16 * 1024));
 
         // If `preview --last` needs transcript/task.md from the stored snapshot, load them safely
         let mut tx_head: Option<String> = None;
@@ -406,6 +430,7 @@ fn run() -> u8 {
             config_text: config_text.as_deref(),
             cli_settings_text: cli_settings_text.as_deref(),
             last_snapshot_text: last_snapshot_text.as_deref(),
+            update_cache_text: update_cache_text.as_deref(),
             transcript_head: tx_head.as_deref(),
             transcript_tail: tx_tail.as_deref(),
             task_md_text: task_md_text.as_deref(),
@@ -459,6 +484,7 @@ fn run() -> u8 {
     let vcs = parse_vcs_info(Some(&stdin_payload), &collected.probes);
     let memory = parse_memory_info(&collected.probes);
     let cached_quota = parse_cached_quota_info(&collected.probes);
+    let update_info = parse_update_cache_info(&collected.probes);
     let columns = stdin_payload.terminal_width.filter(|&w| w > 0);
 
     let lines = render_hud_lines(RenderInput {
@@ -468,6 +494,7 @@ fn run() -> u8 {
         vcs: vcs.as_ref(),
         memory: memory.as_ref(),
         cached_quota: cached_quota.as_ref(),
+        update_info: update_info.as_ref(),
         columns,
         now_ms: started_ms,
     });
@@ -503,6 +530,9 @@ fn run() -> u8 {
 
     if loaded_cfg.config.quota.background_refresh {
         maybe_spawn_background_quota_refresh(&paths, &current_exe, &stdin_payload, started_ms);
+    }
+    if loaded_cfg.config.updates.enabled {
+        maybe_spawn_background_update_check(&paths, &current_exe, started_ms);
     }
 
     0

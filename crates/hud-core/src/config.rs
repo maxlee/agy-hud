@@ -17,6 +17,18 @@ pub struct QuotaConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct UpdatesConfig {
+    pub enabled: bool,
+}
+
+impl Default for UpdatesConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct VcsConfig {
     pub enabled: bool,
     pub show_dirty: bool,
@@ -121,6 +133,8 @@ pub struct HudConfig {
     pub hyperlinks: bool,
     #[serde(default)]
     pub quota: QuotaConfig,
+    #[serde(default)]
+    pub updates: UpdatesConfig,
     pub vcs: VcsConfig,
     pub display: DisplayConfig,
 }
@@ -134,6 +148,7 @@ impl Default for HudConfig {
             max_width: None,
             hyperlinks: true,
             quota: QuotaConfig::default(),
+            updates: UpdatesConfig::default(),
             vcs: VcsConfig::default(),
             display: DisplayConfig::default(),
         }
@@ -198,6 +213,11 @@ pub const CONFIG_SCHEMA: &[SchemaEntry] = &[
         key: "quota.backgroundRefresh",
         kind: SchemaValueKind::Boolean,
         description: "Refresh stale quota in background via read-only `agy -p /usage` (off by default).",
+    },
+    SchemaEntry {
+        key: "updates.enabled",
+        kind: SchemaValueKind::Boolean,
+        description: "Check GitHub Releases in background every 6h and show `/hud-update` badge when a newer version is available.",
     },
     SchemaEntry {
         key: "vcs.enabled",

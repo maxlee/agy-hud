@@ -1,6 +1,8 @@
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::BTreeMap;
 
+pub const HUD_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum Language {
     #[serde(rename = "en")]
@@ -423,6 +425,15 @@ pub struct CachedQuotaSnapshot {
     pub quota: BTreeMap<String, RawQuotaBucket>,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateCacheSnapshot {
+    pub checked_at: i64,
+    pub latest_version: String,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub release_url: Option<String>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ProbeAnswers {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -431,6 +442,8 @@ pub struct ProbeAnswers {
     pub memory: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub quota_cache: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub update_cache: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -500,6 +513,8 @@ pub struct LogicPaths {
     pub last_snapshot: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub quota_cache: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub update_cache: Option<String>,
     pub cli_settings: String,
     pub transcript: Option<String>,
     pub task_md: Option<String>,

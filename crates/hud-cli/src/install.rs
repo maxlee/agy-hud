@@ -100,6 +100,29 @@ fn file_mode_or_default(path: &Path, default_mode: u32) -> u32 {
     default_mode
 }
 
+const INSTALLER_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+pub fn detect_installed_binary_version(paths: &AgyPaths) -> Option<String> {
+    let meta_path = paths.hud_home.join("install-meta.json");
+    if let Some(raw_meta) = read_bounded_string(&meta_path, 16 * 1024)
+        && let Ok(val) = serde_json::from_str::<Value>(&raw_meta)
+        && let Some(ver) = val.get("version").and_then(Value::as_str)
+        && !ver.trim().is_empty()
+    {
+        return Some(ver.trim().to_string());
+    }
+    if paths.installed_bin_path.is_file() {
+        let args = vec!["--version".to_string()];
+        if let Some(out) = exec_file_safe(&paths.installed_bin_path.to_string_lossy(), &args, None)
+            && let Some(ver) = out.split_whitespace().nth(1)
+            && !ver.is_empty()
+        {
+            return Some(ver.to_string());
+        }
+    }
+    None
+}
+
 pub fn install_status_line(
     paths: &AgyPaths,
     current_exe: &Path,
@@ -107,14 +130,16 @@ pub fn install_status_line(
     argv: &[String],
 ) -> Result<Value, String> {
     let replace = argv.iter().any(|a| a == "--replace");
-    let stack = argv.iter().any(|a| a == "--stack");
+    let explicit_stack = argv.iter().any(|a| a == "--stack");
+    let explicit_no_stack = argv.iter().any(|a| a == "--no-stack");
     let plugin_flag = argv.iter().any(|a| a == "--plugin-installed");
-    let padding = argv
+    let explicit_padding = argv
         .iter()
         .position(|a| a == "--padding")
         .and_then(|idx| argv.get(idx + 1))
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(0);
+        .and_then(|v| v.parse::<u64>().ok());
+
+    let previous_version = detect_installed_binary_version(paths);
 
     create_private_dir_all(&paths.cli_dir).map_err(|e| e.to_string())?;
     create_private_dir_all(&paths.hud_home).map_err(|e| e.to_string())?;
@@ -131,6 +156,32 @@ pub fn install_status_line(
         .and_then(Value::as_str)
         .unwrap_or("");
     let current_kind = classify_statusline_command(current_cmd);
+
+    let stack = if explicit_stack {
+        true
+    } else if explicit_no_stack {
+        false
+    } else if current_kind == "agy-hud" {
+        existing_sl
+            .as_ref()
+            .and_then(|m| m.get("stack_with_default"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    } else {
+        false
+    };
+
+    let padding = if let Some(p) = explicit_padding {
+        p
+    } else if current_kind == "agy-hud" {
+        existing_sl
+            .as_ref()
+            .and_then(|m| m.get("padding"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+    } else {
+        0
+    };
 
     if current_kind == "other" && !replace {
         return Err(
@@ -184,8 +235,9 @@ pub fn install_status_line(
         backup_path = Some(bak.to_string_lossy().into_owned());
     }
 
-    // Record plugin root, pluginInstalled state, and tracked backups for clean `uninstall`
+    // Record version, plugin root, pluginInstalled state, and tracked backups for clean `uninstall`
     let meta_bytes = serde_json::to_vec_pretty(&json!({
+        "version": INSTALLER_VERSION,
         "pluginRoot": canonical_or_parent(plugin_root).to_string_lossy(),
         "pluginInstalled": prev_plugin_installed || plugin_flag,
         "backups": tracked_backups,
@@ -224,10 +276,13 @@ pub fn install_status_line(
 
     let mut report = json!({
         "installed": true,
+        "version": INSTALLER_VERSION,
+        "previousVersion": previous_version,
         "engine": "rust-native",
         "settingsPath": paths.cli_settings_path.to_string_lossy(),
         "binaryPath": paths.installed_bin_path.to_string_lossy(),
         "command": command_str,
+        "stackWithDefault": stack,
         "replaced": current_kind,
         "backupPath": backup_path,
     });

@@ -16,6 +16,7 @@ pub struct AgyPaths {
     pub installed_bin_path: PathBuf,
     pub data_dir: PathBuf,
     pub quota_cache_path: PathBuf,
+    pub update_cache_path: PathBuf,
     pub probe_cache_dir: PathBuf,
     pub config_path: PathBuf,
     pub undo_path: PathBuf,
@@ -83,6 +84,7 @@ impl AgyPaths {
             installed_bin_path: bin_dir.join(bin_name),
             bin_dir,
             quota_cache_path: data_dir.join("quota-cache.json"),
+            update_cache_path: data_dir.join("update-cache.json"),
             data_dir,
             probe_cache_dir: hud_home.join("probe-cache"),
             config_path: hud_home.join("config.json"),
@@ -262,6 +264,8 @@ pub fn build_logic_paths(
             .map(|d| d.join("last-snapshot.json").to_string_lossy().into_owned()),
         quota_cache: data_real_dir
             .map(|d| d.join("quota-cache.json").to_string_lossy().into_owned()),
+        update_cache: data_real_dir
+            .map(|d| d.join("update-cache.json").to_string_lossy().into_owned()),
         cli_settings: canonical_or_parent(&paths.cli_settings_path)
             .to_string_lossy()
             .into_owned(),
@@ -298,6 +302,15 @@ pub fn atomic_write_bytes(target: &Path, bytes: &[u8], mode_octal: u32) -> std::
     }
     let _ = mode_octal;
     if let Err(err) = fs::rename(&tmp_path, target) {
+        #[cfg(windows)]
+        if target.exists() {
+            let old_path = target.with_file_name(format!("{file_name}.old"));
+            let _ = fs::remove_file(&old_path);
+            if fs::rename(target, &old_path).is_ok() && fs::rename(&tmp_path, target).is_ok() {
+                let _ = fs::remove_file(&old_path);
+                return Ok(());
+            }
+        }
         let _ = fs::remove_file(&tmp_path);
         return Err(err);
     }
