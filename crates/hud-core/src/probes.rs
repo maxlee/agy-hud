@@ -1,8 +1,12 @@
 use crate::ansi::sanitize_text;
-use crate::transcript::{compute_tps_x10, parse_iso_ms};
+use crate::transcript::{
+    adjust_coarse_dt_ms, blend_tps_ewma_x10, compute_tps_x10, estimate_ttft_overhead_ms,
+    parse_iso_ms, update_speed_anchors,
+};
 use crate::types::{
-    AgyStdinData, CachedQuotaSnapshot, MemoryProbeInfo, ProbeAnswers, RawQuotaBucket,
-    SpeedCacheSnapshot, TranscriptSummary, UpdateCacheSnapshot, VcsProbeInfo, VcsType,
+    ActiveSpeedSample, AgyStdinData, CachedQuotaSnapshot, MemoryProbeInfo, ProbeAnswers,
+    RawQuotaBucket, SpeedCacheSnapshot, TranscriptSummary, UpdateCacheSnapshot, VcsProbeInfo,
+    VcsType,
 };
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -26,7 +30,7 @@ pub fn parse_vcs_info(
         .branch
         .as_deref()
         .filter(|b| !b.trim().is_empty())
-        .or(sv.vcs_type.as_deref())?;
+        .or_else(|| sv.client.as_deref().filter(|c| !c.trim().is_empty()))?;
     let branch = sanitize_text(branch_raw);
     if branch.is_empty() {
         return None;
@@ -447,8 +451,17 @@ fn extract_native_stdin_tps(stdin: Option<&AgyStdinData>) -> Option<f64> {
     None
 }
 
+fn extract_model_key(stdin: Option<&AgyStdinData>) -> String {
+    stdin
+        .and_then(|s| s.model.as_ref())
+        .and_then(|m| m.id.as_deref().or(m.display_name.as_deref()))
+        .map(sanitize_text)
+        .unwrap_or_default()
+}
+
 /// Resolves output generation throughput `(tokens_per_sec, is_estimated)` and returns an updated
-/// `SpeedCacheSnapshot` whenever a newly completed `PLANNER_RESPONSE` step should be locked to disk.
+/// `SpeedCacheSnapshot` whenever live streaming milestones or completed `PLANNER_RESPONSE` steps
+/// should be persisted to disk.
 pub fn resolve_output_speed(
     stdin: Option<&AgyStdinData>,
     transcript: &TranscriptSummary,
@@ -459,67 +472,339 @@ pub fn resolve_output_speed(
         return (Some((exact, false)), None);
     }
 
-    let session_key = stdin
-        .and_then(|s| s.conversation_id.as_deref().or(s.session_id.as_deref()))
-        .map(sanitize_text)
-        .unwrap_or_default();
-
-    let is_idle = stdin
-        .and_then(|s| s.agent_state.as_deref())
-        .is_some_and(|st| st.eq_ignore_ascii_case("idle"));
-
-    if let Some(ref lp) = transcript.latest_planner_step {
-        if let Some(end_ms) = lp.ended_at_ms {
-            if let Some(x10) = compute_tps_x10(lp.output_tokens, end_ms - lp.started_at_ms) {
-                let candidate = (!session_key.is_empty()).then(|| SpeedCacheSnapshot {
-                    session_key: session_key.clone(),
-                    step_index: lp.step_index,
-                    output_tokens: lp.output_tokens,
-                    started_at_ms: lp.started_at_ms,
-                    ended_at_ms: end_ms,
-                    tps_x10: x10,
-                });
-                let to_persist = candidate.filter(|cand| speed_cache != Some(cand));
-                return (Some((x10 as f64 / 10.0, true)), to_persist);
-            }
-        } else {
-            if !session_key.is_empty()
-                && let Some(sc) = speed_cache
-                && sc.session_key == session_key
-                && sc.step_index == lp.step_index
-                && (10..=5_000).contains(&sc.tps_x10)
-            {
-                return (Some((sc.tps_x10 as f64 / 10.0, true)), None);
-            }
-            if !lp.has_trailing_user_input
-                && is_idle
-                && let Some(x10) = compute_tps_x10(lp.output_tokens, now_ms - lp.started_at_ms)
-            {
-                let locked = (!session_key.is_empty()).then(|| SpeedCacheSnapshot {
-                    session_key: session_key.clone(),
-                    step_index: lp.step_index,
-                    output_tokens: lp.output_tokens,
-                    started_at_ms: lp.started_at_ms,
-                    ended_at_ms: now_ms,
-                    tps_x10: x10,
-                });
-                return (Some((x10 as f64 / 10.0, true)), locked);
-            }
-        }
-    }
-
-    if let Some(x10) = transcript.completed_step_tps_x10
-        && (10..=5_000).contains(&x10)
+    if speed_cache.is_none()
+        && let Some(x10) = transcript
+            .resolved_tps_x10
+            .filter(|&v| (10..=5_000).contains(&v))
     {
         return (Some((x10 as f64 / 10.0, true)), None);
     }
 
-    if !session_key.is_empty()
-        && let Some(sc) = speed_cache
-        && sc.session_key == session_key
-        && (10..=5_000).contains(&sc.tps_x10)
+    let session_key = stdin
+        .and_then(|s| s.conversation_id.as_deref().or(s.session_id.as_deref()))
+        .map(sanitize_text)
+        .unwrap_or_default();
+    let model_key = extract_model_key(stdin);
+
+    let agent_state = stdin
+        .and_then(|s| s.agent_state.as_deref())
+        .unwrap_or("")
+        .trim();
+    let is_idle = agent_state.eq_ignore_ascii_case("idle");
+    let is_tool_use = agent_state.eq_ignore_ascii_case("tool_use");
+    let is_streaming_state = agent_state.eq_ignore_ascii_case("streaming");
+    let is_thinking_state =
+        agent_state.eq_ignore_ascii_case("thinking") || agent_state.eq_ignore_ascii_case("working");
+    let confirm_pending = stdin
+        .and_then(|s| s.tool_confirmation_pending)
+        .unwrap_or(false);
+
+    let same_session_cache = (!session_key.is_empty())
+        .then_some(speed_cache)
+        .flatten()
+        .filter(|sc| sc.session_key == session_key);
+
+    let model_switched = same_session_cache.is_some_and(|sc| {
+        !sc.model_key.is_empty() && !model_key.is_empty() && sc.model_key != model_key
+    });
+
+    if model_switched && let Some(old_sc) = same_session_cache {
+        let lp_needs_fresh_eval = transcript
+            .latest_planner_step
+            .as_ref()
+            .is_some_and(|lp| !lp.is_done || lp.step_index > old_sc.step_index);
+        if !lp_needs_fresh_eval && !is_streaming_state && !is_thinking_state {
+            let barrier_step = transcript
+                .latest_planner_step
+                .as_ref()
+                .map_or(old_sc.step_index, |lp| lp.step_index.max(old_sc.step_index));
+            let reset = SpeedCacheSnapshot {
+                session_key,
+                model_key,
+                step_index: barrier_step,
+                output_tokens: 0,
+                started_at_ms: now_ms,
+                ended_at_ms: -1,
+                tps_x10: 0,
+                ewma_tps_x10: None,
+                short_anchor: None,
+                long_anchor: None,
+                active: None,
+            };
+            return (None, Some(reset));
+        }
+    }
+
+    let matching_cache = same_session_cache.filter(|_| !model_switched);
+    let has_model_barrier =
+        model_switched || matching_cache.is_some_and(|sc| sc.ended_at_ms == -1 && sc.tps_x10 == 0);
+
+    let prev_ewma = matching_cache
+        .and_then(|sc| {
+            sc.ewma_tps_x10
+                .or_else(|| (sc.ended_at_ms > 0).then_some(sc.tps_x10))
+                .filter(|&v| (10..=5_000).contains(&v))
+        })
+        .or_else(|| {
+            (!has_model_barrier)
+                .then_some(transcript.completed_step_tps_x10)
+                .flatten()
+                .filter(|&v| (10..=5_000).contains(&v))
+        });
+
+    let lp_in_flight = transcript
+        .latest_planner_step
+        .as_ref()
+        .filter(|lp| !lp.is_done);
+
+    let completed_lp_already_handled = transcript.latest_planner_step.as_ref().is_none_or(|lp| {
+        !lp.is_done
+            || lp.has_trailing_user_input
+            || matching_cache.is_some_and(|sc| {
+                (sc.ended_at_ms > 0 && sc.step_index == lp.step_index && sc.tps_x10 > 0)
+                    || (sc.ended_at_ms == -1 && lp.step_index <= sc.step_index)
+            })
+    });
+
+    // 1. Live 300ms tick tracking while model is thinking or streaming
+    if lp_in_flight.is_some()
+        || ((is_streaming_state || is_thinking_state) && completed_lp_already_handled)
     {
-        return (Some((sc.tps_x10 as f64 / 10.0, true)), None);
+        let mut active = matching_cache
+            .and_then(|sc| sc.active.clone())
+            .filter(|a| {
+                now_ms >= a.turn_started_at_ms
+                    && now_ms - a.turn_started_at_ms <= 300_000
+                    && match (a.step_index, lp_in_flight.map(|l| l.step_index)) {
+                        (Some(a_idx), Some(l_idx)) => a_idx == l_idx,
+                        _ => true,
+                    }
+            })
+            .unwrap_or_else(|| ActiveSpeedSample {
+                step_index: lp_in_flight.map(|l| l.step_index),
+                turn_started_at_ms: lp_in_flight
+                    .map(|l| l.started_at_ms.min(now_ms))
+                    .unwrap_or(now_ms),
+                decode_started_at_ms: None,
+                first_est_tokens: 0,
+                peak_est_tokens: 0,
+                live_tps_x10: None,
+                confirm_seen: false,
+            });
+
+        if let Some(lp) = lp_in_flight {
+            active.step_index = Some(lp.step_index);
+        }
+        active.confirm_seen |= confirm_pending;
+
+        let est_tokens = lp_in_flight.map_or(0, |l| l.estimated_tokens);
+        if active.decode_started_at_ms.is_none() && (is_streaming_state || est_tokens > 0) {
+            active.decode_started_at_ms = Some(now_ms);
+            active.first_est_tokens = est_tokens;
+        }
+        active.peak_est_tokens = active.peak_est_tokens.max(est_tokens);
+
+        if let Some(dec_ms) = active.decode_started_at_ms
+            && !active.confirm_seen
+        {
+            let delta_tok = active
+                .peak_est_tokens
+                .saturating_sub(active.first_est_tokens);
+            let stream_dt = now_ms - dec_ms;
+            if delta_tok >= 16
+                && (700..=180_000).contains(&stream_dt)
+                && let Some(live_x10) = compute_tps_x10(delta_tok, stream_dt)
+            {
+                active.live_tps_x10 = Some(match active.live_tps_x10 {
+                    Some(prev) => ((prev as u64 * 4 + live_x10 as u64 * 6) / 10) as u32,
+                    None => live_x10,
+                });
+            }
+        }
+
+        let display_x10 = active.live_tps_x10.or(prev_ewma);
+        let to_persist = (!session_key.is_empty())
+            .then(|| {
+                let base = matching_cache
+                    .cloned()
+                    .unwrap_or_else(|| SpeedCacheSnapshot {
+                        session_key: session_key.clone(),
+                        model_key: model_key.clone(),
+                        step_index: model_switched
+                            .then(|| same_session_cache.map(|s| s.step_index))
+                            .flatten()
+                            .unwrap_or(0),
+                        output_tokens: 0,
+                        started_at_ms: 0,
+                        ended_at_ms: if model_switched { -1 } else { 0 },
+                        tps_x10: 0,
+                        ewma_tps_x10: None,
+                        short_anchor: None,
+                        long_anchor: None,
+                        active: None,
+                    });
+                SpeedCacheSnapshot {
+                    session_key: session_key.clone(),
+                    model_key: if model_key.is_empty() {
+                        base.model_key
+                    } else {
+                        model_key.clone()
+                    },
+                    active: Some(active),
+                    ..base
+                }
+            })
+            .filter(|cand| speed_cache != Some(cand));
+
+        return (display_x10.map(|x| (x as f64 / 10.0, true)), to_persist);
+    }
+
+    // 2. Completed planner step resolution & locking
+    if let Some(ref lp) = transcript.latest_planner_step
+        && lp.is_done
+    {
+        if let Some(sc) = matching_cache {
+            if sc.ended_at_ms == -1 && lp.step_index <= sc.step_index {
+                let clear_active = sc.active.is_some().then(|| SpeedCacheSnapshot {
+                    active: None,
+                    ..sc.clone()
+                });
+                return (None, clear_active);
+            }
+            if sc.ended_at_ms > 0
+                && sc.step_index == lp.step_index
+                && (10..=5_000).contains(&sc.tps_x10)
+            {
+                let shown = sc
+                    .ewma_tps_x10
+                    .filter(|&v| (10..=5_000).contains(&v))
+                    .unwrap_or(sc.tps_x10);
+                let clear_active = sc.active.is_some().then(|| SpeedCacheSnapshot {
+                    active: None,
+                    ..sc.clone()
+                });
+                return (Some((shown as f64 / 10.0, true)), clear_active);
+            }
+        }
+
+        let matched_active = matching_cache
+            .and_then(|sc| sc.active.as_ref())
+            .filter(|a| {
+                a.step_index == Some(lp.step_index)
+                    || (a.step_index.is_none()
+                        && (lp.started_at_ms - a.turn_started_at_ms).abs() <= 15_000
+                        && now_ms >= lp.started_at_ms)
+            });
+
+        let mut short_anchor = matching_cache.and_then(|sc| sc.short_anchor).or_else(|| {
+            (!has_model_barrier)
+                .then_some(transcript.short_anchor)
+                .flatten()
+        });
+        let mut long_anchor = matching_cache.and_then(|sc| sc.long_anchor).or_else(|| {
+            (!has_model_barrier)
+                .then_some(transcript.long_anchor)
+                .flatten()
+        });
+
+        let step_confirm_contaminated =
+            confirm_pending || matched_active.is_some_and(|a| a.confirm_seen);
+
+        if !step_confirm_contaminated {
+            // 2a. TTFT-stripped millisecond decode window from live 300ms ticks
+            let live_measured = matched_active.and_then(|active| {
+                let end_ms = match lp.ended_at_ms {
+                    Some(gen_end) => now_ms.min(gen_end + 999),
+                    None => now_ms,
+                };
+                if let Some(dec_ms) = active.decode_started_at_ms {
+                    let lead_in = if active.first_est_tokens > 4 {
+                        150.min((dec_ms - active.turn_started_at_ms).max(0))
+                    } else {
+                        0
+                    };
+                    let decode_dt = (end_ms - dec_ms) + lead_in;
+                    if let Some(x10) = compute_tps_x10(lp.output_tokens, decode_dt) {
+                        return Some((x10, end_ms, true));
+                    }
+                }
+                // Sub-tick fast Flash burst fallback using turn_started_at_ms
+                let turn_dt = end_ms - active.turn_started_at_ms;
+                compute_tps_x10(lp.output_tokens, turn_dt).map(|x10| (x10, end_ms, false))
+            });
+
+            // 2b. Coarse transcript / idle-lock timing with 2-point TTFT calibration
+            let resolved_sample = live_measured.or_else(|| {
+                let end_ms = if let Some(gen_end) = lp.ended_at_ms {
+                    Some(gen_end)
+                } else if !lp.has_trailing_user_input && (is_idle || is_tool_use) {
+                    let raw_dt = now_ms - lp.started_at_ms;
+                    let raw_tps = if raw_dt > 0 {
+                        (lp.output_tokens as f64) / ((raw_dt as f64) / 1000.0)
+                    } else {
+                        0.0
+                    };
+                    // Guard against late/cold idle renders minutes after generation finished
+                    if matched_active.is_none() && raw_dt > 45_000 && raw_tps < 12.0 {
+                        None
+                    } else {
+                        Some(now_ms)
+                    }
+                } else {
+                    None
+                }?;
+
+                let raw_dt = end_ms - lp.started_at_ms;
+                update_speed_anchors(
+                    &mut short_anchor,
+                    &mut long_anchor,
+                    lp.output_tokens,
+                    raw_dt,
+                );
+                let overhead_ms = estimate_ttft_overhead_ms(short_anchor, long_anchor);
+                let adj_dt = adjust_coarse_dt_ms(raw_dt, overhead_ms);
+                compute_tps_x10(lp.output_tokens, adj_dt).map(|x10| (x10, end_ms, false))
+            });
+
+            if let Some((sample_x10, end_ms, ttft_stripped)) = resolved_sample {
+                let ewma_x10 = if matching_cache.is_none()
+                    && !ttft_stripped
+                    && lp.output_tokens >= 1_500
+                    && prev_ewma.is_some_and(|prev| sample_x10 >= prev)
+                {
+                    sample_x10
+                } else {
+                    blend_tps_ewma_x10(prev_ewma, sample_x10, lp.output_tokens, ttft_stripped)
+                };
+
+                let candidate = (!session_key.is_empty()).then(|| SpeedCacheSnapshot {
+                    session_key: session_key.clone(),
+                    model_key: model_key.clone(),
+                    step_index: lp.step_index,
+                    output_tokens: lp.output_tokens,
+                    started_at_ms: lp.started_at_ms,
+                    ended_at_ms: end_ms,
+                    tps_x10: sample_x10,
+                    ewma_tps_x10: Some(ewma_x10),
+                    short_anchor,
+                    long_anchor,
+                    active: None,
+                });
+                let to_persist = candidate.filter(|cand| speed_cache != Some(cand));
+                return (Some((ewma_x10 as f64 / 10.0, true)), to_persist);
+            }
+        }
+    }
+
+    if let Some(x10) = prev_ewma {
+        let clear_active =
+            matching_cache
+                .filter(|sc| sc.active.is_some())
+                .map(|sc| SpeedCacheSnapshot {
+                    active: None,
+                    ..sc.clone()
+                });
+        return (Some((x10 as f64 / 10.0, true)), clear_active);
     }
 
     (None, None)
@@ -532,20 +817,23 @@ pub fn apply_speed_cache(
     now_ms: i64,
 ) -> Option<SpeedCacheSnapshot> {
     let (resolved, next_cache) = resolve_output_speed(stdin, transcript, speed_cache, now_ms);
-    if let Some((tps, true)) = resolved {
-        let x10 = (tps * 10.0).round() as u32;
-        if (10..=5_000).contains(&x10) {
-            transcript.completed_step_tps_x10 = Some(x10);
-            if let Some(ref mut lp) = transcript.latest_planner_step
-                && lp.ended_at_ms.is_none()
-                && let Some(end_ms) = next_cache
-                    .as_ref()
-                    .map(|c| c.ended_at_ms)
-                    .or_else(|| speed_cache.map(|c| c.ended_at_ms))
-            {
-                lp.ended_at_ms = Some(end_ms);
+    match resolved {
+        Some((tps, true)) => {
+            let x10 = (tps * 10.0).round() as u32;
+            if (10..=5_000).contains(&x10) {
+                transcript.resolved_tps_x10 = Some(x10);
+                transcript.completed_step_tps_x10 = Some(x10);
             }
         }
+        None => {
+            transcript.resolved_tps_x10 = None;
+            if next_cache.as_ref().is_some_and(|c| c.ended_at_ms == -1)
+                || speed_cache.is_some_and(|c| c.ended_at_ms == -1)
+            {
+                transcript.completed_step_tps_x10 = None;
+            }
+        }
+        Some((_, false)) => {}
     }
     next_cache
 }

@@ -64,6 +64,7 @@ fn sample_stdin(width: usize) -> AgyStdinData {
         }),
         sandbox: Some(SandboxStdin {
             enabled: Some(true),
+            allow_network: None,
         }),
         terminal_width: Some(width),
         cost: Some(CostStdin {
@@ -648,6 +649,7 @@ fn theme_adaptive_palette_plan_tier_default_sandbox_suppression_and_slash_mode()
     stdin.plan_tier = Some("Google AI Ultra".to_string());
     stdin.sandbox = Some(SandboxStdin {
         enabled: Some(false),
+        allow_network: Some(true),
     });
 
     let tx = TranscriptSummary {
@@ -825,4 +827,353 @@ fn output_speed_estimation_idle_cache_locking_and_header_badge() {
         now_ms: ten_min_later,
     });
     assert!(!strip_ansi(&hidden_lines[0]).contains("tok/s"));
+}
+
+#[test]
+fn agy_1_5_4_schema_vcs_fallback_show_project_decoupling_and_subagent_statuses() {
+    let raw_154 = json!({
+        "version": "1.5.4",
+        "cwd": "/Users/dev/agy-hud",
+        "agent_state": "tool_use",
+        "vcs": { "type": "git" },
+        "sandbox": { "enabled": true, "allow_network": false },
+        "battle": { "status": "voting", "focused_arm": 1 },
+        "subagents": [
+            { "name": "research", "role": "API Auditor", "status": "running", "model": "gemini-3.1-pro" },
+            { "name": "self", "role": "Waiter", "status": "blocked", "model": "gemini-3-flash" },
+            { "name": "verifier", "role": "Broken Runner", "status": "error" },
+            { "name": "docs", "role": "Doc Writer", "status": "completed" }
+        ]
+    })
+    .to_string();
+
+    let parsed: AgyStdinData = serde_json::from_str(&raw_154).expect("valid 1.5.4 payload");
+    assert_eq!(
+        parsed.sandbox.as_ref().and_then(|s| s.allow_network),
+        Some(false)
+    );
+    assert_eq!(
+        parsed.battle.as_ref().and_then(|b| b.status.as_deref()),
+        Some("voting")
+    );
+    assert_eq!(parsed.battle.as_ref().and_then(|b| b.focused_arm), Some(1));
+
+    // 1. `{"type": "git"}` without `branch` or `client` must NOT produce `git:(git)`
+    let empty_probes = ProbeAnswers::default();
+    assert!(parse_vcs_info(Some(&parsed), &empty_probes).is_none());
+
+    // 2. CitC / client workspace fallback (`client` populated without `branch`) works & redacts in `report`
+    let mut citc_stdin = parsed.clone();
+    citc_stdin.vcs.as_mut().unwrap().vcs_type = Some("citc".to_string());
+    citc_stdin.vcs.as_mut().unwrap().client = Some("secret-citc-ws".to_string());
+    let citc_vcs = parse_vcs_info(Some(&citc_stdin), &empty_probes).expect("client fallback");
+    assert_eq!(citc_vcs.branch, "secret-citc-ws");
+
+    let snap_json = json!({
+        "stdin": citc_stdin,
+        "probes": {}
+    })
+    .to_string();
+    let facts = DoctorFacts {
+        cwd: "/Users/dev/agy-hud".to_string(),
+        home_dir: "/Users/dev".to_string(),
+        platform: "darwin-arm64".to_string(),
+        terminal: "xterm-256color".to_string(),
+        remote_session: false,
+        runtime: RuntimeFacts {
+            engine: "rust-native".to_string(),
+            version: "1.3.1".to_string(),
+            exec_path: "/bin/agy-hud".to_string(),
+            supported: true,
+        },
+        plugin: PluginFacts {
+            root: "/plugin".to_string(),
+            version: "1.3.1".to_string(),
+        },
+        installed_plugin_status: "installed".to_string(),
+        installed_plugin: None,
+        config_path: "/cfg/config.json".to_string(),
+        heartbeat: None,
+    };
+    let paths = LogicPaths::default();
+    let report_out = execute_subcommand(
+        "report",
+        &[],
+        &CommandContext {
+            config_text: None,
+            cli_settings_text: None,
+            last_snapshot_text: Some(&snap_json),
+            update_cache_text: None,
+            transcript_head: None,
+            transcript_tail: None,
+            task_md_text: None,
+            facts: &facts,
+            paths: &paths,
+            now_ms: 1_700_000_000_000,
+        },
+    );
+    let report_joined = report_out.lines.join("\n");
+    assert!(!report_joined.contains("secret-citc-ws"));
+    assert!(report_joined.contains("<redacted-client>"));
+
+    // 3. Subagent models & 4 statuses (`Running`, `Blocked`, `Error`, `Completed`) + `showProject=false` decoupling
+    let tx = parse_transcript_and_tasks(None, None, None, Some(&parsed));
+    assert_eq!(tx.subagents.len(), 4);
+    assert_eq!(tx.subagents[0].model.as_deref(), Some("gemini-3.1-pro"));
+    assert_eq!(tx.subagents[0].status, SubagentStatus::Running);
+    assert_eq!(tx.subagents[1].status, SubagentStatus::Blocked);
+    assert_eq!(tx.subagents[2].status, SubagentStatus::Error);
+    assert_eq!(tx.subagents[3].status, SubagentStatus::Completed);
+
+    let mut cfg = HudConfig::default();
+    cfg.display.show_project = false;
+    cfg.vcs.enabled = true;
+    let rich_vcs = parse_vcs_info(
+        Some(&parsed),
+        &ProbeAnswers {
+            vcs: Some(json!({ "type": "git", "branch": "feat/154", "dirty": false }).to_string()),
+            ..Default::default()
+        },
+    );
+    let lines = render_hud_lines(RenderInput {
+        stdin: Some(&parsed),
+        config: &cfg,
+        transcript: &tx,
+        vcs: rich_vcs.as_ref(),
+        memory: None,
+        cached_quota: None,
+        update_info: None,
+        columns: Some(140),
+        now_ms: 1_700_000_000_000,
+    });
+    let header_plain = strip_ansi(&lines[0]);
+    assert!(
+        !header_plain.contains("agy-hud") && header_plain.contains("git:(feat/154)"),
+        "showProject=false must still keep VCS when vcs.enabled=true: {header_plain}"
+    );
+    let subagent_plain = lines
+        .iter()
+        .map(|l| strip_ansi(l))
+        .find(|l| l.contains("API Auditor"))
+        .expect("subagents line");
+    assert!(
+        subagent_plain.contains("◐")
+            && subagent_plain.contains("◷")
+            && subagent_plain.contains("✗")
+            && subagent_plain.contains("✓"),
+        "Expected all 4 distinct status glyphs: {subagent_plain}"
+    );
+}
+
+#[test]
+fn hybrid_option_a_speed_strips_ttft_isolates_tool_exec_resists_short_dilution_and_resets_on_model_switch()
+ {
+    let base_ms = 1_794_195_600_000i64; // 2026-11-09T03:40:00Z
+    let mut stdin = sample_stdin(140);
+    stdin.conversation_id = Some("conv-option-a".to_string());
+
+    // 1. Live 300ms ticks: 5.2s in `thinking` (TTFT/prefill), then 1.5s in `streaming` producing 191 BPE tokens
+    stdin.agent_state = Some("thinking".to_string());
+    let mut tx_think = parse_transcript_and_tasks(None, None, None, Some(&stdin));
+    let (spd_t0, c0) =
+        hud_core::probes::resolve_output_speed(Some(&stdin), &tx_think, None, base_ms + 300);
+    assert!(spd_t0.is_none());
+    let c0 = c0.expect("records turn_started_at_ms");
+
+    // +5,500ms: first streaming tick (`decode_started_at_ms = base_ms + 5500`)
+    stdin.agent_state = Some("streaming".to_string());
+    let running_step_t1 = json!({
+        "step_index": 1,
+        "source": "MODEL",
+        "type": "PLANNER_RESPONSE",
+        "status": "RUNNING",
+        "created_at": "2026-11-09T03:40:00Z",
+        "content": "a".repeat(12)
+    })
+    .to_string();
+    tx_think = parse_transcript_and_tasks(
+        Some(&running_step_t1),
+        Some(&running_step_t1),
+        None,
+        Some(&stdin),
+    );
+    let (_, c1) =
+        hud_core::probes::resolve_output_speed(Some(&stdin), &tx_think, Some(&c0), base_ms + 5_500);
+    let c1 = c1.expect("records decode_started_at_ms");
+    assert_eq!(
+        c1.active.as_ref().and_then(|a| a.decode_started_at_ms),
+        Some(base_ms + 5_500)
+    );
+
+    // +6,400ms (+900ms into decode): live streaming ~108 estimated tokens -> live tok/s visible!
+    let running_step_t2 = json!({
+        "step_index": 1,
+        "source": "MODEL",
+        "type": "PLANNER_RESPONSE",
+        "status": "RUNNING",
+        "created_at": "2026-11-09T03:40:00Z",
+        "content": "a".repeat(444)
+    })
+    .to_string();
+    let tx_stream = parse_transcript_and_tasks(
+        Some(&running_step_t2),
+        Some(&running_step_t2),
+        None,
+        Some(&stdin),
+    );
+    let (live_spd, c2) = hud_core::probes::resolve_output_speed(
+        Some(&stdin),
+        &tx_stream,
+        Some(&c1),
+        base_ms + 6_400,
+    );
+    let (live_tps, _) = live_spd.expect("live streaming tok/s");
+    assert!(
+        (110.0..=130.0).contains(&live_tps),
+        "unexpected live_tps: {live_tps}"
+    );
+    let c2 = c2.unwrap();
+
+    // +7,000ms (+1,500ms decode window, 7s total wall time): step 1 finishes and launches `run_command` (`tool_use`)
+    stdin.agent_state = Some("tool_use".to_string());
+    let done_step_1 = json!({
+        "step_index": 1,
+        "source": "MODEL",
+        "type": "PLANNER_RESPONSE",
+        "status": "DONE",
+        "created_at": "2026-11-09T03:40:00Z",
+        "output_tokens": 191,
+        "tool_calls": [{ "name": "run_command", "args": { "CommandLine": "sleep 20" } }]
+    })
+    .to_string();
+    let mut tx_done1 =
+        parse_transcript_and_tasks(Some(&done_step_1), Some(&done_step_1), None, Some(&stdin));
+    let locked_1 = apply_speed_cache(Some(&stdin), &mut tx_done1, Some(&c2), base_ms + 7_000)
+        .expect("locks TTFT-stripped speed immediately at tool_use");
+    // 191 tokens / 1.5s = 127.3 tok/s (whereas naive 191 / 7s would have been 27.3 tok/s!)
+    assert_eq!(locked_1.tps_x10, 1273);
+
+    // 20 seconds later, `sleep 20` finishes and writes `GENERIC` at `03:40:27Z` -> locked step 1 MUST NOT decay!
+    let after_slow_tool = format!(
+        "{done_step_1}\n{}",
+        json!({
+            "step_index": 2,
+            "source": "MODEL",
+            "type": "GENERIC",
+            "status": "DONE",
+            "created_at": "2026-11-09T03:40:27Z",
+            "content": "done"
+        })
+    );
+    stdin.agent_state = Some("idle".to_string());
+    let mut tx_after_tool = parse_transcript_and_tasks(
+        after_slow_tool.lines().next(),
+        Some(&after_slow_tool),
+        None,
+        Some(&stdin),
+    );
+    let rewrite = apply_speed_cache(
+        Some(&stdin),
+        &mut tx_after_tool,
+        Some(&locked_1),
+        base_ms + 27_500,
+    );
+    assert!(
+        rewrite.is_none(),
+        "locked step must ignore slow tool GENERIC"
+    );
+    assert_eq!(tx_after_tool.resolved_tps_x10, Some(1273));
+
+    // 2. Coarse transcript resilience: 3,688-token coding step followed by short TTFT-heavy tool calls
+    let coarse_steps = [
+        json!({ "step_index": 10, "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": "2026-11-09T03:41:00Z", "output_tokens": 3688 }),
+        json!({ "step_index": 11, "type": "GENERIC", "status": "DONE", "created_at": "2026-11-09T03:41:35Z", "content": "ok" }),
+        json!({ "step_index": 12, "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": "2026-11-09T03:41:36Z", "output_tokens": 133 }),
+        json!({ "step_index": 13, "type": "GENERIC", "status": "DONE", "created_at": "2026-11-09T03:41:40Z", "content": "ok" }),
+        json!({ "step_index": 14, "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": "2026-11-09T03:41:41Z", "output_tokens": 191 }),
+        json!({ "step_index": 15, "type": "GENERIC", "status": "DONE", "created_at": "2026-11-09T03:41:49Z", "content": "ok" }),
+    ];
+    let coarse_jsonl = coarse_steps
+        .iter()
+        .map(serde_json::to_string)
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+        .join("\n");
+    let tx_coarse = parse_transcript_and_tasks(
+        coarse_jsonl.lines().next(),
+        Some(&coarse_jsonl),
+        None,
+        Some(&stdin),
+    );
+    let coarse_tps = tx_coarse.completed_step_tps_x10.unwrap() as f64 / 10.0;
+    assert!(
+        coarse_tps >= 100.0,
+        "Short TTFT-heavy tool steps must not crash 105 tok/s rate (got {coarse_tps})"
+    );
+
+    // 3. Mid-session model switch (`Gemini 4 Argon` -> `Gemini 3 Flash`) invalidates stale Pro speed
+    let mut switched_stdin = stdin.clone();
+    switched_stdin.model = Some(ModelStdin {
+        id: Some("Gemini 3 Flash".to_string()),
+        display_name: Some("Gemini 3 Flash".to_string()),
+        effort: None,
+    });
+    let mut tx_switch = tx_after_tool.clone();
+    let barrier_cache = apply_speed_cache(
+        Some(&switched_stdin),
+        &mut tx_switch,
+        Some(&locked_1),
+        base_ms + 30_000,
+    )
+    .expect("writes model-switch barrier");
+    assert_eq!(tx_switch.resolved_tps_x10, None);
+    assert_eq!(tx_switch.completed_step_tps_x10, None);
+
+    // Sub-2s fast Flash burst (120 tokens in 800ms = 150.0 tok/s) succeeds on the new model!
+    let flash_step = format!(
+        "{after_slow_tool}\n{}",
+        json!({
+            "step_index": 3,
+            "type": "PLANNER_RESPONSE",
+            "status": "DONE",
+            "created_at": "2026-11-09T03:40:31Z",
+            "output_tokens": 120,
+            "content": "Fast flash answer"
+        })
+    );
+    let mut tx_flash = parse_transcript_and_tasks(
+        flash_step.lines().next(),
+        Some(&flash_step),
+        None,
+        Some(&switched_stdin),
+    );
+    let flash_locked = apply_speed_cache(
+        Some(&switched_stdin),
+        &mut tx_flash,
+        Some(&barrier_cache),
+        base_ms + 31_800,
+    )
+    .expect("locks 800ms Flash burst");
+    assert_eq!(flash_locked.tps_x10, 1500);
+    assert_eq!(tx_flash.resolved_tps_x10, Some(1500));
+
+    // 4. Stale cold-idle window (>45s with low apparent rate) and `tool_confirmation_pending` are rejected
+    let stale_tx =
+        parse_transcript_and_tasks(Some(&done_step_1), Some(&done_step_1), None, Some(&stdin));
+    let (stale_spd, _) =
+        hud_core::probes::resolve_output_speed(Some(&stdin), &stale_tx, None, base_ms + 120_000);
+    assert!(
+        stale_spd.is_none(),
+        "2-minute stale idle must not lock ~1.6 tok/s"
+    );
+
+    let mut confirm_stdin = stdin.clone();
+    confirm_stdin.tool_confirmation_pending = Some(true);
+    let (confirm_spd, _) = hud_core::probes::resolve_output_speed(
+        Some(&confirm_stdin),
+        &stale_tx,
+        None,
+        base_ms + 8_000,
+    );
+    assert!(confirm_spd.is_none());
 }

@@ -1,7 +1,7 @@
 use crate::ansi::sanitize_text;
 use crate::types::{
-    AgyStdinData, PlannerStepTiming, SubagentEntry, SubagentStatus, TodoItem, TodoStatus,
-    ToolEntry, ToolStatus, TranscriptSummary,
+    AgyStdinData, PlannerStepTiming, SpeedAnchorPoint, SubagentEntry, SubagentStatus, TodoItem,
+    TodoStatus, ToolEntry, ToolStatus, TranscriptSummary,
 };
 use serde::Deserialize;
 use serde_json::{Map, Value};
@@ -21,8 +21,43 @@ struct RawStep {
     status: Option<String>,
     created_at: Option<String>,
     output_tokens: Option<u64>,
+    thinking: Option<String>,
     content: Option<Value>,
     tool_calls: Option<Vec<RawToolCall>>,
+}
+
+fn estimate_json_value_bytes(val: &Value) -> usize {
+    match val {
+        Value::Null => 4,
+        Value::Bool(_) => 4,
+        Value::Number(_) => 8,
+        Value::String(s) => s.len(),
+        Value::Array(items) => items.iter().map(estimate_json_value_bytes).sum(),
+        Value::Object(map) => map
+            .iter()
+            .map(|(k, v)| k.len() + estimate_json_value_bytes(v))
+            .sum(),
+    }
+}
+
+fn estimate_step_tokens(step: &RawStep) -> u64 {
+    let mut bytes: usize = step.thinking.as_deref().map_or(0, str::len);
+    if let Some(Value::String(s)) = step.content.as_ref() {
+        bytes = bytes.saturating_add(s.len());
+    }
+    if let Some(tcs) = step.tool_calls.as_ref() {
+        for tc in tcs {
+            bytes = bytes.saturating_add(tc.name.as_deref().map_or(0, str::len));
+            if let Some(args) = tc.args.as_ref() {
+                for (k, v) in args {
+                    bytes = bytes
+                        .saturating_add(k.len())
+                        .saturating_add(estimate_json_value_bytes(v));
+                }
+            }
+        }
+    }
+    (bytes / 4) as u64
 }
 
 /// Antigravity `transcript.jsonl` often serializes tool argument values as JSON-encoded strings
@@ -357,7 +392,7 @@ fn has_nonzero_exit_code(content: &str) -> bool {
 }
 
 pub fn compute_tps_x10(output_tokens: u64, dt_ms: i64) -> Option<u32> {
-    if output_tokens < 20 || !(2_000..=180_000).contains(&dt_ms) {
+    if output_tokens < 20 || !(400..=180_000).contains(&dt_ms) {
         return None;
     }
     let tps = (output_tokens as f64) / ((dt_ms as f64) / 1000.0);
@@ -365,6 +400,108 @@ pub fn compute_tps_x10(output_tokens: u64, dt_ms: i64) -> Option<u32> {
         return None;
     }
     Some((tps * 10.0).round() as u32)
+}
+
+pub fn update_speed_anchors(
+    short: &mut Option<SpeedAnchorPoint>,
+    long: &mut Option<SpeedAnchorPoint>,
+    tokens: u64,
+    dt_ms: i64,
+) {
+    if !(40..=50_000).contains(&tokens) || !(1_000..=180_000).contains(&dt_ms) {
+        return;
+    }
+    if tokens <= 400 {
+        *short = Some(SpeedAnchorPoint { tokens, dt_ms });
+    } else if tokens >= 600 && long.is_none_or(|existing| tokens >= (existing.tokens * 3) / 4) {
+        *long = Some(SpeedAnchorPoint { tokens, dt_ms });
+    }
+}
+
+pub fn estimate_ttft_overhead_ms(
+    short: Option<SpeedAnchorPoint>,
+    long: Option<SpeedAnchorPoint>,
+) -> i64 {
+    let (Some(s), Some(l)) = (short, long) else {
+        return 0;
+    };
+    if s.tokens > 400
+        || l.tokens < 600
+        || l.tokens < s.tokens.saturating_mul(3)
+        || l.dt_ms <= s.dt_ms + 3_000
+    {
+        return 0;
+    }
+    let ms_per_tok = ((l.dt_ms - s.dt_ms) as f64) / ((l.tokens - s.tokens) as f64);
+    let implied_tps = 1000.0 / ms_per_tok;
+    if !(10.0..=400.0).contains(&implied_tps) {
+        return 0;
+    }
+    let overhead = ((s.dt_ms as f64) - (s.tokens as f64) * ms_per_tok).round() as i64;
+    if overhead < 800 {
+        0
+    } else {
+        overhead.clamp(0, 25_000)
+    }
+}
+
+pub fn adjust_coarse_dt_ms(raw_dt_ms: i64, overhead_ms: i64) -> i64 {
+    if overhead_ms <= 0 {
+        raw_dt_ms
+    } else {
+        (raw_dt_ms - overhead_ms)
+            .max((raw_dt_ms * 25) / 100)
+            .max(400)
+    }
+}
+
+pub fn blend_tps_ewma_x10(
+    prev_x10: Option<u32>,
+    sample_x10: u32,
+    output_tokens: u64,
+    ttft_stripped: bool,
+) -> u32 {
+    let Some(prev) = prev_x10.filter(|&p| (10..=5_000).contains(&p)) else {
+        return sample_x10;
+    };
+    let tok = output_tokens as f64;
+    let alpha = if ttft_stripped {
+        (tok / (tok + 120.0)).clamp(0.25, 0.90)
+    } else if output_tokens >= 1_200 && sample_x10 >= prev {
+        (tok / (tok + 400.0)).clamp(0.70, 0.92)
+    } else if output_tokens < 400 && sample_x10 < prev {
+        (tok / (tok + 1_800.0)).clamp(0.05, 0.18)
+    } else {
+        (tok / (tok + 900.0)).clamp(0.10, 0.85)
+    };
+    let blended = (prev as f64) * (1.0 - alpha) + (sample_x10 as f64) * alpha;
+    blended.round().clamp(10.0, 5_000.0) as u32
+}
+
+pub fn parse_subagent_status(raw: Option<&str>) -> SubagentStatus {
+    let Some(s) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return SubagentStatus::Completed;
+    };
+    if s.eq_ignore_ascii_case("running")
+        || s.eq_ignore_ascii_case("starting")
+        || s.eq_ignore_ascii_case("in_progress")
+    {
+        SubagentStatus::Running
+    } else if s.eq_ignore_ascii_case("blocked")
+        || s.eq_ignore_ascii_case("waiting")
+        || s.eq_ignore_ascii_case("paused")
+    {
+        SubagentStatus::Blocked
+    } else if s.eq_ignore_ascii_case("error")
+        || s.eq_ignore_ascii_case("failed")
+        || s.eq_ignore_ascii_case("cancelled")
+        || s.eq_ignore_ascii_case("canceled")
+        || s.eq_ignore_ascii_case("killed")
+    {
+        SubagentStatus::Error
+    } else {
+        SubagentStatus::Completed
+    }
 }
 
 /// Pure parser for Antigravity `transcript.jsonl` (head first-line + bounded tail lines) and `task.md`.
@@ -417,6 +554,8 @@ pub fn parse_transcript_and_tasks(
     let mut transcript_agents: Vec<SubagentEntry> = Vec::new();
     let mut active_slash_mode: Option<String> = None;
     let mut completed_step_tps_x10: Option<u32> = None;
+    let mut short_anchor: Option<SpeedAnchorPoint> = None;
+    let mut long_anchor: Option<SpeedAnchorPoint> = None;
     let mut latest_planner_step: Option<PlannerStepTiming> = None;
     let mut last_step_at: Option<i64> = None;
     let mut max_step_idx: usize = 0;
@@ -459,27 +598,61 @@ pub fn parse_transcript_and_tasks(
         }
 
         if step_type == "PLANNER_RESPONSE"
-            && let (Some(out_tok), Some(start_ms)) = (step.output_tokens.filter(|&t| t > 0), ts)
+            && let Some(start_ms) = ts
         {
-            let ended_at_ms = steps.get(i + 1).and_then(|next_step| {
-                if next_step.step_type.as_deref() == Some("GENERIC") {
-                    next_step.created_at.as_deref().and_then(parse_iso_ms)
-                } else {
-                    None
-                }
-            });
-            if let Some(end_ms) = ended_at_ms
-                && let Some(x10) = compute_tps_x10(out_tok, end_ms - start_ms)
+            let out_tok = step.output_tokens.unwrap_or(0);
+            let est_tok = estimate_step_tokens(step);
+            let is_running = step
+                .status
+                .as_deref()
+                .is_some_and(|s| s.eq_ignore_ascii_case("RUNNING"));
+            let is_done = !is_running
+                && (step
+                    .status
+                    .as_deref()
+                    .is_some_and(|s| s.eq_ignore_ascii_case("DONE"))
+                    || out_tok > 0);
+            let ended_at_ms = if is_done {
+                steps.get(i + 1).and_then(|next_step| {
+                    if next_step.step_type.as_deref() == Some("GENERIC") {
+                        next_step.created_at.as_deref().and_then(parse_iso_ms)
+                    } else {
+                        None
+                    }
+                })
+            } else {
+                None
+            };
+
+            if is_done
+                && out_tok > 0
+                && let Some(end_ms) = ended_at_ms
             {
-                completed_step_tps_x10 = Some(x10);
+                let raw_dt = end_ms - start_ms;
+                update_speed_anchors(&mut short_anchor, &mut long_anchor, out_tok, raw_dt);
+                let overhead_ms = estimate_ttft_overhead_ms(short_anchor, long_anchor);
+                let adj_dt = adjust_coarse_dt_ms(raw_dt, overhead_ms);
+                if let Some(sample_x10) = compute_tps_x10(out_tok, adj_dt) {
+                    completed_step_tps_x10 = Some(blend_tps_ewma_x10(
+                        completed_step_tps_x10,
+                        sample_x10,
+                        out_tok,
+                        false,
+                    ));
+                }
             }
-            latest_planner_step = Some(PlannerStepTiming {
-                step_index: step.step_index.unwrap_or(i),
-                output_tokens: out_tok,
-                started_at_ms: start_ms,
-                ended_at_ms,
-                has_trailing_user_input: false,
-            });
+
+            if !is_done || out_tok > 0 || est_tok > 0 {
+                latest_planner_step = Some(PlannerStepTiming {
+                    step_index: step.step_index.unwrap_or(i),
+                    output_tokens: out_tok,
+                    estimated_tokens: est_tok,
+                    started_at_ms: start_ms,
+                    ended_at_ms,
+                    has_trailing_user_input: false,
+                    is_done,
+                });
+            }
         }
 
         if step_type == "PLANNER_RESPONSE"
@@ -662,21 +835,28 @@ pub fn parse_transcript_and_tasks(
         && !live_agents.is_empty()
     {
         for (idx, sa) in live_agents.iter().enumerate() {
-            let matched = transcript_agents.get(idx);
-            let name = {
-                let candidate = sa
-                    .name
-                    .as_deref()
-                    .filter(|s| !s.trim().is_empty())
-                    .or_else(|| matched.map(|m| m.name.as_str()))
-                    .unwrap_or("subagent");
-                let clean = sanitize_text(candidate);
-                if clean.is_empty() {
-                    "subagent".to_string()
-                } else {
-                    clean
-                }
+            let live_clean_name = sa
+                .name
+                .as_deref()
+                .filter(|s| !s.trim().is_empty())
+                .map(sanitize_text)
+                .filter(|s| !s.is_empty());
+            let matched = match live_clean_name.as_deref() {
+                Some(target_name) => transcript_agents
+                    .get(idx)
+                    .filter(|m| m.name == target_name)
+                    .or_else(|| {
+                        transcript_agents
+                            .iter()
+                            .rev()
+                            .find(|m| m.name == target_name)
+                    })
+                    .or_else(|| transcript_agents.get(idx)),
+                None => transcript_agents.get(idx),
             };
+            let name = live_clean_name
+                .or_else(|| matched.map(|m| m.name.clone()))
+                .unwrap_or_else(|| "subagent".to_string());
             let role = sa
                 .role
                 .as_deref()
@@ -684,15 +864,18 @@ pub fn parse_transcript_and_tasks(
                 .map(sanitize_text)
                 .filter(|s| !s.is_empty())
                 .or_else(|| matched.and_then(|m| m.role.clone()));
+            let model = sa
+                .model
+                .as_deref()
+                .filter(|s| !s.trim().is_empty())
+                .map(sanitize_text)
+                .filter(|s| !s.is_empty())
+                .or_else(|| matched.and_then(|m| m.model.clone()));
             merged_subagents.push(SubagentEntry {
                 name,
                 role,
-                model: matched.and_then(|m| m.model.clone()),
-                status: if sa.status.as_deref() == Some("running") {
-                    SubagentStatus::Running
-                } else {
-                    SubagentStatus::Completed
-                },
+                model,
+                status: parse_subagent_status(sa.status.as_deref()),
                 started_at: matched.and_then(|m| m.started_at),
                 ended_at: matched.and_then(|m| m.ended_at),
             });
@@ -710,6 +893,9 @@ pub fn parse_transcript_and_tasks(
         todos,
         active_slash_mode,
         completed_step_tps_x10,
+        resolved_tps_x10: None,
+        short_anchor,
+        long_anchor,
         latest_planner_step,
         session_started_at,
         last_step_at,
@@ -807,6 +993,7 @@ mod tests {
                 name: Some("research".to_string()),
                 role: Some("Spec Reader".to_string()),
                 status: Some("running".to_string()),
+                model: None,
             }]),
             ..Default::default()
         };

@@ -149,12 +149,8 @@ fn detect_installed_plugin(paths: &AgyPaths) -> (String, Option<InstalledPluginF
     }
 
     // Fast filesystem check under `~/.gemini/config/plugins/agy-hud/plugin.json`
-    let default_plugin_dir = paths
-        .home
-        .join(".gemini")
-        .join("config")
-        .join("plugins")
-        .join("agy-hud");
+    let gemini_cfg_dir = paths.home.join(".gemini").join("config");
+    let default_plugin_dir = gemini_cfg_dir.join("plugins").join("agy-hud");
     let manifest = default_plugin_dir.join("plugin.json");
     if let Some(raw) = read_bounded_string(&manifest, 32 * 1024)
         && let Ok(val) = serde_json::from_str::<Value>(&raw)
@@ -164,6 +160,14 @@ fn detect_installed_plugin(paths: &AgyPaths) -> (String, Option<InstalledPluginF
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string();
+        let enabled = read_bounded_string(&gemini_cfg_dir.join("config.json"), 64 * 1024)
+            .and_then(|cfg_raw| serde_json::from_str::<Value>(&cfg_raw).ok())
+            .and_then(|cfg_val| {
+                cfg_val
+                    .pointer("/plugins/agy-hud/enabled")
+                    .and_then(Value::as_bool)
+            })
+            .unwrap_or(true);
         return (
             "installed".to_string(),
             Some(InstalledPluginFacts {
@@ -171,7 +175,7 @@ fn detect_installed_plugin(paths: &AgyPaths) -> (String, Option<InstalledPluginF
                 path: canonical_or_parent(&default_plugin_dir)
                     .to_string_lossy()
                     .into_owned(),
-                enabled: true,
+                enabled,
             }),
         );
     }

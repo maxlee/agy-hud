@@ -319,6 +319,7 @@ fn sharded_vcs_cache_isolates_workspaces_and_invalidates_on_mtime_stdin_flip_and
         vcs_type: Some("git".to_string()),
         branch: Some("main".to_string()),
         dirty: Some(true),
+        client: None,
     };
     let _ = probe_vcs_cached(&repo_a, &paths, 1500, Some(&dirty_stdin), t0 + 450, &runner).unwrap();
     assert_eq!(spawns.load(Ordering::SeqCst), 4);
@@ -1241,4 +1242,62 @@ fn marketplace_plugin_router_runs_bundled_binary_and_sha256_bootstrap_fallback()
     );
     assert!(fresh_hud.join("bin/agy-hud").is_file());
     assert!(String::from_utf8_lossy(&bootstrap_out.stdout).contains("rust-native"));
+}
+
+#[test]
+fn doctor_detects_disabled_plugin_in_gemini_config_json() {
+    let tmp = TempDir::new("doctor-disabled-plugin");
+    let fake_home = tmp.path.join("home");
+    let gemini_cfg_dir = fake_home.join(".gemini/config");
+    let plugin_dir = gemini_cfg_dir.join("plugins/agy-hud");
+    fs::create_dir_all(&plugin_dir).unwrap();
+    fs::write(
+        plugin_dir.join("plugin.json"),
+        serde_json::to_string_pretty(&json!({
+            "name": "agy-hud",
+            "version": env!("CARGO_PKG_VERSION")
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        gemini_cfg_dir.join("config.json"),
+        serde_json::to_string_pretty(&json!({
+            "plugins": {
+                "agy-hud": {
+                    "enabled": false
+                }
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let cli_dir = fake_home.join(".gemini/antigravity-cli");
+    let hud_home = cli_dir.join("agy-hud");
+    fs::create_dir_all(&cli_dir).unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_agy-hud"))
+        .arg("doctor")
+        .env("HOME", &fake_home)
+        .env("USERPROFILE", &fake_home)
+        .env("AGY_CLI_DIR", &cli_dir)
+        .env("AGY_HUD_HOME", &hud_home)
+        .env_remove("AGY_HUD_PLUGIN_LIST_JSON")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let doc: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(doc["installedPlugin"]["details"]["enabled"], false);
+    let findings = doc["findings"]
+        .as_array()
+        .expect("doctor findings array")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        findings.contains("Installed agy-hud plugin is disabled"),
+        "expected disabled plugin finding, got: {findings}"
+    );
 }

@@ -775,15 +775,20 @@ fn render_subagents_line(
         .iter()
         .take(4)
         .map(|ag| {
-            let running = ag.status == SubagentStatus::Running;
-            let icon = if running {
-                paint(if ascii { "~" } else { "◐" }, &[colors::CYAN, BOLD])
-            } else {
-                paint(if ascii { "+" } else { "✓" }, &[colors::GREEN])
+            let active = matches!(ag.status, SubagentStatus::Running | SubagentStatus::Blocked);
+            let icon = match ag.status {
+                SubagentStatus::Running => {
+                    paint(if ascii { "~" } else { "◐" }, &[colors::CYAN, BOLD])
+                }
+                SubagentStatus::Blocked => {
+                    paint(if ascii { "!" } else { "◷" }, &[colors::YELLOW, BOLD])
+                }
+                SubagentStatus::Error => paint(if ascii { "x" } else { "✗" }, &[colors::RED, BOLD]),
+                SubagentStatus::Completed => paint(if ascii { "+" } else { "✓" }, &[colors::GREEN]),
             };
             let title = match ag.role.as_deref() {
                 Some(role) if !role.is_empty() => {
-                    let styled_role = if running {
+                    let styled_role = if active {
                         paint(role, &[BOLD])
                     } else {
                         role.to_string()
@@ -791,7 +796,7 @@ fn render_subagents_line(
                     format!("{styled_role} {}", paint(&format!("[{}]", ag.name), &[DIM]))
                 }
                 _ => {
-                    if running {
+                    if active {
                         paint(&ag.name, &[BOLD])
                     } else {
                         ag.name.clone()
@@ -1222,7 +1227,7 @@ pub fn render_hud_lines(input: RenderInput<'_>) -> Vec<String> {
         show_speed: config.display.show_speed && layout_mode != LineLayout::Compact,
         show_vcs_extras: true,
         show_folder: config.display.show_project,
-        show_vcs: config.display.show_project,
+        show_vcs: config.vcs.enabled,
         show_mode: config.display.show_mode,
     };
 

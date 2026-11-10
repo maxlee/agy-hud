@@ -565,7 +565,7 @@ fn sample_presets(now_ms: i64) -> HashMap<&'static str, SamplePreset> {
             display_name: Some("Gemini 4 Argon (Medium)".to_string()),
             effort: Some("medium".to_string()),
         }),
-        version: Some("1.5.3".to_string()),
+        version: Some("1.5.4".to_string()),
         product: Some("antigravity".to_string()),
         context_window: Some(ContextWindowStdin {
             total_input_tokens: Some(142_800),
@@ -586,6 +586,7 @@ fn sample_presets(now_ms: i64) -> HashMap<&'static str, SamplePreset> {
         cycle_mode: Some("auto".to_string()),
         sandbox: Some(SandboxStdin {
             enabled: Some(true),
+            allow_network: None,
         }),
         artifact_count: Some(2),
         plan_tier: Some("Pro".to_string()),
@@ -673,6 +674,9 @@ fn sample_presets(now_ms: i64) -> HashMap<&'static str, SamplePreset> {
         step_count: 24,
         active_slash_mode: None,
         completed_step_tps_x10: Some(640),
+        resolved_tps_x10: None,
+        short_anchor: None,
+        long_anchor: None,
         latest_planner_step: None,
     };
 
@@ -733,11 +737,13 @@ fn sample_presets(now_ms: i64) -> HashMap<&'static str, SamplePreset> {
             name: Some("research".to_string()),
             role: Some("CLI Docs Researcher".to_string()),
             status: Some("running".to_string()),
+            model: None,
         },
         SubagentStdin {
             name: Some("self".to_string()),
             role: Some("Security Auditor".to_string()),
             status: Some("completed".to_string()),
+            model: None,
         },
     ]);
     presets.insert(
@@ -1084,6 +1090,11 @@ fn scrub_stdin(stdin: Option<&AgyStdinData>) -> Option<AgyStdinData> {
             current_dir: Some("/redacted/project".to_string()),
             project_dir: Some("/redacted/project".to_string()),
         });
+    }
+    if let Some(ref mut vcs) = out.vcs
+        && vcs.client.is_some()
+    {
+        vcs.client = Some("<redacted-client>".to_string());
     }
     out.extra.clear();
     Some(out)

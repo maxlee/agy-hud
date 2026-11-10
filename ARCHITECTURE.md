@@ -1,4 +1,4 @@
-# `agy-hud` v1.3.1 — 100% Pure Rust Single-Engine Architecture
+# `agy-hud` v1.4.0 — 100% Pure Rust Single-Engine Architecture
 
 `agy-hud` is a **100% Pure Rust** native statusLine HUD for the Google Antigravity CLI (`agy`). There is **zero Node.js / TypeScript runtime or wrapper code** in the repository.
 
@@ -15,7 +15,7 @@ Instead of spawning a second runtime VM per render, `agy-hud` enforces capabilit
    - Strictly forbidden from referencing `std::fs`, `std::process`, `std::net`, `std::env`, or `std::os`.
    - Owns all untrusted JSON/JSONL/Markdown parsing (`stdin.rs`, `transcript.rs`, `probes.rs`), `CONFIG_SCHEMA` validation (`config.rs`), multi-layout CJK-aware rendering (`render.rs`), CLI subcommand logic (`commands.rs`), and the `terminal_filter` output escape firewall (`ansi.rs`).
 2. **`crates/hud-cli` (Thin Capability Binary — `#![forbid(unsafe_code)]`)**
-   - Owns non-blocking early-exit `stdin` JSON reading (`1000 ms` open-pipe guard, `256 KB` cap, `AGY_HUD_NESTED=1` fast inert exit), bounded `O(1)` `transcript.jsonl` reading (`8 KB` head + `256 KB` tail), symlink-swept `<hudHome>/data` management, `std::thread::scope` parallel probe execution, and opt-in isolated `/usage` quota refresh (`quota_refresh.rs`).
+   - Owns non-blocking early-exit `stdin` JSON reading (`1000 ms` open-pipe guard, `256 KB` cap, `AGY_HUD_NESTED=1` fast inert exit), bounded `O(1)` `transcript.jsonl` reading (`32 KB` head + `512 KB` tail), symlink-swept `<hudHome>/data` management, `std::thread::scope` parallel probe execution, and opt-in isolated `/usage` quota refresh (`quota_refresh.rs`).
    - Executes strictly read-only, shell-free, `1200 ms` timeout-bounded `git`, `jj`, `hg`, and `vm_stat` probes:
      - **Git**: Enforces `-c protocol.allow=never`, `-c core.fsmonitor=false`, `--no-optional-locks`, `--ignore-submodules=dirty`, `GIT_NO_LAZY_FETCH=1`, parses `.git/config` in memory to dynamically neutralize any repo-local `[filter "<name>"]` drivers (`-c filter.<name>.clean=`, `smudge=`, `process=`, `required=false`), AND falls back to zero-subprocess `.git/HEAD` parsing (including linked worktrees) if `git` is absent or exceeds `1200 ms`.
      - **Jujutsu (`jj`)**: Enforces `--ignore-working-copy --at-operation=@ --no-pager` so background renders never snapshot or mutate the working copy.
@@ -59,8 +59,8 @@ flowchart TD
 
 1. `agy` CLI pipes live session JSON to `agy-hud` over `stdin` (throttled to at most once every `300 ms`).
 2. `crates/hud-cli` reads `stdin` (`<= 256 KB`) and `config.json` (`<= 64 KB`), then enters `std::thread::scope`:
-   - **Worker 1**: Seeks `transcript.jsonl` (`0..8 KB` for `session_started_at` + `len-256 KB..len` for recent `tool_calls`, skills, MCP servers, and subagents) and reads `<brain>/<id>/task.md`.
+   - **Worker 1**: Seeks `transcript.jsonl` (`0..32 KB` for `session_started_at` + `len-512 KB..len` for recent `tool_calls`, skills, MCP servers, and subagents) and reads `<brain>/<id>/task.md`.
    - **Worker 2**: Computes `O(1)` VCS metadata stat signature and checks `<hudHome>/probe-cache/<fnv64>.json`; on warm hit (`0` child spawns), returns cached VCS JSON in `< 0.1 ms`; on cold miss, runs hardened read-only `git` / `jj` / `hg` probe.
    - **Worker 3**: (Optional when `display.showMemory = true`) Reads `/proc/meminfo` (Linux) or `sysctl` + `vm_stat` (macOS).
-3. `hud_core::render::render_hud_lines` formats 1–5 ANSI status lines tailored to `terminal_width` (`>= 132` single-line idle, `76..131` box-railed expanded, `< 76` auto-compact), clamping CJK 2-column boundaries and closing any open `file://` OSC 8 hyperlink.
+3. `hud_core::render::render_hud_lines` formats 1–5 ANSI status lines tailored to `terminal_width` (`>= 180` single-line idle, `76..179` box-railed expanded, `< 76` auto-compact), clamping CJK 2-column boundaries and closing any open `file://` OSC 8 hyperlink.
 4. `hud_core::ansi::terminal_filter` strips any non-SGR / non-`file://` escape or bidi control character before `stdout` flush.

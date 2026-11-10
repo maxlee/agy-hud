@@ -191,12 +191,16 @@ pub struct VcsStdin {
     pub branch: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dirty: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SandboxStdin {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allow_network: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -207,6 +211,16 @@ pub struct SubagentStdin {
     pub role: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BattleStdin {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub focused_arm: Option<i64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -282,6 +296,8 @@ pub struct AgyStdinData {
     pub vim: Option<VimStdin>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cost: Option<CostStdin>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub battle: Option<BattleStdin>,
     #[serde(flatten, skip_serializing_if = "BTreeMap::is_empty", default)]
     pub extra: BTreeMap<String, serde_json::Value>,
 }
@@ -309,6 +325,8 @@ pub struct ToolEntry {
 #[serde(rename_all = "lowercase")]
 pub enum SubagentStatus {
     Running,
+    Blocked,
+    Error,
     Completed,
 }
 
@@ -336,16 +354,45 @@ pub struct TodoItem {
     pub status: TodoStatus,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SpeedAnchorPoint {
+    pub tokens: u64,
+    pub dt_ms: i64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActiveSpeedSample {
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub step_index: Option<usize>,
+    pub turn_started_at_ms: i64,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub decode_started_at_ms: Option<i64>,
+    #[serde(default)]
+    pub first_est_tokens: u64,
+    #[serde(default)]
+    pub peak_est_tokens: u64,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub live_tps_x10: Option<u32>,
+    #[serde(default)]
+    pub confirm_seen: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PlannerStepTiming {
     pub step_index: usize,
     pub output_tokens: u64,
+    #[serde(default)]
+    pub estimated_tokens: u64,
     pub started_at_ms: i64,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub ended_at_ms: Option<i64>,
     #[serde(default)]
     pub has_trailing_user_input: bool,
+    #[serde(default)]
+    pub is_done: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -360,6 +407,12 @@ pub struct TranscriptSummary {
     pub active_slash_mode: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub completed_step_tps_x10: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub resolved_tps_x10: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub short_anchor: Option<SpeedAnchorPoint>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub long_anchor: Option<SpeedAnchorPoint>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub latest_planner_step: Option<PlannerStepTiming>,
     pub session_started_at: Option<i64>,
@@ -458,11 +511,21 @@ pub struct UpdateCacheSnapshot {
 #[serde(rename_all = "camelCase")]
 pub struct SpeedCacheSnapshot {
     pub session_key: String,
+    #[serde(default)]
+    pub model_key: String,
     pub step_index: usize,
     pub output_tokens: u64,
     pub started_at_ms: i64,
     pub ended_at_ms: i64,
     pub tps_x10: u32,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub ewma_tps_x10: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub short_anchor: Option<SpeedAnchorPoint>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub long_anchor: Option<SpeedAnchorPoint>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub active: Option<ActiveSpeedSample>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

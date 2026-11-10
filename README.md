@@ -1,74 +1,124 @@
-# AGY HUD (`agy-hud`) v1.3.1 — 100% Pure Rust Edition
+<div align="center">
+
+<img src="assets/logo.svg" alt="AGY HUD Logo" width="88" height="88" />
+
+# AGY HUD (`agy-hud`)
+
+**Ultra-fast, zero-dependency, 100% Pure Rust real-time statusline HUD for Google Antigravity CLI (`agy`)**
 
 [![CI](https://github.com/maxlee/agy-hud/actions/workflows/ci.yml/badge.svg)](https://github.com/maxlee/agy-hud/actions/workflows/ci.yml)
-[![Release](https://github.com/maxlee/agy-hud/actions/workflows/release.yml/badge.svg)](https://github.com/maxlee/agy-hud/releases)
+[![Release](https://github.com/maxlee/agy-hud/actions/workflows/release.yml/badge.svg)](https://github.com/maxlee/agy-hud/releases/latest)
+[![Rust 2024](https://img.shields.io/badge/Rust-2024_Edition-orange.svg)](ARCHITECTURE.md)
+[![Unsafe Forbidden](https://img.shields.io/badge/unsafe-forbidden-brightgreen.svg)](ARCHITECTURE.md)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-Ultra-fast, native **100% Pure Rust** real-time heads-up display (HUD) plugin for **Google Antigravity CLI (`agy`)**, inspired by [`jarrodwatts/claude-hud`](https://github.com/jarrodwatts/claude-hud).
+[**English**](README.md) · [**简体中文**](README.zh-CN.md) · [**Quick Install**](#-installation) · [**Features**](#-highlights) · [**CLI & Config**](#️-cli--configuration) · [**Architecture**](ARCHITECTURE.md) · [**Releases**](https://github.com/maxlee/agy-hud/releases)
 
-Displays live agent state, execution mode (`PLAN` / `AUTO` / `ACCEPT` + Vim mode), model & reasoning effort, workspace + multi-VCS status (`git` + worktrees, Jujutsu `jj` bookmarks/change-IDs/conflicts, Mercurial `hg`), fine-grained context window bar, prompt cache hit rate, quota buckets & reset timers, active tools, running subagents, and `task.md` checklist progress right below your CLI prompt — with **~3 ms internal execution time** (`~11–14 ms` end-to-end process wall-clock) and **zero Node.js dependencies**.
+</div>
 
-> 🌐 English | [简体中文文档](README.zh-CN.md) | [Architecture](ARCHITECTURE.md) | [Releases](https://github.com/maxlee/agy-hud/releases)
+---
 
-## Preview
+**AGY HUD** renders a live, theme-adaptive heads-up display directly beneath your **Antigravity CLI (`agy`)** prompt — surfacing agent state, execution mode, model & reasoning effort, TTFT-stripped token throughput (`~tok/s`), multi-VCS workspace status (`git`, `jj`, `hg`), context window pressure, prompt cache hit rate, quota pace, active tools, subagents, and `task.md` checklist progress in **~1–3 ms** warm execution time with **zero Node.js or runtime VM dependencies**.
+
+> Inspired by [`jarrodwatts/claude-hud`](https://github.com/jarrodwatts/claude-hud) and purpose-engineered from the ground up in safe Rust (`#![forbid(unsafe_code)]`) for the Antigravity CLI plugin & `statusLine` ecosystem.
+
+---
+
+## 📸 Live Preview
+
+### Standard Multi-Row Expanded Layout (`76–179` cols)
 
 ```text
-╭─ 🔧 TOOL │ [AUTO] │ [Gemini 4 Argon · med] Pro · ~64 tok/s │ agy-hud git:(feat/rust-hud* ↑2) │ ⏱ 12m
+╭─ 🔧 TOOL │ [AUTO] │ [Gemini 4 Argon · med] Pro · ~118 tok/s │ agy-hud git:(feat/rust-hud* ↑2) │ ⏱ 12m
 ├─ Ctx ██░····· 28.4% (152k/1.0M) · ⚡ 75% Cache │ ~$0.38 · agents 1/2 · tasks 1 · art 2 · 🛡 Sandbox ON
 ├─ Quota(weekly) ▓···· 16% (4d 18h)
 ├─ ◐ run_command: Cargo test execution · ✓ edit_file ×2: render.rs · ✓ read_file ×5: SKILL.md
 ├─ Skills: hud, agy-customizations │ MCP: context7
-├─ ◐ CLI Docs Researcher [research] (1m 15s) │ ✓ Security Auditor [self] (1m)
+├─ ◐ CLI Docs Researcher [research] (1m 15s) │ ◷ Waiter [self] (20s) │ ✓ Security Auditor [self] (1m)
 ╰─ ▸ Verify compile-time arch_guard boundaries (2/4 · 50%)
 ```
 
-## Requirements
+### Ultra-Wide Single-Line Idle (`>= 180` cols) & Narrow Auto-Compact (`< 76` cols)
 
-- **Antigravity CLI (`agy`)** v1.4.5+
-- **Zero Rust / Node.js / npm required** when installing prebuilt binaries via `install.sh` or [GitHub Releases](https://github.com/maxlee/agy-hud/releases) (`rustc` 1.85+ only needed if building from source)
+```text
+# Ultra-wide terminal (>= 180 cols, idle) — collapses cleanly into one crisp line:
+✓ IDLE │ [AUTO] │ [Gemini 4 Argon · med] Pro · ~118 tok/s │ agy-hud git:(main) │ ⏱ 5m │ Ctx ██░····· 28.4% (152k/1.0M) · ⚡ 75% Cache │ Quota(weekly) ▓···· 16% (4d 18h)
 
-## Quick Install
+# Narrow split pane (< 76 cols, high context) — progressive degradation without wrapping:
+⚡ WORK │ [AUTO] │ [Argon · M] │ agy-hud git:(main*)
+Ctx ███████░ 89.6% !200k │ Quota(weekly) 92% (1h 30m)
+◐ run_command: Cargo test execution
+```
 
-### Option A: Antigravity Marketplace or `agy plugin install` (Recommended)
+### HUD Anatomy
 
-1. **In Antigravity App**: Open **Customizations > Marketplace**, search for **AGY HUD**, click **Add**, then click the **"Set up the HUD status line in Antigravity CLI"** starter prompt chip on the plugin card.
+| Row / Segment | What It Shows | Key Config Toggle |
+| :--- | :--- | :--- |
+| **State & Mode** | Live `IDLE` / `WORK` / `TOOL` / `CONFIRM` state, `[PLAN]` / `[AUTO]` / `[ACCEPT]` cycle mode (plus `/plan` detection & `VIM` mode badge) | `display.showState`, `display.showMode` |
+| **Model, Tier & Speed** | Compact model name, reasoning effort (`low`/`med`/`high`), normalized plan tier (`Pro`/`Ultra`), and TTFT-stripped `~tok/s` decode rate | `display.showModel`, `display.showPlanTier`, `display.showSpeed` |
+| **Workspace & VCS** | Clickable `file://` OSC 8 project path + `git` (worktrees, dirty, ahead/behind, file stats), `jj` (bookmarks, `@change_id`, conflicts), or `hg` | `display.showProject`, `vcs.enabled`, `vcs.showFileStats` |
+| **Context & Meta** | Fine-grained 8th-block Unicode context bar, `!200k` alert, prompt `Cache` hit %, session cost, subagent/task/artifact counts, Sandbox badge | `display.showContextBar`, `display.showCacheHitRate`, `display.showCost` |
+| **Quota Pace** | Model-routed quota buckets (`5h` / `weekly`), used or remaining percentage bar, and human-readable reset countdown | `display.showQuota`, `display.quotaValue`, `quota.backgroundRefresh` |
+| **Activity Rows** | Folded tool invocations (`×N` deduplication), active `Skills` & `MCP` servers (with `!` error alerts), `Subagents` (`◐`/`◷`/`✗`/`✓`), and `task.md` progress | `display.showTools`, `display.showSkillsAndMcp`, `display.showSubagents`, `display.showTodos` |
+
+---
+
+## ✨ Highlights
+
+- **⚡ Native ~1–3 ms Warm Execution**: Single LTO-optimized binary (`~930 KB`), zero VM startup overhead, `std::thread::scope` parallel probes, and bounded `O(1)` `transcript.jsonl` head (`32 KB`) + tail (`512 KB`) seeking.
+- **🎯 Hybrid TTFT-Stripped `~tok/s` Engine (`v1.4.0`)**: Tracks `agy`'s `300 ms` `statusLine` ticks to separate `thinking`/prefill latency (`TTFT`) and post-decode tool execution time from pure streaming decode throughput, reinforced by 2-point slope calibration and per-model Token-Weighted EWMA.
+- **🎨 Theme-Safe & CJK/Emoji-Aware Rendering**: Emits zero hardcoded white (`37m`/`97m`) or gray (`90m`) foreground codes so text stays legible on both Dark and Solarized Light terminals. Respects East Asian 2-column widths, ZWJ emoji clusters, OSC 8 hyperlink closure, and 3 glyph sets (`unicode`, `nerd`, `ascii`).
+- **🌿 First-Class `git`, `jj` & `hg` Support**: Automatically detects colocated Jujutsu (`jj`), nested Git worktrees (with zero-subprocess `.git/HEAD` fallback on timeout), Mercurial (`hg`), and CitC client workspaces, backed by per-workspace FNV-1a sharded `mtime` caches.
+- **🔄 Built-in Verified Self-Update**: Non-blocking 6-hour release check surfaces a subtle header badge (`↑ vX.Y.Z · /agy-hud:hud-update`) and upgrades in one SHA-256-verified step while preserving `--stack` and user `config.json`.
+- **🌏 Native Bilingual UI**: Switch effortlessly between English (`en`) and Simplified Chinese (`zh-Hans`).
+
+---
+
+## 📦 Installation
+
+### Requirements
+
+- **Antigravity CLI (`agy`)** `v1.4.5+` (fully aligned with `v1.5.4+` schemas)
+- **Zero Rust / Node.js / npm required** for Marketplace or prebuilt installations (`rustc 1.85+` only if compiling from source)
+
+### Method 1: Antigravity Marketplace or `agy plugin install` (Recommended)
+
+1. **In Antigravity Desktop**: Open **Customizations → Marketplace**, search for **AGY HUD**, click **Add**, then click the **"Set up the HUD status line in Antigravity CLI"** starter prompt chip.
 2. **Or via `agy` CLI**:
    ```bash
    agy plugin install agy-hud
-   # Or install directly from GitHub anytime:
+   # Or install directly from GitHub:
    agy plugin install https://github.com/maxlee/agy-hud
    ```
-   Then launch `agy` and run `/agy-hud:hud` (if `agy` was already running, run `/skills reload` first) to activate the `statusLine` in `settings.json`.
+   Launch `agy` and run `/agy-hud:hud` to activate the status line in `~/.gemini/antigravity-cli/settings.json` *(if `agy` was already open, run `/skills reload` first)*.
 
-### Option B: One-Line Prebuilt Binary + Plugin Script
+### Method 2: One-Line SHA-256 Verified Installer (macOS & Linux)
 
-Automatically detects your OS (`macOS` Apple Silicon / Intel, `Linux` x64 / ARM64), verifies the SHA-256 checksum against `SHA256SUMS`, registers the `/agy-hud:hud` & `/agy-hud:hud-update` plugin skills, deploys the native binary to `~/.gemini/antigravity-cli/agy-hud/bin/agy-hud`, and configures `settings.json` in one step:
+Detects your OS/CPU (`darwin-arm64`, `darwin-x64`, `linux-x64`, `linux-arm64`), verifies the archive against `SHA256SUMS`, registers `/agy-hud:hud` & `/agy-hud:hud-update`, deploys `~/.gemini/antigravity-cli/agy-hud/bin/agy-hud`, and atomically updates `settings.json`:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/maxlee/agy-hud/main/install.sh | sh
 ```
 
-Need to stack below the built-in status line or replace an existing custom `statusLine`? Pass flags via `sh -s --`:
+Want to stack **below** Antigravity's built-in status bar instead of replacing it?
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/maxlee/agy-hud/main/install.sh | sh -s -- --stack
 ```
 
-Inside `agy` CLI, run `/agy-hud:hud` anytime to customize layouts, language, or elements interactively, `/agy-hud:hud-update` to check and upgrade to the latest verified GitHub release in one step, or `/statusline` to toggle the bar on/off.
+### Method 3: Prebuilt Release Archives (macOS / Linux / Windows)
 
-### Option C: Prebuilt Release Archives (macOS / Linux / Windows)
+Download prebuilt binaries and `SHA256SUMS` from [**GitHub Releases**](https://github.com/maxlee/agy-hud/releases/latest):
 
-Download the archive for your platform from [**GitHub Releases**](https://github.com/maxlee/agy-hud/releases/latest):
+| Platform | Archive | Rust Target Triple | Notes |
+| :--- | :--- | :--- | :--- |
+| **macOS (Apple Silicon)** | `agy-hud-darwin-arm64.tar.gz` | `aarch64-apple-darwin` | Native M1 / M2 / M3 / M4 |
+| **macOS (Intel)** | `agy-hud-darwin-x64.tar.gz` | `x86_64-apple-darwin` | Native x86_64 |
+| **Linux (x64)** | `agy-hud-linux-x64.tar.gz` | `x86_64-unknown-linux-musl` | Fully static `musl` (zero `glibc` issues) |
+| **Linux (ARM64)** | `agy-hud-linux-arm64.tar.gz` | `aarch64-unknown-linux-musl` | Fully static `musl` |
+| **Windows (x64)** | `agy-hud-windows-x64.zip` | `x86_64-pc-windows-msvc` | Native `agy-hud.exe` (quote-safe path handling) |
 
-| Platform | Archive | Target Triple |
-| :--- | :--- | :--- |
-| macOS (Apple Silicon) | `agy-hud-darwin-arm64.tar.gz` | `aarch64-apple-darwin` |
-| macOS (Intel) | `agy-hud-darwin-x64.tar.gz` | `x86_64-apple-darwin` |
-| Linux (x64, static musl) | `agy-hud-linux-x64.tar.gz` | `x86_64-unknown-linux-musl` |
-| Linux (ARM64, static musl) | `agy-hud-linux-arm64.tar.gz` | `aarch64-unknown-linux-musl` |
-| Windows (x64) | `agy-hud-windows-x64.zip` | `x86_64-pc-windows-msvc` |
-
-### Option D: Build from Source (`git clone` + `cargo`)
+### Method 4: Build from Source
 
 ```bash
 git clone https://github.com/maxlee/agy-hud.git
@@ -78,67 +128,116 @@ agy plugin install .
 ./target/release/agy-hud install
 ```
 
-## CLI Subcommands
+---
 
-Once installed (`~/.gemini/antigravity-cli/agy-hud/bin/agy-hud` or `./scripts/agy-hud` inside a checkout):
+## 🛠️ CLI & Configuration
+
+### In-Session Slash Commands (inside `agy`)
+
+| Command | Description |
+| :--- | :--- |
+| `/agy-hud:hud` | Interactively install, diagnose, preview, or customize layout, language, and badges in natural language |
+| `/agy-hud:hud-update` | Check GitHub Releases and perform a SHA-256-verified binary + plugin self-upgrade in one step |
+| `/statusline` | Built-in `agy` command to toggle the status bar on or off |
+
+### Native CLI Subcommands
+
+Invoke via `~/.gemini/antigravity-cli/agy-hud/bin/agy-hud` (or `./scripts/agy-hud` inside a checkout):
+
+| Subcommand | Purpose |
+| :--- | :--- |
+| `install [--stack] [--replace]` | Deploy native binary and configure `statusLine` in `settings.json` (creates timestamped backup) |
+| `uninstall [--plugin] [--keep-config]` | Remove `statusLine`, clean backups & HUD directory, and restore official `agy` default |
+| `doctor [--pretty]` | Inspect runtime, plugin enablement, `statusLine` wiring, config validity, and glyph alignment |
+| `preview [--state <name>] [--last] [--set k=v]` | Render `showcase`, `idle`, `tool_use`, `confirm`, `high-context`, inline JSON, or last live snapshot |
+| `schema [query]` | Browse all **43** validated configuration keys, types, defaults, and descriptions |
+| `set <key>=<value> ...` / `set --undo` | Atomically update `~/.gemini/antigravity-cli/agy-hud/config.json` or revert the previous change |
+| `update [--check] [--force]` | Check for or apply the latest SHA-256-verified release from GitHub |
+| `quota refresh` | Run an isolated one-shot `agy -p /usage` sync to reconcile local quota cache |
+| `report [--note "..."]` | Export a privacy-scrubbed diagnostic JSON bundle (redacts paths, IDs, titles, emails, VCS clients) |
+
+### Common Customization Recipes
 
 ```bash
-./scripts/agy-hud doctor                                    # JSON health check (runtime, plugin, statusLine, config)
-./scripts/agy-hud doctor --pretty                           # Human-readable diagnostics (~ paths + glyph alignment probe)
-./scripts/agy-hud preview --state showcase                  # Preview all 5 layout/language scenarios
-./scripts/agy-hud preview --set language=zh-Hans            # Preview Simplified Chinese UI
-./scripts/agy-hud schema                                    # List all 43 configurable keys and types
-./scripts/agy-hud update --check                            # Check GitHub Releases for a newer version
-./scripts/agy-hud update                                    # SHA-256 verified self-upgrade (preserves --stack & config)
-./scripts/agy-hud set updates.enabled=false                 # Optional: disable 6h background update check & badge
-./scripts/agy-hud set display.glyphMode=nerd                # Switch glyph set: unicode | nerd | ascii
-./scripts/agy-hud set display.showPlanTier=false            # Optional: hide normalized subscription tier badge (Pro/Ultra)
-./scripts/agy-hud set display.showSpeed=false               # Optional: hide estimated output throughput (~tok/s) badge
-./scripts/agy-hud set display.showTitle=true                # Show sanitized conversation title (<=24 cols)
-./scripts/agy-hud set quota.backgroundRefresh=true          # Optional background `agy -p /usage` refresh (default: false)
-./scripts/agy-hud quota refresh                             # Manually refresh official `/usage` quota cache once
-./scripts/agy-hud set language=zh-Hans vcs.showFileStats=true
-./scripts/agy-hud set vcs.cacheTtlMs=1500                   # Tune sharded VCS mtime+TTL cache window (0 disables)
-./scripts/agy-hud set --undo                                # Revert the previous config change
-./scripts/agy-hud report --note "Describe issue"            # Generate privacy-scrubbed bug report JSON
-./scripts/agy-hud uninstall                                 # Cleanly remove HUD, plugin & files; restore official default
+# Preview all 5 responsive layout & language presets
+~/.gemini/antigravity-cli/agy-hud/bin/agy-hud preview --state showcase
+
+# Switch UI to Simplified Chinese and enable +/- VCS file stats
+~/.gemini/antigravity-cli/agy-hud/bin/agy-hud set language=zh-Hans vcs.showFileStats=true
+
+# Switch glyph mode: unicode (default) | nerd (Nerd Fonts) | ascii (strict 7-bit)
+~/.gemini/antigravity-cli/agy-hud/bin/agy-hud set display.glyphMode=nerd
+
+# Customize header badges (conversation title, plan tier, ~tok/s throughput, project folder)
+~/.gemini/antigravity-cli/agy-hud/bin/agy-hud set display.showTitle=true display.showSpeed=true
+~/.gemini/antigravity-cli/agy-hud/bin/agy-hud set display.showProject=false vcs.enabled=true
+
+# Undo the most recent `set` command
+~/.gemini/antigravity-cli/agy-hud/bin/agy-hud set --undo
 ```
 
-### Clean Uninstall (Zero Residue & Restore Official Default)
+### Environment Variables
 
-Uninstall at any time with one command — removes `"statusLine"` from `~/.gemini/antigravity-cli/settings.json` (restoring Antigravity CLI's official default status bar while preserving all other settings), cleans tracked `.bak.*` backups, unregisters the `agy-hud` plugin, and deletes `~/.gemini/antigravity-cli/agy-hud`:
+| Variable | Description |
+| :--- | :--- |
+| `AGY_HUD_DISABLE=1` | Suppress HUD output for the current terminal session without modifying `settings.json` (`AGY_HUD_DISABLE=1 agy`) |
+| `AGY_CLI_DIR` | Override Antigravity CLI config directory (default: `~/.gemini/antigravity-cli`) |
+| `AGY_HUD_HOME` | Override HUD data & config directory (default: `~/.gemini/antigravity-cli/agy-hud`) |
+
+---
+
+## 🧹 Clean Uninstall (Zero Residue)
+
+Uninstall at any time with a single command — removes `"statusLine"` from `settings.json` (restoring Antigravity CLI's official default status bar while keeping all your other settings intact), cleans tracked backups, unregisters the plugin, and deletes `~/.gemini/antigravity-cli/agy-hud`:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/maxlee/agy-hud/main/uninstall.sh | sh
 ```
 
-(Or offline: `~/.gemini/antigravity-cli/agy-hud/bin/agy-hud uninstall --plugin`. Add `--keep-config` if you wish to retain `config.json`.)
-
-Disable the HUD for a single terminal session without changing `settings.json`:
+Offline alternative:
 
 ```bash
-AGY_HUD_DISABLE=1 agy
+~/.gemini/antigravity-cli/agy-hud/bin/agy-hud uninstall --plugin
 ```
 
-## Security & Performance
+*(Append `--keep-config` if you want to preserve `config.json` for future reinstalls.)*
 
-See [ARCHITECTURE.md](ARCHITECTURE.md) for the full design:
+---
 
-- **Compile-time crate isolation (`hud-core` vs. `hud-cli`)**: `crates/hud-core` enforces `#![forbid(unsafe_code)]`, depends only on `serde` + `serde_json`, and is statically verified by `arch_guard.rs` to contain **zero** `std::fs`, `std::process`, `std::net`, or `std::env` capabilities.
-- **Hardened read-only VCS probes**: Enforces `-c protocol.allow=never`, `-c core.fsmonitor=false`, `--no-optional-locks`, dynamic repo-local `filter.*` neutralization for Git, `--ignore-working-copy --at-operation=@ --no-pager` for Jujutsu (`jj`), and `HGPLAIN=1` for Mercurial (`hg`).
-- **Sharded per-workspace cache**: Stores VCS snapshots at `<hudHome>/probe-cache/<fnv64>.json`, eliminating multi-terminal write races.
-- **Terminal escape firewall (`terminal_filter`)**: Strips OSC 52 clipboard writes, title hijacks, cursor CSI escapes, and Unicode bidi overrides, permitting only SGR color sequences and `file://` OSC 8 links.
+## 🔒 Architecture & Security (`THE LINE`)
 
-## Development & Verification
+`agy-hud` enforces capability isolation at compile time across a two-crate Rust workspace (continuously verified by [`arch_guard.rs`](crates/hud-core/tests/arch_guard.rs)). See [**ARCHITECTURE.md**](ARCHITECTURE.md) for full details:
+
+```text
+agy-hud/
+├── crates/
+│   ├── hud-core/   # Pure deterministic logic & layout crate (#![forbid(unsafe_code)], ZERO I/O)
+│   └── hud-cli/    # Thin capability shell: bounded file seeks, hardened VCS probes, atomic cache I/O
+├── skills/         # Antigravity slash-command skills (/agy-hud:hud & /agy-hud:hud-update)
+├── scripts/        # POSIX platform router & SHA-256 Marketplace binary sync tooling
+└── plugin.json     # Strict Antigravity v1 plugin manifest
+```
+
+1. **Zero-I/O Pure Core (`hud-core`)**: Depends **only** on `serde` and `serde_json` (11 total transitive crates) and is statically forbidden from referencing `std::fs`, `std::process`, `std::net`, `std::env`, or `std::os`.
+2. **Command-Injection-Safe VCS Probes (`hud-cli`)**:
+   - **Git**: Enforces `-c protocol.allow=never`, `-c core.fsmonitor=false`, `--no-optional-locks`, `GIT_NO_LAZY_FETCH=1`, and dynamically parses `.git/config` in memory to neutralize repo-local `[filter "<name>"]` `clean`/`smudge`/`process` drivers before invoking `git`.
+   - **Jujutsu (`jj`) & Mercurial (`hg`)**: Enforces `--ignore-working-copy --at-operation=@ --no-pager` and `HGPLAIN=1 --config extensions.fsmonitor=!` under a strict `1200 ms` timeout.
+3. **Terminal Escape Firewall (`terminal_filter`)**: Every line written to `stdout` is scrubbed against OSC 52 clipboard exfiltration, window title hijacking, cursor-movement CSI escapes, and Unicode Bidi Trojans (`U+202A..U+202E`, `U+2066..U+2069`), allowing only SGR styling and local `file://` OSC 8 links.
+
+---
+
+## 🧪 Development & Verification
 
 ```bash
-cargo fmt --all -- --check                             # Formatting check
-cargo clippy --workspace --all-targets -- -D warnings  # Strict zero-warning lint check
-cargo test --workspace                                 # Unit, CLI e2e, Git filter canary, and arch_guard tests
-cargo build --release                                  # LTO stripped native binary (~929 KB)
-agy plugin validate --strict .                         # Antigravity strict plugin schema check
+cargo fmt --all -- --check                             # Verify Rustfmt formatting
+cargo clippy --workspace --all-targets -- -D warnings  # Enforce zero Clippy warnings
+cargo test --workspace                                 # Run unit, CLI e2e, Git filter canary & arch_guard suites
+cargo build --release                                  # Build stripped LTO native binary
+agy plugin validate --strict .                         # Validate Antigravity plugin manifest & skills
 ```
 
-## License
+---
 
-Released under the [MIT License](LICENSE).
+## 📄 License
+
+Distributed under the [**MIT License**](LICENSE). Copyright © Max.
