@@ -21,13 +21,8 @@ jobs:
       matrix:
         include:
           - os: macos-latest
-            target: aarch64-apple-darwin
-            platform: darwin-arm64
-            bin_name: agy-hud
-            archive_ext: tar.gz
-          - os: macos-latest
-            target: x86_64-apple-darwin
-            platform: darwin-x64
+            target: aarch64-apple-darwin,x86_64-apple-darwin
+            platform: darwin
             bin_name: agy-hud
             archive_ext: tar.gz
           - os: ubuntu-latest
@@ -69,34 +64,57 @@ jobs:
       - name: Rust build cache
         uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ matrix.target }}
+          key: ${{ matrix.platform }}
 
       - name: Run test suite on host targets
-        if: matrix.target == 'aarch64-apple-darwin' || matrix.target == 'x86_64-unknown-linux-musl' || matrix.target == 'x86_64-pc-windows-msvc'
-        run: cargo test --workspace --target ${{ matrix.target }}
+        if: matrix.platform == 'darwin' || matrix.target == 'x86_64-unknown-linux-musl' || matrix.target == 'x86_64-pc-windows-msvc'
+        shell: bash
+        run: |
+          if [ "${{ matrix.platform }}" = "darwin" ]; then
+            cargo test --workspace --target aarch64-apple-darwin
+          else
+            cargo test --workspace --target ${{ matrix.target }}
+          fi
 
       - name: Build optimized release binary
-        run: cargo build --release --target ${{ matrix.target }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          for tgt in $(echo "${{ matrix.target }}" | tr ',' ' '); do
+            cargo build --release --target "$tgt"
+          done
 
       - name: Package Unix release tarball
         if: matrix.archive_ext == 'tar.gz'
         shell: bash
         run: |
           set -euo pipefail
-          STAGE="dist/agy-hud"
-          mkdir -p "$STAGE/scripts/bin/${{ matrix.platform }}"
-          cp plugin.json LICENSE README.md README.zh-CN.md ARCHITECTURE.md install.sh uninstall.sh "$STAGE/"
-          cp -R assets skills "$STAGE/"
-          cp scripts/agy-hud "$STAGE/scripts/agy-hud"
-          cp "target/${{ matrix.target }}/release/${{ matrix.bin_name }}" "$STAGE/scripts/bin/${{ matrix.platform }}/${{ matrix.bin_name }}"
-          chmod 0755 \
-            "$STAGE/install.sh" \
-            "$STAGE/uninstall.sh" \
-            "$STAGE/scripts/agy-hud" \
-            "$STAGE/skills/hud/scripts/hud-cli.sh" \
-            "$STAGE/skills/hud-update/scripts/hud-cli.sh" \
-            "$STAGE/scripts/bin/${{ matrix.platform }}/${{ matrix.bin_name }}"
-          tar -C dist -czf "dist/agy-hud-${{ matrix.platform }}.tar.gz" agy-hud
+          package_one() {
+            local tgt="$1"
+            local plat="$2"
+            rm -rf dist/agy-hud
+            STAGE="dist/agy-hud"
+            mkdir -p "$STAGE/scripts/bin/${plat}"
+            cp plugin.json LICENSE README.md README.zh-CN.md ARCHITECTURE.md install.sh uninstall.sh "$STAGE/"
+            cp -R assets skills "$STAGE/"
+            cp scripts/agy-hud "$STAGE/scripts/agy-hud"
+            cp "target/${tgt}/release/${{ matrix.bin_name }}" "$STAGE/scripts/bin/${plat}/${{ matrix.bin_name }}"
+            chmod 0755 \
+              "$STAGE/install.sh" \
+              "$STAGE/uninstall.sh" \
+              "$STAGE/scripts/agy-hud" \
+              "$STAGE/skills/hud/scripts/hud-cli.sh" \
+              "$STAGE/skills/hud-update/scripts/hud-cli.sh" \
+              "$STAGE/scripts/bin/${plat}/${{ matrix.bin_name }}"
+            tar -C dist -czf "dist/agy-hud-${plat}.tar.gz" agy-hud
+            rm -rf dist/agy-hud
+          }
+          if [ "${{ matrix.platform }}" = "darwin" ]; then
+            package_one "aarch64-apple-darwin" "darwin-arm64"
+            package_one "x86_64-apple-darwin" "darwin-x64"
+          else
+            package_one "${{ matrix.target }}" "${{ matrix.platform }}"
+          fi
 
       - name: Package Windows release zip
         if: matrix.archive_ext == 'zip'
@@ -115,7 +133,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: release-${{ matrix.platform }}
-          path: dist/agy-hud-${{ matrix.platform }}.${{ matrix.archive_ext }}
+          path: dist/agy-hud-*.${{ matrix.archive_ext }}
           if-no-files-found: error
 
   publish:
