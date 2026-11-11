@@ -35,6 +35,10 @@ pub struct VcsConfig {
     pub show_ahead_behind: bool,
     pub show_file_stats: bool,
     pub cache_ttl_ms: u64,
+    #[serde(default)]
+    pub push_warning_threshold: u64,
+    #[serde(default)]
+    pub push_critical_threshold: u64,
 }
 
 impl Default for VcsConfig {
@@ -45,6 +49,8 @@ impl Default for VcsConfig {
             show_ahead_behind: true,
             show_file_stats: false,
             cache_ttl_ms: 1500,
+            push_warning_threshold: 0,
+            push_critical_threshold: 0,
         }
     }
 }
@@ -63,6 +69,8 @@ pub struct DisplayConfig {
     pub effort_format: EffortFormatMode,
     pub show_project: bool,
     #[serde(default)]
+    pub show_launch_dir: bool,
+    #[serde(default)]
     pub show_title: bool,
     #[serde(default)]
     pub glyph_mode: GlyphMode,
@@ -76,7 +84,15 @@ pub struct DisplayConfig {
     pub quota_value: QuotaValueMode,
     pub quota_bar_enabled: bool,
     pub show_quota_reset: bool,
+    #[serde(default = "default_true")]
+    pub quota_pace: bool,
+    #[serde(default)]
+    pub quota_threshold: u64,
     pub show_cost: bool,
+    #[serde(default)]
+    pub show_daily_cost: bool,
+    #[serde(default)]
+    pub show_weekly_cost: bool,
     pub show_sandbox: bool,
     pub show_counts: bool,
     pub show_plan_tier: bool,
@@ -90,6 +106,10 @@ pub struct DisplayConfig {
     pub show_subagents: bool,
     pub show_todos: bool,
     pub custom_tag: String,
+    #[serde(default)]
+    pub merge_groups: Vec<Vec<String>>,
+    #[serde(default)]
+    pub right_align: Vec<String>,
 }
 
 impl Default for DisplayConfig {
@@ -101,6 +121,7 @@ impl Default for DisplayConfig {
             model_format: ModelFormatMode::Compact,
             effort_format: EffortFormatMode::Text,
             show_project: true,
+            show_launch_dir: false,
             show_title: false,
             glyph_mode: GlyphMode::Unicode,
             show_context_bar: true,
@@ -113,7 +134,11 @@ impl Default for DisplayConfig {
             quota_value: QuotaValueMode::Used,
             quota_bar_enabled: true,
             show_quota_reset: true,
+            quota_pace: true,
+            quota_threshold: 0,
             show_cost: true,
+            show_daily_cost: false,
+            show_weekly_cost: false,
             show_sandbox: true,
             show_counts: true,
             show_plan_tier: true,
@@ -126,6 +151,8 @@ impl Default for DisplayConfig {
             show_subagents: true,
             show_todos: true,
             custom_tag: String::new(),
+            merge_groups: Vec::new(),
+            right_align: Vec::new(),
         }
     }
 }
@@ -162,6 +189,30 @@ impl Default for HudConfig {
     }
 }
 
+pub const MERGEABLE_ROWS: &[&str] = &[
+    "header",
+    "context",
+    "quota",
+    "meta",
+    "tools",
+    "skills",
+    "subagents",
+    "todos",
+];
+
+pub const RIGHT_ALIGN_SEGMENTS: &[&str] = &[
+    "duration",
+    "cost",
+    "dailyCost",
+    "weeklyCost",
+    "memory",
+    "counts",
+    "sandbox",
+    "customTag",
+    "quota",
+    "meta",
+];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SchemaValueKind {
     Boolean,
@@ -169,6 +220,8 @@ pub enum SchemaValueKind {
     Enum(&'static [&'static str]),
     Number { min: i64, max: i64 },
     NullableNumber { min: i64, max: i64 },
+    StringArray(&'static [&'static str]),
+    MergeGroups(&'static [&'static str]),
 }
 
 impl SchemaValueKind {
@@ -179,6 +232,8 @@ impl SchemaValueKind {
             Self::Enum(_) => "enum",
             Self::Number { .. } => "number",
             Self::NullableNumber { .. } => "number|null",
+            Self::StringArray(_) => "string[]",
+            Self::MergeGroups(_) => "string[][]",
         }
     }
 }
@@ -255,6 +310,16 @@ pub const CONFIG_SCHEMA: &[SchemaEntry] = &[
         description: "VCS probe cache TTL in ms (0 disables caching; auto-invalidates on repo HEAD/index/dirstate mtime changes).",
     },
     SchemaEntry {
+        key: "vcs.pushWarningThreshold",
+        kind: SchemaValueKind::Number { min: 0, max: 500 },
+        description: "Unpushed commit count (ahead) at which ↑N turns yellow (0 disables).",
+    },
+    SchemaEntry {
+        key: "vcs.pushCriticalThreshold",
+        kind: SchemaValueKind::Number { min: 0, max: 500 },
+        description: "Unpushed commit count (ahead) at which ↑N turns red (0 disables).",
+    },
+    SchemaEntry {
         key: "display.showState",
         kind: SchemaValueKind::Boolean,
         description: "Show real-time agent_state badge (READY, WORKING, TOOL, CONFIRM?, etc.).",
@@ -283,6 +348,11 @@ pub const CONFIG_SCHEMA: &[SchemaEntry] = &[
         key: "display.showProject",
         kind: SchemaValueKind::Boolean,
         description: "Show workspace folder path.",
+    },
+    SchemaEntry {
+        key: "display.showLaunchDir",
+        kind: SchemaValueKind::Boolean,
+        description: "Show launch directory breadcrumb (project_dir › current_dir) when working in a nested or external folder.",
     },
     SchemaEntry {
         key: "display.showTitle",
@@ -345,9 +415,29 @@ pub const CONFIG_SCHEMA: &[SchemaEntry] = &[
         description: "Show countdown until quota bucket resets (e.g., \"6d 11h\").",
     },
     SchemaEntry {
+        key: "display.quotaPace",
+        kind: SchemaValueKind::Boolean,
+        description: "Project quota burn rate against window elapsed time and highlight unsustainable pace (▲).",
+    },
+    SchemaEntry {
+        key: "display.quotaThreshold",
+        kind: SchemaValueKind::Number { min: 0, max: 99 },
+        description: "Minimum used percentage before displaying a quota bucket unless pace is elevated (0 shows all).",
+    },
+    SchemaEntry {
         key: "display.showCost",
         kind: SchemaValueKind::Boolean,
         description: "Show estimated session USD spend when reported.",
+    },
+    SchemaEntry {
+        key: "display.showDailyCost",
+        kind: SchemaValueKind::Boolean,
+        description: "Show aggregated cross-session USD spend for the current UTC day.",
+    },
+    SchemaEntry {
+        key: "display.showWeeklyCost",
+        kind: SchemaValueKind::Boolean,
+        description: "Show aggregated cross-session USD spend for the current 7-day rolling window.",
     },
     SchemaEntry {
         key: "display.showSandbox",
@@ -409,6 +499,16 @@ pub const CONFIG_SCHEMA: &[SchemaEntry] = &[
         kind: SchemaValueKind::String,
         description: "Optional custom text label pinned to the header line.",
     },
+    SchemaEntry {
+        key: "display.mergeGroups",
+        kind: SchemaValueKind::MergeGroups(MERGEABLE_ROWS),
+        description: "Row groups merged side-by-side when terminal width fits (e.g. [[\"context\",\"quota\"]]); auto-stacks on narrow widths.",
+    },
+    SchemaEntry {
+        key: "display.rightAlign",
+        kind: SchemaValueKind::StringArray(RIGHT_ALIGN_SEGMENTS),
+        description: "Segments or merged rows pushed flush-right when terminal width allows (e.g. [\"duration\",\"cost\"]).",
+    },
 ];
 
 pub fn find_schema(key: &str) -> Option<&'static SchemaEntry> {
@@ -469,6 +569,70 @@ pub fn validate_setting(key: &str, value: &Value) -> Result<(), String> {
             }
             if n > max {
                 return Err(format!("{key} must be <= {max}."));
+            }
+            Ok(())
+        }
+        SchemaValueKind::StringArray(allowed) => {
+            let Some(arr) = value.as_array() else {
+                return Err(format!("{key} expects a JSON array of strings."));
+            };
+            if arr.len() > allowed.len() {
+                return Err(format!("{key} accepts at most {} entries.", allowed.len()));
+            }
+            let mut seen: Vec<&str> = Vec::with_capacity(arr.len());
+            for item in arr {
+                let Some(s) = item.as_str() else {
+                    return Err(format!("{key} expects every array item to be a string."));
+                };
+                if !allowed.contains(&s) {
+                    return Err(format!(
+                        "{key} item \"{s}\" must be one of: {}.",
+                        allowed.join(", ")
+                    ));
+                }
+                if seen.contains(&s) {
+                    return Err(format!("{key} must not contain duplicate item \"{s}\"."));
+                }
+                seen.push(s);
+            }
+            Ok(())
+        }
+        SchemaValueKind::MergeGroups(allowed) => {
+            let Some(groups) = value.as_array() else {
+                return Err(format!("{key} expects a JSON array of row groups."));
+            };
+            if groups.len() > 4 {
+                return Err(format!("{key} accepts at most 4 merge groups."));
+            }
+            let mut seen_across_groups: Vec<&str> = Vec::new();
+            for group_val in groups {
+                let Some(group) = group_val.as_array() else {
+                    return Err(format!(
+                        "{key} expects each group to be an array of 2..4 row names."
+                    ));
+                };
+                if !(2..=4).contains(&group.len()) {
+                    return Err(format!(
+                        "{key} expects each group to contain 2..4 row names."
+                    ));
+                }
+                for item in group {
+                    let Some(s) = item.as_str() else {
+                        return Err(format!("{key} expects every row name to be a string."));
+                    };
+                    if !allowed.contains(&s) {
+                        return Err(format!(
+                            "{key} row \"{s}\" must be one of: {}.",
+                            allowed.join(", ")
+                        ));
+                    }
+                    if seen_across_groups.contains(&s) {
+                        return Err(format!(
+                            "{key} row \"{s}\" cannot appear more than once across merge groups."
+                        ));
+                    }
+                    seen_across_groups.push(s);
+                }
             }
             Ok(())
         }

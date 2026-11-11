@@ -1,0 +1,54 @@
+{
+  "id": "02-narrow-compact-pace-alert",
+  "nowMs": 1794218400000,
+  "columns": 68,
+  "config": {
+    "display": {
+      "quotaThreshold": 50
+    }
+  },
+  "stdin": {
+    "cwd": "/Users/dev/agy-hud",
+    "conversation_id": "conv-corpus-02",
+    "agent_state": "streaming",
+    "cycle_mode": "plan",
+    "terminal_width": 68,
+    "workspace": {
+      "project_dir": "/Users/dev/agy-hud",
+      "current_dir": "/Users/dev/agy-hud"
+    },
+    "model": {
+      "id": "Gemini 3.1 Pro (Medium)",
+      "display_name": "Gemini 3.1 Pro (Medium)",
+      "effort": "medium"
+    },
+    "context_window": {
+      "context_window_size": 1048576,
+      "used_percentage": 64.0
+    },
+    "quota": {
+      "gemini-5h": {
+        "remaining_fraction": 0.68,
+        "reset_in_seconds": 14400.0
+      }
+    }
+  },
+  "probes": {
+    "vcs": "{\"type\":\"git\",\"branch\":\"main\",\"dirty\":false}"
+  },
+  "transcript": {
+    "tools": [],
+    "skills": [],
+    "mcp_servers": [],
+    "mcp_errors": [],
+    "subagents": [],
+    "todos": [],
+    "session_started_at": 1794218100000,
+    "last_step_at": 1794218399000,
+    "step_count": 3
+  },
+  "expectedPlainLines": [
+    "● STREAMING │ [PLAN] │ [Pro · med] │ agy-hud git:(main) │ ⏱ 5m",
+    "Ctx █████··· 64.0% │ Quota(5h) █▒··· 32%▲ (4h)"
+  ]
+}

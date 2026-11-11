@@ -1,7 +1,8 @@
-use crate::ansi::sanitize_text;
+use crate::ansi::{graphemes, sanitize_text};
 use crate::types::{
-    AgyStdinData, PlannerStepTiming, SpeedAnchorPoint, SubagentEntry, SubagentStatus, TodoItem,
-    TodoStatus, ToolEntry, ToolStatus, TranscriptSummary,
+    AgyStdinData, PlannerStepTiming, SpeedAnchorPoint, SubagentEntry, SubagentStatus,
+    TRANSCRIPT_CURSOR_VERSION, TodoItem, TodoStatus, ToolEntry, ToolStatus, TranscriptCursor,
+    TranscriptSummary,
 };
 use serde::Deserialize;
 use serde_json::{Map, Value};
@@ -161,9 +162,9 @@ pub fn parse_iso_ms(iso: &str) -> Option<i64> {
     Some(epoch_sec * 1_000 + millis)
 }
 
-fn char_slice(s: &str, max_chars: usize) -> String {
-    s.chars()
-        .take(max_chars)
+fn grapheme_slice(s: &str, max_clusters: usize) -> String {
+    graphemes(s)
+        .take(max_clusters)
         .collect::<String>()
         .trim_end()
         .to_string()
@@ -189,22 +190,22 @@ fn summarize_tool_target(name: &str, args: Option<&Map<String, Value>>) -> Optio
     if name == "run_command" {
         let summary = unwrap_arg_value(args.get("toolSummary"));
         if !summary.is_empty() {
-            return Some(char_slice(&summary, 20));
+            return Some(grapheme_slice(&summary, 20));
         }
         let cmd = unwrap_arg_value(args.get("CommandLine"));
         if !cmd.is_empty() {
             let short = cmd.split_whitespace().take(2).collect::<Vec<_>>().join(" ");
-            return Some(char_slice(&short, 20));
+            return Some(grapheme_slice(&short, 20));
         }
         return None;
     }
     if name == "search_web" {
         let q = unwrap_arg_value(args.get("query"));
-        return (!q.is_empty()).then(|| char_slice(&q, 24));
+        return (!q.is_empty()).then(|| grapheme_slice(&q, 24));
     }
     if name == "grep_search" || name == "find_by_name" {
         let q = unwrap_arg_value(args.get("Query").or_else(|| args.get("Pattern")));
-        return (!q.is_empty()).then(|| char_slice(&q, 24));
+        return (!q.is_empty()).then(|| grapheme_slice(&q, 24));
     }
     if name == "call_mcp_tool" {
         let server = unwrap_arg_value(args.get("ServerName"));
@@ -219,7 +220,7 @@ fn summarize_tool_target(name: &str, args: Option<&Map<String, Value>>) -> Optio
     }
     if name == "invoke_subagent" {
         let role = unwrap_arg_value(args.get("Role").or_else(|| args.get("TypeName")));
-        return (!role.is_empty()).then(|| char_slice(&role, 26));
+        return (!role.is_empty()).then(|| grapheme_slice(&role, 26));
     }
     None
 }
@@ -504,278 +505,16 @@ pub fn parse_subagent_status(raw: Option<&str>) -> SubagentStatus {
     }
 }
 
-/// Pure parser for Antigravity `transcript.jsonl` (head first-line + bounded tail lines) and `task.md`.
-pub fn parse_transcript_and_tasks(
-    head_line: Option<&str>,
-    tail_text: Option<&str>,
-    task_md_content: Option<&str>,
-    stdin: Option<&AgyStdinData>,
-) -> TranscriptSummary {
-    let todos = parse_task_markdown(task_md_content);
+struct IndexedStep {
+    line_start_offset: u64,
+    step: RawStep,
+}
 
-    let mut session_started_at = head_line
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .and_then(|l| {
-            serde_json::from_str::<RawStep>(l)
-                .ok()
-                .and_then(|s| s.created_at)
-                .and_then(|iso| parse_iso_ms(&iso))
-                .or_else(|| extract_created_at_prefix(l))
-        });
-
-    let mut steps = Vec::new();
-    if let Some(tail) = tail_text {
-        for line in tail.lines() {
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            if let Ok(step) = serde_json::from_str::<RawStep>(trimmed) {
-                steps.push(step);
-            }
-        }
-    }
-
-    if session_started_at.is_none()
-        && let Some(first) = steps.first()
-        && let Some(iso) = first.created_at.as_deref()
-    {
-        session_started_at = parse_iso_ms(iso);
-    }
-
-    let mut skills_vec = Vec::new();
-    let mut skills_seen = BTreeSet::new();
-    let mut mcp_vec = Vec::new();
-    let mut mcp_seen = BTreeSet::new();
-    let mut mcp_last_status = HashMap::new();
-
-    let mut raw_tools: Vec<ToolEntry> = Vec::new();
-    let mut transcript_agents: Vec<SubagentEntry> = Vec::new();
-    let mut active_slash_mode: Option<String> = None;
-    let mut completed_step_tps_x10: Option<u32> = None;
-    let mut short_anchor: Option<SpeedAnchorPoint> = None;
-    let mut long_anchor: Option<SpeedAnchorPoint> = None;
-    let mut latest_planner_step: Option<PlannerStepTiming> = None;
-    let mut last_step_at: Option<i64> = None;
-    let mut max_step_idx: usize = 0;
-
-    let is_idle = stdin
-        .and_then(|s| s.agent_state.as_deref())
-        .is_some_and(|st| st.eq_ignore_ascii_case("idle"));
-
-    for i in 0..steps.len() {
-        let step = &steps[i];
-        let ts = step.created_at.as_deref().and_then(parse_iso_ms);
-        if ts.is_some() {
-            last_step_at = ts;
-        }
-        if let Some(idx) = step.step_index
-            && idx + 1 > max_step_idx
-        {
-            max_step_idx = idx + 1;
-        }
-
-        let step_type = step.step_type.as_deref().unwrap_or("");
-        if step_type == "USER_INPUT" {
-            if let Some(ref mut lp) = latest_planner_step {
-                lp.has_trailing_user_input = true;
-            }
-            if let Some(Value::String(text)) = step.content.as_ref() {
-                if let Some(cmd) = extract_slash_command(text) {
-                    if cmd == "plan" {
-                        active_slash_mode = Some("plan".to_string());
-                    } else {
-                        active_slash_mode = None;
-                    }
-                    if skills_seen.insert(cmd.clone()) {
-                        skills_vec.push(cmd);
-                    }
-                } else {
-                    active_slash_mode = None;
-                }
-            }
-        }
-
-        if step_type == "PLANNER_RESPONSE"
-            && let Some(start_ms) = ts
-        {
-            let out_tok = step.output_tokens.unwrap_or(0);
-            let est_tok = estimate_step_tokens(step);
-            let is_running = step
-                .status
-                .as_deref()
-                .is_some_and(|s| s.eq_ignore_ascii_case("RUNNING"));
-            let is_done = !is_running
-                && (step
-                    .status
-                    .as_deref()
-                    .is_some_and(|s| s.eq_ignore_ascii_case("DONE"))
-                    || out_tok > 0);
-            let ended_at_ms = if is_done {
-                steps.get(i + 1).and_then(|next_step| {
-                    if next_step.step_type.as_deref() == Some("GENERIC") {
-                        next_step.created_at.as_deref().and_then(parse_iso_ms)
-                    } else {
-                        None
-                    }
-                })
-            } else {
-                None
-            };
-
-            if is_done
-                && out_tok > 0
-                && let Some(end_ms) = ended_at_ms
-            {
-                let raw_dt = end_ms - start_ms;
-                update_speed_anchors(&mut short_anchor, &mut long_anchor, out_tok, raw_dt);
-                let overhead_ms = estimate_ttft_overhead_ms(short_anchor, long_anchor);
-                let adj_dt = adjust_coarse_dt_ms(raw_dt, overhead_ms);
-                if let Some(sample_x10) = compute_tps_x10(out_tok, adj_dt) {
-                    completed_step_tps_x10 = Some(blend_tps_ewma_x10(
-                        completed_step_tps_x10,
-                        sample_x10,
-                        out_tok,
-                        false,
-                    ));
-                }
-            }
-
-            if !is_done || out_tok > 0 || est_tok > 0 {
-                latest_planner_step = Some(PlannerStepTiming {
-                    step_index: step.step_index.unwrap_or(i),
-                    output_tokens: out_tok,
-                    estimated_tokens: est_tok,
-                    started_at_ms: start_ms,
-                    ended_at_ms,
-                    has_trailing_user_input: false,
-                    is_done,
-                });
-            }
-        }
-
-        if step_type == "PLANNER_RESPONSE"
-            && let Some(tool_calls) = step.tool_calls.as_ref()
-            && !tool_calls.is_empty()
-        {
-            let mut results: Vec<&RawStep> = Vec::new();
-            for next_step in &steps[i + 1..] {
-                if results.len() >= tool_calls.len() {
-                    break;
-                }
-                let nt = next_step.step_type.as_deref().unwrap_or("");
-                if nt == "PLANNER_RESPONSE" || nt == "USER_INPUT" {
-                    break;
-                }
-                if nt == "GENERIC" {
-                    results.push(next_step);
-                }
-            }
-
-            for (idx, tc) in tool_calls.iter().enumerate() {
-                let raw_name = {
-                    let n = sanitize_text(tc.name.as_deref().unwrap_or("tool"));
-                    if n.is_empty() { "tool".to_string() } else { n }
-                };
-                let args = tc.args.as_ref();
-                let result_step = results.get(idx).copied();
-                let ended_at = result_step
-                    .and_then(|r| r.created_at.as_deref())
-                    .and_then(parse_iso_ms);
-
-                let status = if let Some(res) = result_step {
-                    let content_str = res.content.as_ref().and_then(Value::as_str).unwrap_or("");
-                    let trimmed_content = content_str.trim_start();
-                    let is_err = res.status.as_deref() == Some("ERROR")
-                        || (trimmed_content.len() >= 6
-                            && trimmed_content[..6].eq_ignore_ascii_case("error:"))
-                        || has_nonzero_exit_code(content_str);
-                    if is_err {
-                        ToolStatus::Error
-                    } else {
-                        ToolStatus::Completed
-                    }
-                } else if is_idle {
-                    ToolStatus::Completed
-                } else {
-                    ToolStatus::Running
-                };
-
-                if raw_name == "read_file"
-                    && let Some(a) = args
-                    && let Some(skill) = detect_skill_from_path(&unwrap_arg_value(a.get("Path")))
-                    && skills_seen.insert(skill.clone())
-                {
-                    skills_vec.push(skill);
-                }
-
-                let mcp_server = if raw_name == "call_mcp_tool" {
-                    args.map(|a| unwrap_arg_value(a.get("ServerName")))
-                        .unwrap_or_default()
-                } else if let Some(after_mcp) = raw_name.strip_prefix("mcp_") {
-                    after_mcp.split('_').next().unwrap_or("").to_string()
-                } else {
-                    String::new()
-                };
-                if !mcp_server.is_empty() {
-                    if mcp_seen.insert(mcp_server.clone()) {
-                        mcp_vec.push(mcp_server.clone());
-                    }
-                    mcp_last_status.insert(mcp_server, status);
-                }
-
-                if raw_name == "invoke_subagent"
-                    && let Some(a) = args
-                {
-                    let name = {
-                        let t = unwrap_arg_value(a.get("TypeName"));
-                        if t.is_empty() {
-                            "subagent".to_string()
-                        } else {
-                            t
-                        }
-                    };
-                    let role = {
-                        let r = unwrap_arg_value(a.get("Role"));
-                        (!r.is_empty()).then_some(r)
-                    };
-                    let model = {
-                        let m = unwrap_arg_value(a.get("Model"));
-                        (!m.is_empty()).then_some(m)
-                    };
-                    transcript_agents.push(SubagentEntry {
-                        name,
-                        role,
-                        model,
-                        status: if status == ToolStatus::Running {
-                            SubagentStatus::Running
-                        } else {
-                            SubagentStatus::Completed
-                        },
-                        started_at: ts,
-                        ended_at,
-                    });
-                }
-
-                let target = summarize_tool_target(&raw_name, args);
-                raw_tools.push(ToolEntry {
-                    id: format!("{}:{idx}", step.step_index.unwrap_or(i)),
-                    name: raw_name,
-                    target,
-                    status,
-                    count: 1,
-                    started_at: ts,
-                    ended_at,
-                });
-            }
-        }
-    }
-
-    // Fold tools newest-first: keep active `Running` entries distinct, supersede historical
-    // `Error` calls when a newer invocation of the same tool succeeded or is currently running,
-    // and fold unresolved `Error` or `Completed` invocations by tool name while preserving the
-    // most recent target summary.
+/// Folds chronological tool invocations newest-first: keeps active `Running` entries distinct,
+/// supersedes historical `Error` calls when a newer invocation of the same tool succeeded or is
+/// currently running, and folds unresolved `Error` or `Completed` counts by tool name while
+/// preserving the most recent target summary.
+fn fold_tools_newest_first(raw_tools: Vec<ToolEntry>, sort_by_status: bool) -> Vec<ToolEntry> {
     let mut aggregated: Vec<ToolEntry> = Vec::new();
     let mut completed_idx_by_name: HashMap<String, usize> = HashMap::new();
     let mut error_idx_by_name: HashMap<String, usize> = HashMap::new();
@@ -791,7 +530,7 @@ pub fn parse_transcript_and_tasks(
                 seen_newer_active_or_ok.insert(item.name.clone());
                 if let Some(&agg_idx) = completed_idx_by_name.get(&item.name) {
                     let existing = &mut aggregated[agg_idx];
-                    existing.count += 1;
+                    existing.count = existing.count.saturating_add(item.count);
                     if existing.target.is_none() && item.target.is_some() {
                         existing.target = item.target;
                     }
@@ -804,11 +543,12 @@ pub fn parse_transcript_and_tasks(
             ToolStatus::Error => {
                 if seen_newer_active_or_ok.contains(&item.name) {
                     if let Some(&agg_idx) = completed_idx_by_name.get(&item.name) {
-                        aggregated[agg_idx].count += 1;
+                        aggregated[agg_idx].count =
+                            aggregated[agg_idx].count.saturating_add(item.count);
                     }
                 } else if let Some(&err_idx) = error_idx_by_name.get(&item.name) {
                     let existing = &mut aggregated[err_idx];
-                    existing.count += 1;
+                    existing.count = existing.count.saturating_add(item.count);
                     if existing.target.is_none() && item.target.is_some() {
                         existing.target = item.target;
                     }
@@ -821,90 +561,523 @@ pub fn parse_transcript_and_tasks(
         }
     }
 
-    aggregated.sort_by_key(|t| t.status);
-
-    let mcp_err_vec: Vec<String> = mcp_vec
-        .iter()
-        .filter(|srv| mcp_last_status.get(*srv) == Some(&ToolStatus::Error))
-        .cloned()
-        .collect();
-
-    // Merge authoritative live `stdin.subagents` with transcript subagent timestamps/models
-    let mut merged_subagents = Vec::new();
-    if let Some(live_agents) = stdin.and_then(|s| s.subagents.as_ref())
-        && !live_agents.is_empty()
-    {
-        for (idx, sa) in live_agents.iter().enumerate() {
-            let live_clean_name = sa
-                .name
-                .as_deref()
-                .filter(|s| !s.trim().is_empty())
-                .map(sanitize_text)
-                .filter(|s| !s.is_empty());
-            let matched = match live_clean_name.as_deref() {
-                Some(target_name) => transcript_agents
-                    .get(idx)
-                    .filter(|m| m.name == target_name)
-                    .or_else(|| {
-                        transcript_agents
-                            .iter()
-                            .rev()
-                            .find(|m| m.name == target_name)
-                    })
-                    .or_else(|| transcript_agents.get(idx)),
-                None => transcript_agents.get(idx),
-            };
-            let name = live_clean_name
-                .or_else(|| matched.map(|m| m.name.clone()))
-                .unwrap_or_else(|| "subagent".to_string());
-            let role = sa
-                .role
-                .as_deref()
-                .filter(|s| !s.trim().is_empty())
-                .map(sanitize_text)
-                .filter(|s| !s.is_empty())
-                .or_else(|| matched.and_then(|m| m.role.clone()));
-            let model = sa
-                .model
-                .as_deref()
-                .filter(|s| !s.trim().is_empty())
-                .map(sanitize_text)
-                .filter(|s| !s.is_empty())
-                .or_else(|| matched.and_then(|m| m.model.clone()));
-            merged_subagents.push(SubagentEntry {
-                name,
-                role,
-                model,
-                status: parse_subagent_status(sa.status.as_deref()),
-                started_at: matched.and_then(|m| m.started_at),
-                ended_at: matched.and_then(|m| m.ended_at),
-            });
-        }
+    if sort_by_status {
+        aggregated.sort_by_key(|t| t.status);
     } else {
-        merged_subagents = transcript_agents;
+        aggregated.reverse();
+    }
+    aggregated
+}
+
+#[derive(Clone)]
+struct StepAccumulator {
+    session_started_at: Option<i64>,
+    skills_vec: Vec<String>,
+    skills_seen: BTreeSet<String>,
+    mcp_vec: Vec<String>,
+    mcp_seen: BTreeSet<String>,
+    mcp_last_status: HashMap<String, ToolStatus>,
+    tools: Vec<ToolEntry>,
+    subagents: Vec<SubagentEntry>,
+    active_slash_mode: Option<String>,
+    completed_step_tps_x10: Option<u32>,
+    short_anchor: Option<SpeedAnchorPoint>,
+    long_anchor: Option<SpeedAnchorPoint>,
+    latest_planner_step: Option<PlannerStepTiming>,
+    last_step_at: Option<i64>,
+    max_step_idx: usize,
+    step_lines_seen: usize,
+}
+
+impl StepAccumulator {
+    fn from_cursor(cursor: Option<&TranscriptCursor>, head_started_at: Option<i64>) -> Self {
+        let Some(c) = cursor else {
+            return Self {
+                session_started_at: head_started_at,
+                skills_vec: Vec::new(),
+                skills_seen: BTreeSet::new(),
+                mcp_vec: Vec::new(),
+                mcp_seen: BTreeSet::new(),
+                mcp_last_status: HashMap::new(),
+                tools: Vec::new(),
+                subagents: Vec::new(),
+                active_slash_mode: None,
+                completed_step_tps_x10: None,
+                short_anchor: None,
+                long_anchor: None,
+                latest_planner_step: None,
+                last_step_at: None,
+                max_step_idx: 0,
+                step_lines_seen: 0,
+            };
+        };
+
+        let skills_seen: BTreeSet<String> = c.skills.iter().cloned().collect();
+        let mcp_seen: BTreeSet<String> = c.mcp_servers.iter().cloned().collect();
+        let err_set: BTreeSet<&str> = c.mcp_last_error.iter().map(String::as_str).collect();
+        let mut mcp_last_status = HashMap::new();
+        for srv in &c.mcp_servers {
+            let st = if err_set.contains(srv.as_str()) {
+                ToolStatus::Error
+            } else {
+                ToolStatus::Completed
+            };
+            mcp_last_status.insert(srv.clone(), st);
+        }
+
+        Self {
+            session_started_at: c.session_started_at.or(head_started_at),
+            skills_vec: c.skills.clone(),
+            skills_seen,
+            mcp_vec: c.mcp_servers.clone(),
+            mcp_seen,
+            mcp_last_status,
+            tools: c.folded_tools.clone(),
+            subagents: c.subagents.clone(),
+            active_slash_mode: c.active_slash_mode.clone(),
+            completed_step_tps_x10: c.completed_step_tps_x10,
+            short_anchor: c.short_anchor,
+            long_anchor: c.long_anchor,
+            latest_planner_step: c.latest_planner_step.clone(),
+            last_step_at: c.last_step_at,
+            max_step_idx: c.max_step_idx,
+            step_lines_seen: c.step_lines_seen,
+        }
     }
 
-    TranscriptSummary {
-        tools: aggregated,
-        skills: skills_vec,
-        mcp_servers: mcp_vec,
-        mcp_errors: mcp_err_vec,
-        subagents: merged_subagents,
-        todos,
-        active_slash_mode,
-        completed_step_tps_x10,
-        resolved_tps_x10: None,
-        short_anchor,
-        long_anchor,
-        latest_planner_step,
-        session_started_at,
-        last_step_at,
-        step_count: if max_step_idx > 0 {
-            max_step_idx
-        } else {
-            steps.len()
-        },
+    fn ingest_steps(&mut self, steps: &[IndexedStep], unmatched_is_completed: bool) {
+        if self.session_started_at.is_none()
+            && let Some(first) = steps.first()
+            && let Some(iso) = first.step.created_at.as_deref()
+        {
+            self.session_started_at = parse_iso_ms(iso);
+        }
+
+        let base_seen = self.step_lines_seen;
+        self.step_lines_seen = self.step_lines_seen.saturating_add(steps.len());
+
+        for i in 0..steps.len() {
+            let step = &steps[i].step;
+            let fallback_idx = base_seen + i;
+            let ts = step.created_at.as_deref().and_then(parse_iso_ms);
+            if ts.is_some() {
+                self.last_step_at = ts;
+            }
+            if let Some(idx) = step.step_index
+                && idx + 1 > self.max_step_idx
+            {
+                self.max_step_idx = idx + 1;
+            }
+
+            let step_type = step.step_type.as_deref().unwrap_or("");
+            if step_type == "USER_INPUT" {
+                if let Some(ref mut lp) = self.latest_planner_step {
+                    lp.has_trailing_user_input = true;
+                }
+                if let Some(Value::String(text)) = step.content.as_ref() {
+                    if let Some(cmd) = extract_slash_command(text) {
+                        if cmd == "plan" {
+                            self.active_slash_mode = Some("plan".to_string());
+                        } else {
+                            self.active_slash_mode = None;
+                        }
+                        if self.skills_seen.insert(cmd.clone()) {
+                            self.skills_vec.push(cmd);
+                        }
+                    } else {
+                        self.active_slash_mode = None;
+                    }
+                }
+            }
+
+            if step_type == "PLANNER_RESPONSE"
+                && let Some(start_ms) = ts
+            {
+                let out_tok = step.output_tokens.unwrap_or(0);
+                let est_tok = estimate_step_tokens(step);
+                let is_running = step
+                    .status
+                    .as_deref()
+                    .is_some_and(|s| s.eq_ignore_ascii_case("RUNNING"));
+                let is_done = !is_running
+                    && (step
+                        .status
+                        .as_deref()
+                        .is_some_and(|s| s.eq_ignore_ascii_case("DONE"))
+                        || out_tok > 0);
+                let ended_at_ms = if is_done {
+                    steps.get(i + 1).and_then(|next_item| {
+                        if next_item.step.step_type.as_deref() == Some("GENERIC") {
+                            next_item.step.created_at.as_deref().and_then(parse_iso_ms)
+                        } else {
+                            None
+                        }
+                    })
+                } else {
+                    None
+                };
+
+                if is_done
+                    && out_tok > 0
+                    && let Some(end_ms) = ended_at_ms
+                {
+                    let raw_dt = end_ms - start_ms;
+                    update_speed_anchors(
+                        &mut self.short_anchor,
+                        &mut self.long_anchor,
+                        out_tok,
+                        raw_dt,
+                    );
+                    let overhead_ms =
+                        estimate_ttft_overhead_ms(self.short_anchor, self.long_anchor);
+                    let adj_dt = adjust_coarse_dt_ms(raw_dt, overhead_ms);
+                    if let Some(sample_x10) = compute_tps_x10(out_tok, adj_dt) {
+                        self.completed_step_tps_x10 = Some(blend_tps_ewma_x10(
+                            self.completed_step_tps_x10,
+                            sample_x10,
+                            out_tok,
+                            false,
+                        ));
+                    }
+                }
+
+                if !is_done || out_tok > 0 || est_tok > 0 {
+                    self.latest_planner_step = Some(PlannerStepTiming {
+                        step_index: step.step_index.unwrap_or(fallback_idx),
+                        output_tokens: out_tok,
+                        estimated_tokens: est_tok,
+                        started_at_ms: start_ms,
+                        ended_at_ms,
+                        has_trailing_user_input: false,
+                        is_done,
+                    });
+                }
+            }
+
+            if step_type == "PLANNER_RESPONSE"
+                && let Some(tool_calls) = step.tool_calls.as_ref()
+                && !tool_calls.is_empty()
+            {
+                let mut results: Vec<&RawStep> = Vec::new();
+                for next_item in &steps[i + 1..] {
+                    if results.len() >= tool_calls.len() {
+                        break;
+                    }
+                    let nt = next_item.step.step_type.as_deref().unwrap_or("");
+                    if nt == "PLANNER_RESPONSE" || nt == "USER_INPUT" {
+                        break;
+                    }
+                    if nt == "GENERIC" {
+                        results.push(&next_item.step);
+                    }
+                }
+
+                for (idx, tc) in tool_calls.iter().enumerate() {
+                    let raw_name = {
+                        let n = sanitize_text(tc.name.as_deref().unwrap_or("tool"));
+                        if n.is_empty() { "tool".to_string() } else { n }
+                    };
+                    let args = tc.args.as_ref();
+                    let result_step = results.get(idx).copied();
+                    let ended_at = result_step
+                        .and_then(|r| r.created_at.as_deref())
+                        .and_then(parse_iso_ms);
+
+                    let status = if let Some(res) = result_step {
+                        let content_str =
+                            res.content.as_ref().and_then(Value::as_str).unwrap_or("");
+                        let trimmed_content = content_str.trim_start();
+                        let is_err = res.status.as_deref() == Some("ERROR")
+                            || (trimmed_content.len() >= 6
+                                && trimmed_content[..6].eq_ignore_ascii_case("error:"))
+                            || has_nonzero_exit_code(content_str);
+                        if is_err {
+                            ToolStatus::Error
+                        } else {
+                            ToolStatus::Completed
+                        }
+                    } else if unmatched_is_completed {
+                        ToolStatus::Completed
+                    } else {
+                        ToolStatus::Running
+                    };
+
+                    if raw_name == "read_file"
+                        && let Some(a) = args
+                        && let Some(skill) =
+                            detect_skill_from_path(&unwrap_arg_value(a.get("Path")))
+                        && self.skills_seen.insert(skill.clone())
+                    {
+                        self.skills_vec.push(skill);
+                    }
+
+                    let mcp_server = if raw_name == "call_mcp_tool" {
+                        args.map(|a| unwrap_arg_value(a.get("ServerName")))
+                            .unwrap_or_default()
+                    } else if let Some(after_mcp) = raw_name.strip_prefix("mcp_") {
+                        after_mcp.split('_').next().unwrap_or("").to_string()
+                    } else {
+                        String::new()
+                    };
+                    if !mcp_server.is_empty() {
+                        if self.mcp_seen.insert(mcp_server.clone()) {
+                            self.mcp_vec.push(mcp_server.clone());
+                        }
+                        self.mcp_last_status.insert(mcp_server, status);
+                    }
+
+                    if raw_name == "invoke_subagent"
+                        && let Some(a) = args
+                    {
+                        let name = {
+                            let t = unwrap_arg_value(a.get("TypeName"));
+                            if t.is_empty() {
+                                "subagent".to_string()
+                            } else {
+                                t
+                            }
+                        };
+                        let role = {
+                            let r = unwrap_arg_value(a.get("Role"));
+                            (!r.is_empty()).then_some(r)
+                        };
+                        let model = {
+                            let m = unwrap_arg_value(a.get("Model"));
+                            (!m.is_empty()).then_some(m)
+                        };
+                        self.subagents.push(SubagentEntry {
+                            name,
+                            role,
+                            model,
+                            status: if status == ToolStatus::Running {
+                                SubagentStatus::Running
+                            } else {
+                                SubagentStatus::Completed
+                            },
+                            started_at: ts,
+                            ended_at,
+                        });
+                    }
+
+                    let target = summarize_tool_target(&raw_name, args);
+                    self.tools.push(ToolEntry {
+                        id: format!("{}:{idx}", step.step_index.unwrap_or(fallback_idx)),
+                        name: raw_name,
+                        target,
+                        status,
+                        count: 1,
+                        started_at: ts,
+                        ended_at,
+                    });
+                }
+            }
+        }
     }
+
+    fn to_cursor(&self, offset: u64) -> TranscriptCursor {
+        let mcp_last_error: Vec<String> = self
+            .mcp_vec
+            .iter()
+            .filter(|srv| self.mcp_last_status.get(*srv) == Some(&ToolStatus::Error))
+            .cloned()
+            .collect();
+        let folded_tools = fold_tools_newest_first(self.tools.clone(), false);
+        let subagents = if self.subagents.len() > 64 {
+            self.subagents[self.subagents.len() - 64..].to_vec()
+        } else {
+            self.subagents.clone()
+        };
+        TranscriptCursor {
+            version: TRANSCRIPT_CURSOR_VERSION,
+            offset,
+            session_started_at: self.session_started_at,
+            skills: self.skills_vec.clone(),
+            mcp_servers: self.mcp_vec.clone(),
+            mcp_last_error,
+            active_slash_mode: self.active_slash_mode.clone(),
+            completed_step_tps_x10: self.completed_step_tps_x10,
+            short_anchor: self.short_anchor,
+            long_anchor: self.long_anchor,
+            latest_planner_step: self.latest_planner_step.clone(),
+            last_step_at: self.last_step_at,
+            max_step_idx: self.max_step_idx,
+            step_lines_seen: self.step_lines_seen,
+            folded_tools,
+            subagents,
+        }
+    }
+
+    fn into_summary(self, todos: Vec<TodoItem>, stdin: Option<&AgyStdinData>) -> TranscriptSummary {
+        let aggregated = fold_tools_newest_first(self.tools, true);
+        let mcp_err_vec: Vec<String> = self
+            .mcp_vec
+            .iter()
+            .filter(|srv| self.mcp_last_status.get(*srv) == Some(&ToolStatus::Error))
+            .cloned()
+            .collect();
+
+        // Merge authoritative live `stdin.subagents` with transcript subagent timestamps/models
+        let mut merged_subagents = Vec::new();
+        if let Some(live_agents) = stdin.and_then(|s| s.subagents.as_ref())
+            && !live_agents.is_empty()
+        {
+            for (idx, sa) in live_agents.iter().enumerate() {
+                let live_clean_name = sa
+                    .name
+                    .as_deref()
+                    .filter(|s| !s.trim().is_empty())
+                    .map(sanitize_text)
+                    .filter(|s| !s.is_empty());
+                let matched = match live_clean_name.as_deref() {
+                    Some(target_name) => self
+                        .subagents
+                        .get(idx)
+                        .filter(|m| m.name == target_name)
+                        .or_else(|| self.subagents.iter().rev().find(|m| m.name == target_name))
+                        .or_else(|| self.subagents.get(idx)),
+                    None => self.subagents.get(idx),
+                };
+                let name = live_clean_name
+                    .or_else(|| matched.map(|m| m.name.clone()))
+                    .unwrap_or_else(|| "subagent".to_string());
+                let role = sa
+                    .role
+                    .as_deref()
+                    .filter(|s| !s.trim().is_empty())
+                    .map(sanitize_text)
+                    .filter(|s| !s.is_empty())
+                    .or_else(|| matched.and_then(|m| m.role.clone()));
+                let model = sa
+                    .model
+                    .as_deref()
+                    .filter(|s| !s.trim().is_empty())
+                    .map(sanitize_text)
+                    .filter(|s| !s.is_empty())
+                    .or_else(|| matched.and_then(|m| m.model.clone()));
+                merged_subagents.push(SubagentEntry {
+                    name,
+                    role,
+                    model,
+                    status: parse_subagent_status(sa.status.as_deref()),
+                    started_at: matched.and_then(|m| m.started_at),
+                    ended_at: matched.and_then(|m| m.ended_at),
+                });
+            }
+        } else {
+            merged_subagents = self.subagents;
+        }
+
+        TranscriptSummary {
+            tools: aggregated,
+            skills: self.skills_vec,
+            mcp_servers: self.mcp_vec,
+            mcp_errors: mcp_err_vec,
+            subagents: merged_subagents,
+            todos,
+            active_slash_mode: self.active_slash_mode,
+            completed_step_tps_x10: self.completed_step_tps_x10,
+            resolved_tps_x10: None,
+            short_anchor: self.short_anchor,
+            long_anchor: self.long_anchor,
+            latest_planner_step: self.latest_planner_step,
+            session_started_at: self.session_started_at,
+            last_step_at: self.last_step_at,
+            step_count: if self.max_step_idx > 0 {
+                self.max_step_idx
+            } else {
+                self.step_lines_seen
+            },
+        }
+    }
+}
+
+/// Incremental `transcript.jsonl` parser supporting byte-offset cursor resumption (`O(Δ)`).
+/// Advances `TranscriptCursor::offset` strictly up to the byte offset immediately preceding the
+/// latest `PLANNER_RESPONSE` or `USER_INPUT` step so live in-flight tool calls and speed timings
+/// remain re-evaluated on every tick while historical turns stay folded in `TranscriptCursor`.
+pub fn parse_transcript_with_cursor(
+    cursor: Option<&TranscriptCursor>,
+    head_line: Option<&str>,
+    delta_text: Option<&str>,
+    base_offset: u64,
+    task_md_content: Option<&str>,
+    stdin: Option<&AgyStdinData>,
+) -> (TranscriptSummary, Option<TranscriptCursor>) {
+    let todos = parse_task_markdown(task_md_content);
+    let head_started_at = head_line
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .and_then(|l| {
+            serde_json::from_str::<RawStep>(l)
+                .ok()
+                .and_then(|s| s.created_at)
+                .and_then(|iso| parse_iso_ms(&iso))
+                .or_else(|| extract_created_at_prefix(l))
+        });
+
+    let valid_cursor =
+        cursor.filter(|c| c.version == TRANSCRIPT_CURSOR_VERSION && c.offset == base_offset);
+
+    let mut parsed_steps = Vec::new();
+    if let Some(delta) = delta_text {
+        let bytes = delta.as_bytes();
+        let mut pos = 0usize;
+        while pos < bytes.len() {
+            let line_start = pos;
+            let (line_end, next_pos) = match delta[pos..].find('\n') {
+                Some(rel_nl) => (pos + rel_nl, pos + rel_nl + 1),
+                None => (bytes.len(), bytes.len()),
+            };
+            pos = next_pos;
+            let trimmed = delta[line_start..line_end].trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if let Ok(step) = serde_json::from_str::<RawStep>(trimmed) {
+                parsed_steps.push(IndexedStep {
+                    line_start_offset: base_offset.saturating_add(line_start as u64),
+                    step,
+                });
+            }
+        }
+    }
+
+    let is_idle = stdin
+        .and_then(|s| s.agent_state.as_deref())
+        .is_some_and(|st| st.eq_ignore_ascii_case("idle"));
+
+    let last_turn_idx = parsed_steps.iter().rposition(|item| {
+        matches!(
+            item.step.step_type.as_deref(),
+            Some("PLANNER_RESPONSE" | "USER_INPUT")
+        )
+    });
+    let commit_idx = last_turn_idx.unwrap_or(0);
+
+    let mut acc = StepAccumulator::from_cursor(valid_cursor, head_started_at);
+    let mut next_cursor = None;
+    if commit_idx > 0 {
+        // Check if a trailing USER_INPUT at `commit_idx` closes a planner step right before `commit_idx`
+        acc.ingest_steps(&parsed_steps[..commit_idx], true);
+        let commit_offset = parsed_steps[commit_idx].line_start_offset;
+        let candidate = acc.to_cursor(commit_offset);
+        if valid_cursor != Some(&candidate) {
+            next_cursor = Some(candidate);
+        }
+    }
+    acc.ingest_steps(&parsed_steps[commit_idx..], is_idle);
+
+    (acc.into_summary(todos, stdin), next_cursor)
+}
+
+/// Pure parser for Antigravity `transcript.jsonl` (head first-line + bounded tail lines) and `task.md`.
+pub fn parse_transcript_and_tasks(
+    head_line: Option<&str>,
+    tail_text: Option<&str>,
+    task_md_content: Option<&str>,
+    stdin: Option<&AgyStdinData>,
+) -> TranscriptSummary {
+    parse_transcript_with_cursor(None, head_line, tail_text, 0, task_md_content, stdin).0
 }
 
 #[cfg(test)]

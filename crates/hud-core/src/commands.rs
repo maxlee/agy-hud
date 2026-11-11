@@ -1,18 +1,20 @@
-use crate::ansi::{BOLD, DIM, colors, paint, strip_ansi};
+use crate::ansi::{BOLD, DIM, colors, mask_preserving_width, paint, strip_ansi};
 use crate::config::{
-    CONFIG_SCHEMA, SchemaValueKind, get_dot_value, parse_config_str, parse_set_pairs, set_dot_value,
+    CONFIG_SCHEMA, HudConfig, SchemaValueKind, get_dot_value, parse_config_str, parse_set_pairs,
+    set_dot_value,
 };
 use crate::probes::{
     apply_speed_cache, is_newer_semver, normalize_semver_tag, parse_cached_quota_info,
-    parse_memory_info, parse_speed_cache_info, parse_update_cache_info, parse_vcs_info,
+    parse_cost_ledger_info, parse_memory_info, parse_speed_cache_info, parse_update_cache_info,
+    parse_vcs_info, reconcile_cost_ledger,
 };
-use crate::render::{RenderInput, render_hud_lines};
+use crate::render::{RenderInput, format_config_problem_line, render_hud_lines_full};
 use crate::transcript::parse_transcript_and_tasks;
 use crate::types::{
     AgyStdinData, CommandOutput, ContextWindowStdin, CostStdin, CurrentUsageStdin, DoctorFacts,
     GlyphMode, Language, LogicPaths, ModelStdin, ProbeAnswers, RawQuotaBucket, SandboxStdin,
     SubagentEntry, SubagentStatus, SubagentStdin, TodoItem, TodoStatus, ToolEntry, ToolStatus,
-    TranscriptSummary, UpdateCacheSnapshot, VimStdin, WorkspaceStdin,
+    TranscriptSummary, UpdateCacheSnapshot, VcsProbeInfo, VimStdin, WorkspaceStdin,
 };
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
@@ -516,6 +518,12 @@ fn run_schema(words: &[String], ctx: &CommandContext<'_>) -> CommandOutput {
                 SchemaValueKind::Enum(allowed) => format!("[{}]", allowed.join(" | ")),
                 SchemaValueKind::Number { min, max } => format!("[{min}..{max}]"),
                 SchemaValueKind::NullableNumber { min, max } => format!("[{min}..{max} | null]"),
+                SchemaValueKind::StringArray(allowed) => {
+                    format!("string[] ({})", allowed.join("|"))
+                }
+                SchemaValueKind::MergeGroups(allowed) => {
+                    format!("string[][] ({})", allowed.join("|"))
+                }
                 other => other.type_name().to_string(),
             };
             format!(
@@ -647,8 +655,8 @@ fn sample_presets(now_ms: i64) -> HashMap<&'static str, SamplePreset> {
                 role: Some("Security Auditor".to_string()),
                 model: None,
                 status: SubagentStatus::Completed,
-                started_at: Some(now_ms - 140_000),
-                ended_at: Some(now_ms - 80_000),
+                started_at: Some(now_ms - 95_000),
+                ended_at: Some(now_ms - 35_000),
             },
         ],
         todos: vec![
@@ -874,20 +882,29 @@ fn run_preview(args: &[String], ctx: &CommandContext<'_>) -> CommandOutput {
         let memory = parse_memory_info(&snap.probes);
         let cached_quota = parse_cached_quota_info(&snap.probes);
         let update_info = parse_update_cache_info(&snap.probes);
+        let cost_ledger = parse_cost_ledger_info(&snap.probes);
+        let (cost_totals, _) =
+            reconcile_cost_ledger(cost_ledger.as_ref(), snap.stdin.as_ref(), ctx.now_ms);
         let cols = explicit_width
             .or_else(|| snap.stdin.as_ref().and_then(|s| s.terminal_width))
             .or(Some(100));
-        let lines = render_hud_lines(RenderInput {
-            stdin: snap.stdin.as_ref(),
-            config: &config,
-            transcript: &transcript,
-            vcs: vcs.as_ref(),
-            memory: memory.as_ref(),
-            cached_quota: cached_quota.as_ref(),
-            update_info: update_info.as_ref(),
-            columns: cols,
-            now_ms: ctx.now_ms,
-        });
+        let mut lines = render_hud_lines_full(
+            RenderInput {
+                stdin: snap.stdin.as_ref(),
+                config: &config,
+                transcript: &transcript,
+                vcs: vcs.as_ref(),
+                memory: memory.as_ref(),
+                cached_quota: cached_quota.as_ref(),
+                update_info: update_info.as_ref(),
+                columns: cols,
+                now_ms: ctx.now_ms,
+            },
+            cost_totals.as_ref(),
+        );
+        if let Some(prob) = format_config_problem_line(&loaded.problems, &config, cols) {
+            lines.push(prob);
+        }
         return CommandOutput {
             lines,
             failed: false,
@@ -946,17 +963,20 @@ fn run_preview(args: &[String], ctx: &CommandContext<'_>) -> CommandOutput {
             out.push(paint(&format!("── {title} ──"), &[DIM, BOLD]));
             let vcs = parse_vcs_info(Some(&p.stdin), &p.probes);
             let memory = parse_memory_info(&p.probes);
-            let rendered = render_hud_lines(RenderInput {
-                stdin: Some(&p.stdin),
-                config: &cfg,
-                transcript: &p.transcript,
-                vcs: vcs.as_ref(),
-                memory: memory.as_ref(),
-                cached_quota: None,
-                update_info: None,
-                columns: Some(explicit_width.unwrap_or(*width)),
-                now_ms: ctx.now_ms,
-            });
+            let rendered = render_hud_lines_full(
+                RenderInput {
+                    stdin: Some(&p.stdin),
+                    config: &cfg,
+                    transcript: &p.transcript,
+                    vcs: vcs.as_ref(),
+                    memory: memory.as_ref(),
+                    cached_quota: None,
+                    update_info: None,
+                    columns: Some(explicit_width.unwrap_or(*width)),
+                    now_ms: ctx.now_ms,
+                },
+                None,
+            );
             out.extend(rendered);
             if idx + 1 < scenarios.len() {
                 out.push(String::new());
@@ -973,17 +993,23 @@ fn run_preview(args: &[String], ctx: &CommandContext<'_>) -> CommandOutput {
         let vcs = parse_vcs_info(Some(&p.stdin), &p.probes);
         let memory = parse_memory_info(&p.probes);
         let cols = explicit_width.or(p.stdin.terminal_width).or(Some(108));
-        let lines = render_hud_lines(RenderInput {
-            stdin: Some(&p.stdin),
-            config: &config,
-            transcript: &p.transcript,
-            vcs: vcs.as_ref(),
-            memory: memory.as_ref(),
-            cached_quota: None,
-            update_info: None,
-            columns: cols,
-            now_ms: ctx.now_ms,
-        });
+        let mut lines = render_hud_lines_full(
+            RenderInput {
+                stdin: Some(&p.stdin),
+                config: &config,
+                transcript: &p.transcript,
+                vcs: vcs.as_ref(),
+                memory: memory.as_ref(),
+                cached_quota: None,
+                update_info: None,
+                columns: cols,
+                now_ms: ctx.now_ms,
+            },
+            None,
+        );
+        if let Some(prob) = format_config_problem_line(&loaded.problems, &config, cols) {
+            lines.push(prob);
+        }
         return CommandOutput {
             lines,
             failed: false,
@@ -996,17 +1022,23 @@ fn run_preview(args: &[String], ctx: &CommandContext<'_>) -> CommandOutput {
         let empty_probes = ProbeAnswers::default();
         let vcs = parse_vcs_info(Some(&custom_stdin), &empty_probes);
         let cols = explicit_width.or(custom_stdin.terminal_width).or(Some(100));
-        let lines = render_hud_lines(RenderInput {
-            stdin: Some(&custom_stdin),
-            config: &config,
-            transcript: &TranscriptSummary::default(),
-            vcs: vcs.as_ref(),
-            memory: None,
-            cached_quota: None,
-            update_info: None,
-            columns: cols,
-            now_ms: ctx.now_ms,
-        });
+        let mut lines = render_hud_lines_full(
+            RenderInput {
+                stdin: Some(&custom_stdin),
+                config: &config,
+                transcript: &TranscriptSummary::default(),
+                vcs: vcs.as_ref(),
+                memory: None,
+                cached_quota: None,
+                update_info: None,
+                columns: cols,
+                now_ms: ctx.now_ms,
+            },
+            None,
+        );
+        if let Some(prob) = format_config_problem_line(&loaded.problems, &config, cols) {
+            lines.push(prob);
+        }
         return CommandOutput {
             lines,
             failed: false,
@@ -1067,8 +1099,8 @@ fn run_set(args: &[String], ctx: &CommandContext<'_>) -> CommandOutput {
 fn scrub_stdin(stdin: Option<&AgyStdinData>) -> Option<AgyStdinData> {
     let s = stdin?;
     let mut out = s.clone();
-    if out.cwd.is_some() {
-        out.cwd = Some("/redacted/project".to_string());
+    if let Some(ref cwd) = out.cwd {
+        out.cwd = Some(mask_preserving_width(cwd));
     }
     if out.session_id.is_some() {
         out.session_id = Some("00000000-0000-0000-0000-000000000000".to_string());
@@ -1076,28 +1108,72 @@ fn scrub_stdin(stdin: Option<&AgyStdinData>) -> Option<AgyStdinData> {
     if out.conversation_id.is_some() {
         out.conversation_id = Some("00000000-0000-0000-0000-000000000000".to_string());
     }
-    if out.conversation_title.is_some() {
-        out.conversation_title = Some("<redacted-title>".to_string());
+    if let Some(ref title) = out.conversation_title {
+        out.conversation_title = Some(mask_preserving_width(title));
     }
-    if out.transcript_path.is_some() {
-        out.transcript_path = Some("/redacted/transcript.jsonl".to_string());
+    if let Some(ref tp) = out.transcript_path {
+        out.transcript_path = Some(mask_preserving_width(tp));
     }
     if out.email.is_some() {
         out.email = Some("user@example.com".to_string());
     }
-    if out.workspace.is_some() {
-        out.workspace = Some(WorkspaceStdin {
-            current_dir: Some("/redacted/project".to_string()),
-            project_dir: Some("/redacted/project".to_string()),
-        });
+    if let Some(ref mut ws) = out.workspace {
+        ws.current_dir = ws.current_dir.as_deref().map(mask_preserving_width);
+        ws.project_dir = ws.project_dir.as_deref().map(mask_preserving_width);
     }
-    if let Some(ref mut vcs) = out.vcs
-        && vcs.client.is_some()
-    {
-        vcs.client = Some("<redacted-client>".to_string());
+    if let Some(ref mut vcs) = out.vcs {
+        if let Some(ref br) = vcs.branch {
+            vcs.branch = Some(mask_preserving_width(br));
+        }
+        if vcs.client.is_some() {
+            vcs.client = Some("<redacted-client>".to_string());
+        }
     }
     out.extra.clear();
     Some(out)
+}
+
+fn scrub_probes(probes: Option<&ProbeAnswers>) -> ProbeAnswers {
+    let Some(p) = probes else {
+        return ProbeAnswers::default();
+    };
+    let vcs = p
+        .vcs
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<VcsProbeInfo>(raw).ok())
+        .and_then(|mut v| {
+            v.branch = mask_preserving_width(&v.branch);
+            v.repo_url = None;
+            serde_json::to_string(&v).ok()
+        });
+    ProbeAnswers {
+        vcs,
+        memory: p.memory.clone(),
+        quota_cache: None,
+        update_cache: None,
+        speed_cache: None,
+        cost_ledger: None,
+    }
+}
+
+fn scrub_non_default_config(cfg: &HudConfig) -> (HudConfig, Map<String, Value>) {
+    let mut scrubbed_cfg = cfg.clone();
+    if !scrubbed_cfg.display.custom_tag.is_empty() {
+        scrubbed_cfg.display.custom_tag = mask_preserving_width(&scrubbed_cfg.display.custom_tag);
+    }
+    let defaults_val = serde_json::to_value(HudConfig::default()).unwrap_or(Value::Null);
+    let current_val = serde_json::to_value(&scrubbed_cfg).unwrap_or(Value::Null);
+    let mut non_default = Map::new();
+    for entry in CONFIG_SCHEMA {
+        let cur = get_dot_value(&current_val, entry.key);
+        let def = get_dot_value(&defaults_val, entry.key);
+        if let Some(c) = cur
+            && Some(c) != def
+        {
+            set_dot_value(&mut non_default, entry.key, c.clone());
+        }
+    }
+    (scrubbed_cfg, non_default)
 }
 
 fn run_report(args: &[String], ctx: &CommandContext<'_>) -> CommandOutput {
@@ -1108,41 +1184,72 @@ fn run_report(args: &[String], ctx: &CommandContext<'_>) -> CommandOutput {
         .cloned()
         .unwrap_or_default();
     let loaded = parse_config_str(ctx.config_text);
+    let (scrubbed_cfg, minimal_config_map) = scrub_non_default_config(&loaded.config);
+
     let snap = ctx
         .last_snapshot_text
         .and_then(|t| serde_json::from_str::<StoredSnapshot>(t).ok());
     let scrubbed_stdin = scrub_stdin(snap.as_ref().and_then(|s| s.stdin.as_ref()));
+    let scrubbed_probes = scrub_probes(snap.as_ref().map(|s| &s.probes));
 
-    let empty_probes = ProbeAnswers::default();
-    let vcs = parse_vcs_info(scrubbed_stdin.as_ref(), &empty_probes);
+    let vcs = parse_vcs_info(scrubbed_stdin.as_ref(), &scrubbed_probes);
+    let memory = parse_memory_info(&scrubbed_probes);
     let cols = scrubbed_stdin
         .as_ref()
         .and_then(|s| s.terminal_width)
         .or(Some(100));
 
-    let rendered: Vec<String> = render_hud_lines(RenderInput {
-        stdin: scrubbed_stdin.as_ref(),
-        config: &loaded.config,
-        transcript: &TranscriptSummary::default(),
-        vcs: vcs.as_ref(),
-        memory: None,
-        cached_quota: None,
-        update_info: None,
-        columns: cols,
-        now_ms: ctx.now_ms,
-    })
+    let rendered: Vec<String> = render_hud_lines_full(
+        RenderInput {
+            stdin: scrubbed_stdin.as_ref(),
+            config: &scrubbed_cfg,
+            transcript: &TranscriptSummary::default(),
+            vcs: vcs.as_ref(),
+            memory: memory.as_ref(),
+            cached_quota: None,
+            update_info: None,
+            columns: cols,
+            now_ms: ctx.now_ms,
+        },
+        None,
+    )
     .into_iter()
     .map(|l| strip_ansi(&l))
     .collect();
+
+    let case_id = if note.trim().is_empty() {
+        "reported-case".to_string()
+    } else {
+        note.chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() {
+                    c.to_ascii_lowercase()
+                } else {
+                    '-'
+                }
+            })
+            .collect::<String>()
+            .trim_matches('-')
+            .to_string()
+    };
 
     let payload = json!({
         "note": note,
         "pluginVersion": ctx.facts.plugin.version,
         "engine": ctx.facts.runtime.engine,
         "engineVersion": ctx.facts.runtime.version,
-        "config": loaded.raw,
+        "config": minimal_config_map,
         "scrubbedStdin": scrubbed_stdin,
         "renderedPlainLines": rendered,
+        "case": {
+            "id": if case_id.is_empty() { "reported-case" } else { case_id.as_str() },
+            "nowMs": ctx.now_ms,
+            "columns": cols,
+            "config": minimal_config_map,
+            "stdin": scrubbed_stdin,
+            "probes": scrubbed_probes,
+            "expectedPlainLines": rendered,
+        }
     });
 
     let pretty = serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_string());

@@ -4,12 +4,58 @@ use crate::transcript::{
     parse_iso_ms, update_speed_anchors,
 };
 use crate::types::{
-    ActiveSpeedSample, AgyStdinData, CachedQuotaSnapshot, MemoryProbeInfo, ProbeAnswers,
-    RawQuotaBucket, SpeedCacheSnapshot, TranscriptSummary, UpdateCacheSnapshot, VcsProbeInfo,
-    VcsType,
+    ActiveSpeedSample, AgyStdinData, CachedQuotaSnapshot, CostLedgerSnapshot, CostTotals,
+    MemoryProbeInfo, ProbeAnswers, RawQuotaBucket, SessionCostEntry, SpeedCacheSnapshot,
+    TranscriptSummary, UpdateCacheSnapshot, VcsProbeInfo, VcsType,
 };
 use serde_json::Value;
 use std::collections::BTreeMap;
+
+/// Normalizes a Git remote origin URL (`https://github.com/owner/repo(.git)` or `git@github.com:owner/repo(.git)`)
+/// strictly to `https://github.com/<owner>/<repo>`, rejecting embedded credentials, non-GitHub hosts, or path traversal.
+pub fn normalize_github_repo_url(raw: &str) -> Option<String> {
+    let clean = sanitize_text(raw);
+    let trimmed = clean.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    let rest = if lower.starts_with("https://github.com/") {
+        &trimmed["https://github.com/".len()..]
+    } else if lower.starts_with("http://github.com/") {
+        &trimmed["http://github.com/".len()..]
+    } else if lower.starts_with("git@github.com:") {
+        &trimmed["git@github.com:".len()..]
+    } else if lower.starts_with("ssh://git@github.com/") {
+        &trimmed["ssh://git@github.com/".len()..]
+    } else {
+        return None;
+    };
+
+    let without_slash = rest.trim_end_matches('/');
+    let without_git = without_slash
+        .strip_suffix(".git")
+        .or_else(|| without_slash.strip_suffix(".GIT"))
+        .unwrap_or(without_slash);
+    let mut parts = without_git.split('/');
+    let owner = parts.next()?;
+    let repo = parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    let valid_seg = |s: &str| {
+        !s.is_empty()
+            && s.len() <= 100
+            && s != "."
+            && s != ".."
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+    };
+    if !valid_seg(owner) || !valid_seg(repo) {
+        return None;
+    }
+    Some(format!("https://github.com/{owner}/{repo}"))
+}
 
 /// Merges `stdin.vcs` metadata from `agy` CLI with optional rich VCS probe JSON from `hud-cli`.
 pub fn parse_vcs_info(
@@ -20,6 +66,10 @@ pub fn parse_vcs_info(
         && let Ok(mut parsed) = serde_json::from_str::<VcsProbeInfo>(raw_json)
     {
         parsed.branch = sanitize_text(&parsed.branch);
+        parsed.repo_url = parsed
+            .repo_url
+            .as_deref()
+            .and_then(normalize_github_repo_url);
         if !parsed.branch.is_empty() {
             return Some(parsed);
         }
@@ -836,6 +886,232 @@ pub fn apply_speed_cache(
         Some((_, false)) => {}
     }
     next_cache
+}
+
+const COST_LEDGER_VERSION: u8 = 1;
+const MAX_LEDGER_SESSIONS: usize = 128;
+const STALE_LEDGER_SESSION_MS: i64 = 14 * 86_400_000;
+
+/// Pure Howard Hinnant epoch-days-to-civil-date (`YYYY, MM, DD`) conversion.
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = (yoe as i64) + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (y + i64::from(m <= 2), m as u32, d as u32)
+}
+
+fn format_ymd(days: i64) -> String {
+    let (y, m, d) = civil_from_days(days);
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+fn utc_day_and_monday_keys(now_ms: i64) -> (String, String) {
+    let epoch_days = now_ms.div_euclid(86_400_000);
+    let weekday_from_mon = (epoch_days + 3).rem_euclid(7);
+    let monday_days = epoch_days - weekday_from_mon;
+    (format_ymd(epoch_days), format_ymd(monday_days))
+}
+
+fn quantize_usd(v: f64) -> f64 {
+    if !v.is_finite() || v <= 0.0 {
+        0.0
+    } else {
+        (v * 100_000.0).round() / 100_000.0
+    }
+}
+
+fn extract_weekly_quota_reset_ms(stdin: Option<&AgyStdinData>, now_ms: i64) -> Option<i64> {
+    let quota = stdin?.quota.as_ref()?;
+    for key in ["gemini-weekly", "gemini-argon-wtu-weekly", "3p-weekly"] {
+        let Some(bucket) = quota.get(key) else {
+            continue;
+        };
+        if bucket.disabled.unwrap_or(false) {
+            continue;
+        }
+        if let Some(rt_ms) = bucket.reset_time.as_deref().and_then(parse_iso_ms)
+            && rt_ms > now_ms
+        {
+            return Some(rt_ms);
+        }
+        if let Some(sec) = bucket.reset_in_seconds
+            && sec.is_finite()
+            && sec > 0.0
+        {
+            return Some(now_ms + (sec * 1000.0).round() as i64);
+        }
+    }
+    None
+}
+
+pub fn parse_cost_ledger_info(answers: &ProbeAnswers) -> Option<CostLedgerSnapshot> {
+    let raw_json = answers.cost_ledger.as_deref()?;
+    let parsed = serde_json::from_str::<CostLedgerSnapshot>(raw_json).ok()?;
+    (parsed.version == COST_LEDGER_VERSION && !parsed.day_key.is_empty()).then_some(parsed)
+}
+
+/// Pure watermark-based cross-session cost ledger reconciler.
+/// Tracks monotonic `total_usd` per `conversation_id` / `session_id` so 300ms statusLine ticks
+/// never double-count spend, and returns `None` for the snapshot output when no disk write is needed.
+pub fn reconcile_cost_ledger(
+    existing: Option<&CostLedgerSnapshot>,
+    stdin: Option<&AgyStdinData>,
+    now_ms: i64,
+) -> (Option<CostTotals>, Option<CostLedgerSnapshot>) {
+    if now_ms <= 0 {
+        return (None, None);
+    }
+    let live_cost = stdin
+        .and_then(|s| s.cost.as_ref())
+        .and_then(|c| c.total_usd)
+        .filter(|v| v.is_finite() && *v >= 0.0);
+
+    if existing.is_none() && live_cost.is_none() {
+        return (None, None);
+    }
+
+    let (day_key, calendar_week_key) = utc_day_and_monday_keys(now_ms);
+    let observed_week_reset_ms = extract_weekly_quota_reset_ms(stdin, now_ms);
+
+    let mut ledger = match existing.filter(|e| e.version == COST_LEDGER_VERSION) {
+        Some(prev) => prev.clone(),
+        None => CostLedgerSnapshot {
+            version: COST_LEDGER_VERSION,
+            day_key: day_key.clone(),
+            calendar_week_key: calendar_week_key.clone(),
+            week_reset_ms: observed_week_reset_ms,
+            day_carry_usd: 0.0,
+            week_carry_usd: 0.0,
+            sessions: BTreeMap::new(),
+        },
+    };
+
+    if ledger.day_key != day_key {
+        ledger.day_key = day_key;
+        ledger.day_carry_usd = 0.0;
+        for entry in ledger.sessions.values_mut() {
+            entry.day_baseline = entry.total;
+        }
+    }
+
+    let week_rolled = match (ledger.week_reset_ms, observed_week_reset_ms) {
+        (Some(prev_reset), Some(next_reset)) => {
+            now_ms >= prev_reset || next_reset > prev_reset + 3_600_000
+        }
+        (Some(prev_reset), None) => now_ms >= prev_reset,
+        (None, _) => ledger.calendar_week_key != calendar_week_key,
+    };
+    if week_rolled {
+        ledger.calendar_week_key = calendar_week_key;
+        ledger.week_reset_ms = observed_week_reset_ms;
+        ledger.week_carry_usd = 0.0;
+        for entry in ledger.sessions.values_mut() {
+            entry.week_baseline = entry.total;
+        }
+    } else if ledger.week_reset_ms.is_none() && observed_week_reset_ms.is_some() {
+        ledger.week_reset_ms = observed_week_reset_ms;
+    }
+
+    if let Some(raw_usd) = live_cost {
+        let usd = quantize_usd(raw_usd);
+        let session_key = stdin
+            .and_then(|s| s.conversation_id.as_deref().or(s.session_id.as_deref()))
+            .map(sanitize_text)
+            .filter(|k| !k.is_empty())
+            .unwrap_or_else(|| "_ephemeral".to_string());
+
+        if let Some(entry) = ledger.sessions.get_mut(&session_key) {
+            if usd + 1e-5 < entry.total {
+                ledger.day_carry_usd = quantize_usd(
+                    ledger.day_carry_usd + (entry.total - entry.day_baseline).max(0.0),
+                );
+                ledger.week_carry_usd = quantize_usd(
+                    ledger.week_carry_usd + (entry.total - entry.week_baseline).max(0.0),
+                );
+                entry.day_baseline = 0.0;
+                entry.week_baseline = 0.0;
+                entry.total = usd;
+                entry.updated_at = now_ms;
+            } else if usd > entry.total + 1e-6 {
+                entry.total = usd;
+                entry.updated_at = now_ms;
+            }
+        } else {
+            ledger.sessions.insert(
+                session_key,
+                SessionCostEntry {
+                    day_baseline: 0.0,
+                    week_baseline: 0.0,
+                    total: usd,
+                    updated_at: now_ms,
+                },
+            );
+        }
+    }
+
+    // Prune ancient sessions (>14d) or cap session map size while folding active deltas into carry
+    let stale_keys: Vec<String> = ledger
+        .sessions
+        .iter()
+        .filter(|(_, e)| now_ms.saturating_sub(e.updated_at) > STALE_LEDGER_SESSION_MS)
+        .map(|(k, _)| k.clone())
+        .collect();
+    for k in stale_keys {
+        if let Some(removed) = ledger.sessions.remove(&k) {
+            ledger.day_carry_usd = quantize_usd(
+                ledger.day_carry_usd + (removed.total - removed.day_baseline).max(0.0),
+            );
+            ledger.week_carry_usd = quantize_usd(
+                ledger.week_carry_usd + (removed.total - removed.week_baseline).max(0.0),
+            );
+        }
+    }
+    while ledger.sessions.len() > MAX_LEDGER_SESSIONS {
+        let Some(oldest_key) = ledger
+            .sessions
+            .iter()
+            .min_by_key(|(_, e)| e.updated_at)
+            .map(|(k, _)| k.clone())
+        else {
+            break;
+        };
+        if let Some(removed) = ledger.sessions.remove(&oldest_key) {
+            ledger.day_carry_usd = quantize_usd(
+                ledger.day_carry_usd + (removed.total - removed.day_baseline).max(0.0),
+            );
+            ledger.week_carry_usd = quantize_usd(
+                ledger.week_carry_usd + (removed.total - removed.week_baseline).max(0.0),
+            );
+        }
+    }
+
+    let today_sum: f64 = ledger
+        .sessions
+        .values()
+        .map(|e| (e.total - e.day_baseline).max(0.0))
+        .sum();
+    let week_sum: f64 = ledger
+        .sessions
+        .values()
+        .map(|e| (e.total - e.week_baseline).max(0.0))
+        .sum();
+
+    let totals = CostTotals {
+        today_usd: quantize_usd(ledger.day_carry_usd + today_sum),
+        week_usd: quantize_usd(ledger.week_carry_usd + week_sum),
+        estimated: stdin
+            .and_then(|s| s.cost.as_ref())
+            .and_then(|c| c.estimated)
+            .unwrap_or(true),
+    };
+    let changed = existing != Some(&ledger);
+    (Some(totals), changed.then_some(ledger))
 }
 
 #[cfg(test)]

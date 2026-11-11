@@ -1,0 +1,78 @@
+{
+  "id": "05-ascii-glyph-mode-high-push",
+  "nowMs": 1794218400000,
+  "columns": 112,
+  "config": {
+    "vcs": {
+      "pushWarningThreshold": 5,
+      "pushCriticalThreshold": 10
+    },
+    "display": {
+      "glyphMode": "ascii",
+      "showLaunchDir": true
+    }
+  },
+  "stdin": {
+    "cwd": "/Users/dev/agy-hud/crates/hud-cli",
+    "conversation_id": "conv-corpus-05",
+    "agent_state": "thinking",
+    "cycle_mode": "plan",
+    "terminal_width": 112,
+    "workspace": {
+      "project_dir": "/Users/dev/agy-hud",
+      "current_dir": "/Users/dev/agy-hud/crates/hud-cli"
+    },
+    "model": {
+      "id": "Gemini 4 Argon (High)",
+      "display_name": "Gemini 4 Argon (High)",
+      "effort": "high"
+    },
+    "context_window": {
+      "context_window_size": 1048576,
+      "used_percentage": 55.0
+    },
+    "quota": {
+      "gemini-5h": {
+        "remaining_fraction": 0.60,
+        "reset_in_seconds": 13500.0
+      }
+    }
+  },
+  "probes": {
+    "vcs": "{\"type\":\"git\",\"branch\":\"feat/ascii\",\"dirty\":true,\"ahead\":14}"
+  },
+  "transcript": {
+    "tools": [],
+    "skills": [],
+    "mcp_servers": [],
+    "mcp_errors": [],
+    "subagents": [
+      {
+        "name": "retired",
+        "role": "Expired Helper",
+        "model": null,
+        "status": "completed",
+        "started_at": 1794218280000,
+        "ended_at": 1794218320000
+      },
+      {
+        "name": "active",
+        "role": "Security Scanner",
+        "model": "gemini-3-flash",
+        "status": "running",
+        "started_at": 1794218390000,
+        "ended_at": null
+      }
+    ],
+    "todos": [],
+    "session_started_at": 1794218100000,
+    "last_step_at": 1794218398000,
+    "step_count": 5
+  },
+  "expectedPlainLines": [
+    "+- ~ THINKING | [PLAN] | [Gemini 4 Argon . high] | agy-hud > hud-cli git:(feat/ascii* ^14) | 5m",
+    "|- Ctx ####=--- 55.0% | agents 1/2",
+    "|- Quota(5h) ##--- 40%^ (3h 45m)",
+    "+- ~ Security Scanner [active] (10s)"
+  ]
+}

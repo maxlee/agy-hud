@@ -2,7 +2,7 @@ use crate::ansi::sanitize_text;
 use crate::transcript::parse_iso_ms;
 use crate::types::{
     AgyStdinData, CachedQuotaSnapshot, EffortFormatMode, GlyphMode, ModelFormatMode, ModelStdin,
-    PathLevels, QuotaBucketView, RawQuotaBucket,
+    PathLevels, QuotaBucketView, QuotaPace, RawQuotaBucket,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -501,6 +501,49 @@ pub fn extract_quota_buckets_reconciled(
         .collect()
 }
 
+/// Projects whether the current quota bucket burn rate will exhaust the window before reset.
+/// Ignores early low-usage noise (`used_percent < 10%`) to avoid false alarms right after reset.
+pub fn compute_quota_pace(bucket: &QuotaBucketView) -> QuotaPace {
+    let id_lower = bucket.id.to_ascii_lowercase();
+    let label_lower = bucket.label.to_ascii_lowercase();
+    let window_sec = if id_lower.contains("5h") || label_lower.contains("5h") {
+        18_000.0
+    } else if id_lower.contains("weekly")
+        || id_lower.contains("7d")
+        || label_lower.contains("weekly")
+        || label_lower.contains("7d")
+    {
+        604_800.0
+    } else {
+        return QuotaPace::Normal;
+    };
+
+    let (Some(used_pct), Some(reset_sec)) = (bucket.used_percent, bucket.reset_in_seconds) else {
+        return QuotaPace::Normal;
+    };
+    if !used_pct.is_finite()
+        || !reset_sec.is_finite()
+        || used_pct < 10.0
+        || reset_sec <= 0.0
+        || reset_sec >= window_sec
+    {
+        return QuotaPace::Normal;
+    }
+
+    let elapsed_fraction = ((window_sec - reset_sec) / window_sec).clamp(0.0, 1.0);
+    if elapsed_fraction <= 0.001 {
+        return QuotaPace::Normal;
+    }
+    let projected_used_pct = used_pct / elapsed_fraction;
+    if projected_used_pct > 100.0 {
+        QuotaPace::Critical
+    } else if projected_used_pct >= 90.0 {
+        QuotaPace::Warning
+    } else {
+        QuotaPace::Normal
+    }
+}
+
 pub fn format_compact_tokens(count: u64) -> String {
     if count >= 1_000_000 {
         format!("{:.1}M", (count as f64) / 1_000_000.0)
@@ -563,4 +606,61 @@ pub fn format_workspace_path(raw_path: Option<&str>, levels: PathLevels) -> Stri
         return parts.join("/");
     }
     parts[parts.len() - keep_count..].join("/")
+}
+
+/// Formats workspace directory with optional launch-directory breadcrumb (`project_dir › current_dir`)
+/// when `show_launch_dir` is enabled and `current_dir` is deeper than `pathLevels` or outside `project_dir`.
+pub fn format_workspace_breadcrumb(
+    project_dir: Option<&str>,
+    current_dir: Option<&str>,
+    levels: PathLevels,
+    show_launch_dir: bool,
+    glyph_mode: GlyphMode,
+) -> String {
+    let active_dir = current_dir.filter(|s| !s.trim().is_empty()).or(project_dir);
+    let short_cur = format_workspace_path(active_dir, levels);
+    if !show_launch_dir || short_cur.is_empty() {
+        return short_cur;
+    }
+
+    let Some(keep_count) = levels.as_count() else {
+        return short_cur;
+    };
+    let Some(proj_clean) = project_dir.map(sanitize_text).filter(|s| !s.is_empty()) else {
+        return short_cur;
+    };
+    let Some(cur_clean) = current_dir.map(sanitize_text).filter(|s| !s.is_empty()) else {
+        return short_cur;
+    };
+
+    let norm_proj = proj_clean.replace('\\', "/");
+    let norm_proj = norm_proj.trim_end_matches('/');
+    let norm_cur = cur_clean.replace('\\', "/");
+    let norm_cur = norm_cur.trim_end_matches('/');
+    if norm_proj.is_empty() || norm_cur.is_empty() || norm_proj == norm_cur {
+        return short_cur;
+    }
+
+    let proj_name = norm_proj.rsplit('/').find(|p| !p.is_empty()).unwrap_or("/");
+    let needs_breadcrumb = if let Some(rel) = norm_cur.strip_prefix(norm_proj) {
+        if let Some(after_slash) = rel.strip_prefix('/') {
+            let depth = after_slash.split('/').filter(|p| !p.is_empty()).count();
+            depth >= keep_count
+        } else {
+            // Sibling directory sharing a string prefix (e.g., `/work/app` vs `/work/app-v2`)
+            true
+        }
+    } else {
+        true
+    };
+
+    if !needs_breadcrumb {
+        return short_cur;
+    }
+
+    let sep = match glyph_mode {
+        GlyphMode::Ascii => ">",
+        GlyphMode::Unicode | GlyphMode::Nerd => "›",
+    };
+    format!("{proj_name} {sep} {short_cur}")
 }

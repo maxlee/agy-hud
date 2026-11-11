@@ -1,0 +1,110 @@
+{
+  "id": "01-expanded-multi-agent",
+  "nowMs": 1794218400000,
+  "columns": 116,
+  "config": {
+    "vcs": {
+      "pushWarningThreshold": 3,
+      "pushCriticalThreshold": 10
+    }
+  },
+  "stdin": {
+    "cwd": "/Users/dev/agy-hud",
+    "conversation_id": "conv-corpus-01",
+    "agent_state": "tool_use",
+    "cycle_mode": "auto_edit",
+    "plan_tier": "Ultra",
+    "terminal_width": 116,
+    "workspace": {
+      "project_dir": "/Users/dev/agy-hud",
+      "current_dir": "/Users/dev/agy-hud"
+    },
+    "model": {
+      "id": "Gemini 4 Argon (High)",
+      "display_name": "Gemini 4 Argon (High)",
+      "effort": "high"
+    },
+    "context_window": {
+      "context_window_size": 1048576,
+      "used_percentage": 46.0
+    },
+    "quota": {
+      "gemini-weekly": {
+        "remaining_fraction": 0.68,
+        "reset_in_seconds": 345600.0
+      }
+    },
+    "cost": {
+      "total_usd": 1.38,
+      "estimated": false
+    }
+  },
+  "probes": {
+    "vcs": "{\"type\":\"git\",\"branch\":\"feat/corpus\",\"dirty\":true,\"ahead\":5,\"repoUrl\":\"https://github.com/Max/agy-hud\"}"
+  },
+  "transcript": {
+    "tools": [
+      {
+        "id": "t1",
+        "name": "run_command",
+        "target": "cargo test --workspace",
+        "status": "running",
+        "count": 1,
+        "started_at": 1794218396000,
+        "ended_at": null
+      },
+      {
+        "id": "t2",
+        "name": "edit_file",
+        "target": "render.rs",
+        "status": "completed",
+        "count": 3,
+        "started_at": 1794218380000,
+        "ended_at": 1794218381000
+      }
+    ],
+    "skills": ["hud"],
+    "mcp_servers": ["context7"],
+    "mcp_errors": [],
+    "subagents": [
+      {
+        "name": "research",
+        "role": "Architecture Reviewer",
+        "model": "gemini-3.1-pro",
+        "status": "running",
+        "started_at": 1794218388000,
+        "ended_at": null
+      },
+      {
+        "name": "verifier",
+        "role": "Test Runner",
+        "model": "gemini-3-flash",
+        "status": "completed",
+        "started_at": 1794218350000,
+        "ended_at": 1794218375000
+      }
+    ],
+    "todos": [
+      {
+        "text": "Validate corpus snapshots",
+        "status": "in_progress"
+      },
+      {
+        "text": "Wire Git filter defense",
+        "status": "completed"
+      }
+    ],
+    "session_started_at": 1794218040000,
+    "last_step_at": 1794218396000,
+    "step_count": 8
+  },
+  "expectedPlainLines": [
+    "╭─ 🔧 TOOL │ [Gemini 4 Argon · high] Ultra │ agy-hud git:(feat/corpus* ↑5) │ ⏱ 6m",
+    "├─ Ctx ███▒···· 46.0% │ $1.38 · agents 1/2",
+    "├─ Quota(weekly) █▒··· 32% (4d)",
+    "├─ ◐ run_command: cargo test --workspace · ✓ edit_file ×3: render.rs",
+    "├─ Skills: hud │ MCP: context7",
+    "├─ ◐ Architecture Reviewer [research] (12s) │ ✓ Test Runner [verifier] (25s)",
+    "╰─ ▸ Validate corpus snapshots (1/2 · 50%)"
+  ]
+}

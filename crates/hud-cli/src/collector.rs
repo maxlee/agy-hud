@@ -1,15 +1,17 @@
 use crate::paths::{AgyPaths, atomic_write_bytes, canonical_or_parent, create_private_dir_all};
 use hud_core::config::HudConfig;
 use hud_core::probes::{
-    parse_git_head_text, parse_git_porcelain_v2, parse_hg_probe_output, parse_jj_probe_output,
+    normalize_github_repo_url, parse_git_head_text, parse_git_porcelain_v2, parse_hg_probe_output,
+    parse_jj_probe_output,
 };
-use hud_core::transcript::parse_transcript_and_tasks;
+use hud_core::transcript::{parse_transcript_and_tasks, parse_transcript_with_cursor};
 use hud_core::types::{
-    AgyStdinData, LogicPaths, MemoryProbeInfo, ProbeAnswers, TranscriptSummary, VcsProbeInfo,
-    VcsStdin, VcsType,
+    AgyStdinData, LogicPaths, MemoryProbeInfo, ProbeAnswers, TRANSCRIPT_CURSOR_VERSION,
+    TranscriptCursor, TranscriptSummary, VcsProbeInfo, VcsStdin, VcsType,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
+use std::ffi::OsStr;
 use std::fs::{self, File};
 use std::io::{IsTerminal, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -22,6 +24,7 @@ pub const MAX_STDIN_BYTES: usize = 256 * 1024;
 pub const STDIN_READ_TIMEOUT_MS: u64 = 1_000;
 pub const HEAD_READ_BYTES: usize = 32 * 1024;
 pub const TAIL_READ_BYTES: u64 = 512 * 1024;
+pub const MAX_CURSOR_DELTA_BYTES: u64 = 2 * 1024 * 1024;
 pub const MAX_TASK_MD_BYTES: u64 = 64 * 1024;
 pub const PROBE_TIMEOUT_MS: u64 = 1_200;
 pub const PROBE_MAX_BUFFER: u64 = 512 * 1024;
@@ -237,6 +240,123 @@ pub fn read_transcript_slices(path: &Path) -> (Option<String>, Option<String>) {
     (head_line, Some(tail_str))
 }
 
+/// Incremental `O(Δ)` transcript reader backed by `TranscriptCursor`.
+/// Seeks directly to `cursor.offset` when valid; falls back to full scan (`<= 2 MB`) or bounded
+/// `512 KB` tail slice on cold start, and atomically persists updated cursors when `cursor_path` is set.
+pub fn read_and_parse_transcript_incremental(
+    transcript_path: Option<&Path>,
+    cursor_path: Option<&Path>,
+    task_md_content: Option<&str>,
+    stdin: Option<&AgyStdinData>,
+) -> TranscriptSummary {
+    let Some(tp) = transcript_path else {
+        return parse_transcript_and_tasks(None, None, task_md_content, stdin);
+    };
+    let Ok(meta) = fs::metadata(tp) else {
+        return parse_transcript_and_tasks(None, None, task_md_content, stdin);
+    };
+    if !meta.is_file() || meta.len() == 0 {
+        return parse_transcript_and_tasks(None, None, task_md_content, stdin);
+    }
+    let Ok(mut f) = File::open(tp) else {
+        return parse_transcript_and_tasks(None, None, task_md_content, stdin);
+    };
+
+    let file_len = meta.len();
+    let head_len = (file_len as usize).min(HEAD_READ_BYTES);
+    let mut head_buf = vec![0u8; head_len];
+    let head_line = if let Ok(n) = f.read(&mut head_buf) {
+        let slice = &head_buf[..n];
+        let end = slice.iter().position(|&b| b == b'\n').unwrap_or(n);
+        Some(String::from_utf8_lossy(&slice[..end]).into_owned())
+    } else {
+        None
+    };
+
+    let existing_cursor: Option<TranscriptCursor> = cursor_path
+        .and_then(|cp| read_bounded_string(cp, 64 * 1024))
+        .and_then(|raw| serde_json::from_str::<TranscriptCursor>(&raw).ok())
+        .filter(|c| c.version == TRANSCRIPT_CURSOR_VERSION && c.offset <= file_len);
+
+    let (use_cursor, read_offset) = match existing_cursor.as_ref() {
+        Some(cur) if file_len.saturating_sub(cur.offset) <= MAX_CURSOR_DELTA_BYTES => {
+            (Some(cur), cur.offset)
+        }
+        _ if file_len <= MAX_CURSOR_DELTA_BYTES => (None, 0),
+        _ => {
+            let tail_offset = file_len.saturating_sub(TAIL_READ_BYTES);
+            if f.seek(SeekFrom::Start(tail_offset)).is_err() {
+                return parse_transcript_and_tasks(
+                    head_line.as_deref(),
+                    None,
+                    task_md_content,
+                    stdin,
+                );
+            }
+            let mut tail_buf = Vec::with_capacity((file_len - tail_offset) as usize);
+            if f.take(TAIL_READ_BYTES + 1)
+                .read_to_end(&mut tail_buf)
+                .is_err()
+            {
+                return parse_transcript_and_tasks(
+                    head_line.as_deref(),
+                    None,
+                    task_md_content,
+                    stdin,
+                );
+            }
+            let lossy = String::from_utf8_lossy(&tail_buf);
+            let (aligned_offset, aligned_tail) = match lossy.find('\n') {
+                Some(nl) => (tail_offset + (nl as u64) + 1, &lossy[nl + 1..]),
+                None => (file_len, ""),
+            };
+            let (summary, next_cursor) = parse_transcript_with_cursor(
+                None,
+                head_line.as_deref(),
+                Some(aligned_tail),
+                aligned_offset,
+                task_md_content,
+                stdin,
+            );
+            if let (Some(cp), Some(updated)) = (cursor_path, next_cursor)
+                && let Ok(bytes) = serde_json::to_vec(&updated)
+            {
+                let _ = atomic_write_bytes(cp, &bytes, 0o600);
+            }
+            return summary;
+        }
+    };
+
+    if f.seek(SeekFrom::Start(read_offset)).is_err() {
+        return parse_transcript_and_tasks(head_line.as_deref(), None, task_md_content, stdin);
+    }
+    let delta_cap = (file_len - read_offset) as usize;
+    let mut delta_buf = Vec::with_capacity(delta_cap);
+    if f.take(MAX_CURSOR_DELTA_BYTES + 1)
+        .read_to_end(&mut delta_buf)
+        .is_err()
+    {
+        return parse_transcript_and_tasks(head_line.as_deref(), None, task_md_content, stdin);
+    }
+    let delta_str = String::from_utf8_lossy(&delta_buf);
+    let (summary, next_cursor) = parse_transcript_with_cursor(
+        use_cursor,
+        head_line.as_deref(),
+        Some(&delta_str),
+        read_offset,
+        task_md_content,
+        stdin,
+    );
+
+    if let (Some(cp), Some(updated)) = (cursor_path, next_cursor)
+        && let Ok(bytes) = serde_json::to_vec(&updated)
+    {
+        let _ = atomic_write_bytes(cp, &bytes, 0o600);
+    }
+
+    summary
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DetectedRepo {
     Git {
@@ -402,10 +522,12 @@ pub fn compute_vcs_signature(repo: &DetectedRepo) -> String {
                 }
             }
             format!(
-                "git|{}|{}|{}|{}",
+                "git|{}|{}|{}|{}|{}|{}",
                 stat_token(&head_path),
                 stat_token(&git_dir.join("index")),
                 stat_token(&common_dir.join("packed-refs")),
+                stat_token(&git_dir.join("config")),
+                stat_token(&common_dir.join("config")),
                 ref_token,
             )
         }
@@ -421,6 +543,129 @@ pub fn compute_vcs_signature(repo: &DetectedRepo) -> String {
             stat_token(&meta_dir.join("bookmarks")),
         ),
     }
+}
+
+/// Returns `true` strictly when a Git filter driver name is safe to interpolate into `-c filter.<name>.*=`.
+pub fn is_safe_git_filter_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 128
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+}
+
+fn has_git_include_directive(config_text: &str) -> bool {
+    for raw_line in config_text.lines() {
+        let line = raw_line.trim();
+        if !line.starts_with('[') {
+            continue;
+        }
+        let Some(close) = line.find(']') else {
+            continue;
+        };
+        let header = line[1..close].trim();
+        let section_head = header
+            .split(|c: char| c.is_ascii_whitespace() || c == '"' || c == '.')
+            .next()
+            .unwrap_or("");
+        if section_head.eq_ignore_ascii_case("include")
+            || section_head.eq_ignore_ascii_case("includeIf")
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Extracts and normalizes `[remote "origin"] url` from `.git/config` in-memory (zero subprocesses),
+/// returning `Some("https://github.com/<owner>/<repo>")` only for valid GitHub remotes.
+pub fn extract_git_remote_origin_url(git_dir: &Path, common_dir: &Path) -> Option<String> {
+    for cfg_path in [git_dir.join("config"), common_dir.join("config")] {
+        let Some(text) = read_bounded_string(&cfg_path, 128 * 1024) else {
+            continue;
+        };
+        let mut in_origin = false;
+        for raw_line in text.lines() {
+            let line = raw_line.trim();
+            if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+                continue;
+            }
+            if line.starts_with('[') {
+                in_origin = false;
+                if let Some(close) = line.find(']') {
+                    let header = line[1..close].trim();
+                    if header.len() >= 6 && header[..6].eq_ignore_ascii_case("remote") {
+                        let rest = header[6..].trim();
+                        let remote_name = if let Some(q) = rest.strip_prefix('"') {
+                            q.strip_suffix('"').map(str::trim)
+                        } else {
+                            rest.strip_prefix('.').map(str::trim)
+                        };
+                        in_origin = remote_name == Some("origin");
+                    }
+                }
+                continue;
+            }
+            if in_origin
+                && let Some((k, v)) = line.split_once('=')
+                && k.trim().eq_ignore_ascii_case("url")
+            {
+                let raw_val = v.trim();
+                let unquoted = if let Some(q) = raw_val.strip_prefix('"') {
+                    q.split('"').next().unwrap_or("")
+                } else {
+                    raw_val.split(['#', ';']).next().unwrap_or("").trim()
+                };
+                if let Some(norm) = normalize_github_repo_url(unquoted) {
+                    return Some(norm);
+                }
+            }
+        }
+    }
+    None
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnsafeGitFilterError;
+
+/// Parses `git config --show-scope -z --get-regexp ^(core\.repositoryformatversion|filter\.)` output.
+/// Ignores `global` and `system` scopes (preserving user `git-lfs`) while returning all repo-scoped
+/// filter names, or `Err(UnsafeGitFilterError)` if any repo-scoped filter name cannot be safely neutralized via `-c`.
+pub fn parse_git_scoped_filters(raw: &str) -> Result<Vec<String>, UnsafeGitFilterError> {
+    let mut tokens: Vec<&str> = raw.split('\0').collect();
+    if tokens.last() == Some(&"") {
+        tokens.pop();
+    }
+    let mut names = BTreeSet::new();
+    let mut idx = 0usize;
+    while idx < tokens.len() {
+        let tok = tokens[idx];
+        let (scope, entry) = if let Some((sc, rest)) = tok.split_once('\t') {
+            idx += 1;
+            (sc.trim(), rest)
+        } else {
+            let Some(&next_tok) = tokens.get(idx + 1) else {
+                break;
+            };
+            idx += 2;
+            (tok.trim(), next_tok)
+        };
+
+        if scope.eq_ignore_ascii_case("global") || scope.eq_ignore_ascii_case("system") {
+            continue;
+        }
+        let key = entry.split('\n').next().unwrap_or(entry).trim();
+        if key.len() > 7
+            && key[..7].eq_ignore_ascii_case("filter.")
+            && let Some((filter_name, _attr)) = key[7..].rsplit_once('.')
+        {
+            if !is_safe_git_filter_name(filter_name) {
+                return Err(UnsafeGitFilterError);
+            }
+            names.insert(filter_name.to_string());
+        }
+    }
+    Ok(names.into_iter().collect())
 }
 
 /// Extracts `[filter "<name>"]` / `[filter.<name>]` driver names from `.git/config` so `probe_git`
@@ -447,7 +692,6 @@ pub fn extract_git_filter_names(config_text: &str) -> Vec<String> {
         };
         if let Some(name) = extracted
             && !name.is_empty()
-            && !name.chars().any(|c| c.is_control() || c == '\0')
         {
             names.insert(name.to_string());
         }
@@ -455,18 +699,13 @@ pub fn extract_git_filter_names(config_text: &str) -> Vec<String> {
     names.into_iter().collect()
 }
 
-pub fn build_git_filter_neutralizers(git_dir: &Path, common_dir: &Path) -> Vec<String> {
-    let mut names = BTreeSet::new();
-    for cfg_path in [git_dir.join("config"), common_dir.join("config")] {
-        if let Some(text) = read_bounded_string(&cfg_path, 128 * 1024) {
-            for n in extract_git_filter_names(&text) {
-                names.insert(n);
-            }
+fn format_filter_neutralizer_args<I: IntoIterator<Item = String>>(names: I) -> Vec<String> {
+    let collected: Vec<String> = names.into_iter().collect();
+    let mut args = Vec::with_capacity(collected.len() * 8);
+    for name in collected {
+        if !is_safe_git_filter_name(&name) {
+            continue;
         }
-    }
-
-    let mut args = Vec::with_capacity(names.len() * 8);
-    for name in names {
         for suffix in ["clean=", "smudge=", "process=", "required=false"] {
             args.push("-c".to_string());
             args.push(format!("filter.{name}.{suffix}"));
@@ -475,9 +714,139 @@ pub fn build_git_filter_neutralizers(git_dir: &Path, common_dir: &Path) -> Vec<S
     args
 }
 
+pub fn build_git_filter_neutralizers(git_dir: &Path, common_dir: &Path) -> Vec<String> {
+    let mut names = BTreeSet::new();
+    for cfg_path in [
+        git_dir.join("config"),
+        common_dir.join("config"),
+        git_dir.join("config.worktree"),
+    ] {
+        if let Some(text) = read_bounded_string(&cfg_path, 128 * 1024) {
+            for n in extract_git_filter_names(&text) {
+                names.insert(n);
+            }
+        }
+    }
+    format_filter_neutralizer_args(names)
+}
+
+fn resolve_git_filter_neutralizers(
+    root: &Path,
+    git_dir: &Path,
+    common_dir: &Path,
+    runner: &dyn ProbeRunner,
+) -> Result<Vec<String>, UnsafeGitFilterError> {
+    let mut names = BTreeSet::new();
+    let mut has_include = false;
+
+    for cfg_path in [
+        git_dir.join("config"),
+        common_dir.join("config"),
+        git_dir.join("config.worktree"),
+    ] {
+        if let Some(text) = read_bounded_string(&cfg_path, 128 * 1024) {
+            if has_git_include_directive(&text) {
+                has_include = true;
+            }
+            for n in extract_git_filter_names(&text) {
+                if !is_safe_git_filter_name(&n) {
+                    return Err(UnsafeGitFilterError);
+                }
+                names.insert(n);
+            }
+        }
+    }
+
+    if has_include {
+        let mut cfg_args: Vec<String> = GIT_SAFE_PREFIX.iter().map(|s| (*s).to_string()).collect();
+        cfg_args.extend([
+            "config".to_string(),
+            "--show-scope".to_string(),
+            "-z".to_string(),
+            "--get-regexp".to_string(),
+            r"^(core\.repositoryformatversion|filter\.)".to_string(),
+        ]);
+        let scoped_out = runner
+            .run("git", &cfg_args, Some(root))
+            .ok_or(UnsafeGitFilterError)?;
+        for scoped_name in parse_git_scoped_filters(&scoped_out)? {
+            names.insert(scoped_name);
+        }
+    }
+
+    Ok(format_filter_neutralizer_args(names))
+}
+
+/// Resolves `cmd` strictly from absolute directories in `PATH`, preventing Windows `CreateProcessW`
+/// working-directory hijacking (`git.exe` / `git.bat` / `git.cmd` planted in an untrusted repo `cwd`)
+/// and ignoring relative `PATH` entries (`.` or `bin`).
+pub fn resolve_executable_in_path(
+    cmd: &str,
+    path_env: Option<&OsStr>,
+    is_windows: bool,
+) -> Option<PathBuf> {
+    if cmd.is_empty() || cmd.contains('\0') {
+        return None;
+    }
+    let cmd_path = Path::new(cmd);
+    if cmd_path.is_absolute() {
+        return fs::metadata(cmd_path)
+            .ok()
+            .filter(|m| m.is_file())
+            .map(|_| cmd_path.to_path_buf());
+    }
+    if cmd.contains(['/', '\\']) {
+        return None;
+    }
+
+    let path_os = path_env?;
+    if is_windows {
+        let base = if cmd.len() > 4 && cmd[cmd.len() - 4..].eq_ignore_ascii_case(".exe") {
+            &cmd[..cmd.len() - 4]
+        } else if cmd.contains('.') {
+            return None;
+        } else {
+            cmd
+        };
+        let exe_name = format!("{base}.exe");
+        for dir in std::env::split_paths(path_os) {
+            if !dir.is_absolute() {
+                continue;
+            }
+            let candidate = dir.join(&exe_name);
+            if fs::metadata(&candidate).is_ok_and(|m| m.is_file()) {
+                return Some(candidate);
+            }
+        }
+        None
+    } else {
+        for dir in std::env::split_paths(path_os) {
+            if !dir.is_absolute() {
+                continue;
+            }
+            let candidate = dir.join(cmd);
+            if let Ok(meta) = fs::metadata(&candidate)
+                && meta.is_file()
+            {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    if meta.permissions().mode() & 0o111 == 0 {
+                        continue;
+                    }
+                }
+                return Some(candidate);
+            }
+        }
+        None
+    }
+}
+
 /// Timeout-bounded, shell-free subprocess runner (`1200ms` hard cap, `512 KB` stdout cap).
 pub fn exec_file_safe(cmd: &str, args: &[String], cwd: Option<&Path>) -> Option<String> {
-    let mut command = Command::new(cmd);
+    let resolved_bin =
+        resolve_executable_in_path(cmd, std::env::var_os("PATH").as_deref(), cfg!(windows))?;
+    let mut command = Command::new(&resolved_bin);
     command
         .args(args)
         .stdin(Stdio::null())
@@ -551,8 +920,9 @@ pub fn probe_git(
     common_dir: &Path,
     runner: &dyn ProbeRunner,
 ) -> Option<VcsProbeInfo> {
+    let filter_args = resolve_git_filter_neutralizers(root, git_dir, common_dir, runner).ok()?;
     let mut status_args: Vec<String> = GIT_SAFE_PREFIX.iter().map(|s| (*s).to_string()).collect();
-    status_args.extend(build_git_filter_neutralizers(git_dir, common_dir));
+    status_args.extend(filter_args);
     status_args.extend([
         "status".to_string(),
         "--porcelain=v2".to_string(),
@@ -573,7 +943,9 @@ pub fn probe_git(
         None
     };
 
-    parse_git_porcelain_v2(&out, detached_rev.as_deref())
+    let mut info = parse_git_porcelain_v2(&out, detached_rev.as_deref())?;
+    info.repo_url = extract_git_remote_origin_url(git_dir, common_dir);
+    Some(info)
 }
 
 pub fn probe_jj(root: &Path, runner: &dyn ProbeRunner) -> Option<VcsProbeInfo> {
@@ -599,10 +971,12 @@ pub fn probe_hg(root: &Path, runner: &dyn ProbeRunner) -> Option<VcsProbeInfo> {
 }
 
 /// Zero-subprocess fallback reading `.git/HEAD` (including linked worktree gitdirs) when `git`
-/// is unavailable or exceeds `PROBE_TIMEOUT_MS`.
+/// is unavailable, exceeds `PROBE_TIMEOUT_MS`, or contains unskippable local filter names.
 pub fn read_git_head_fallback(git_dir: &Path) -> Option<VcsProbeInfo> {
     let head_raw = read_bounded_string(&git_dir.join("HEAD"), 4096)?;
-    parse_git_head_text(&head_raw)
+    let mut info = parse_git_head_text(&head_raw)?;
+    info.repo_url = extract_git_remote_origin_url(git_dir, git_dir);
+    Some(info)
 }
 
 pub fn probe_vcs_uncached(repo: &DetectedRepo, runner: &dyn ProbeRunner) -> Option<VcsProbeInfo> {
@@ -613,9 +987,13 @@ pub fn probe_vcs_uncached(repo: &DetectedRepo, runner: &dyn ProbeRunner) -> Opti
             root,
             git_dir,
             common_dir,
-        } => {
-            probe_git(root, git_dir, common_dir, runner).or_else(|| read_git_head_fallback(git_dir))
-        }
+        } => probe_git(root, git_dir, common_dir, runner).or_else(|| {
+            let mut info = read_git_head_fallback(git_dir)?;
+            if info.repo_url.is_none() {
+                info.repo_url = extract_git_remote_origin_url(git_dir, common_dir);
+            }
+            Some(info)
+        }),
     }
 }
 
@@ -788,16 +1166,14 @@ pub fn collect_render_inputs(
 ) -> CollectedRenderData {
     let cwd = logic_paths.cwd.as_deref().map(Path::new);
     let transcript_path = logic_paths.transcript.as_deref().map(Path::new);
+    let cursor_path = logic_paths.transcript_cursor.as_deref().map(Path::new);
     let task_md_path = logic_paths.task_md.as_deref().map(Path::new);
     thread::scope(|s| {
         let tx_handle = s.spawn(|| {
-            let (head, tail) = transcript_path
-                .map(read_transcript_slices)
-                .unwrap_or((None, None));
             let task_md = task_md_path.and_then(|p| read_bounded_string(p, MAX_TASK_MD_BYTES));
-            parse_transcript_and_tasks(
-                head.as_deref(),
-                tail.as_deref(),
+            read_and_parse_transcript_incremental(
+                transcript_path,
+                cursor_path,
                 task_md.as_deref(),
                 Some(stdin),
             )
@@ -847,6 +1223,11 @@ pub fn collect_render_inputs(
             None
         };
 
+        let cost_ledger = logic_paths
+            .cost_ledger
+            .as_deref()
+            .and_then(|p| read_bounded_string(Path::new(p), 64 * 1024));
+
         CollectedRenderData {
             transcript: tx_handle.join().unwrap_or_default(),
             probes: ProbeAnswers {
@@ -855,6 +1236,7 @@ pub fn collect_render_inputs(
                 quota_cache,
                 update_cache,
                 speed_cache,
+                cost_ledger,
             },
         }
     })

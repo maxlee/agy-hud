@@ -1,0 +1,59 @@
+{
+  "id": "04-launch-dir-and-right-align",
+  "nowMs": 1794218400000,
+  "columns": 148,
+  "config": {
+    "display": {
+      "showLaunchDir": true,
+      "mergeGroups": [["context", "quota"]],
+      "rightAlign": ["quota"]
+    }
+  },
+  "stdin": {
+    "cwd": "/Users/dev/agy-hud/crates/hud-core",
+    "conversation_id": "conv-corpus-04",
+    "agent_state": "idle",
+    "cycle_mode": "auto_edit",
+    "terminal_width": 148,
+    "workspace": {
+      "project_dir": "/Users/dev/agy-hud",
+      "current_dir": "/Users/dev/agy-hud/crates/hud-core"
+    },
+    "model": {
+      "id": "Gemini 3 Flash",
+      "display_name": "Gemini 3 Flash"
+    },
+    "context_window": {
+      "context_window_size": 1048576,
+      "used_percentage": 22.0
+    },
+    "quota": {
+      "gemini-weekly": {
+        "remaining_fraction": 0.85,
+        "reset_in_seconds": 518400.0
+      }
+    },
+    "cost": {
+      "total_usd": 0.18,
+      "estimated": false
+    }
+  },
+  "probes": {
+    "vcs": "{\"type\":\"git\",\"branch\":\"main\",\"dirty\":false}"
+  },
+  "transcript": {
+    "tools": [],
+    "skills": [],
+    "mcp_servers": [],
+    "mcp_errors": [],
+    "subagents": [],
+    "todos": [],
+    "session_started_at": 1794218220000,
+    "last_step_at": 1794218395000,
+    "step_count": 2
+  },
+  "expectedPlainLines": [
+    "╭─ ● READY │ [Gemini 3 Flash] │ agy-hud › hud-core git:(main) │ ⏱ 3m",
+    "╰─ Ctx ██▒········· 22.0% │ $0.18                                                                                    Quota(weekly) █······ 15%▲ (6d)"
+  ]
+}

@@ -489,6 +489,84 @@ pub struct QuotaBucketView {
     pub reset_in_seconds: Option<f64>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum QuotaPace {
+    #[default]
+    Normal,
+    Warning,
+    Critical,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionCostEntry {
+    pub day_baseline: f64,
+    pub week_baseline: f64,
+    pub total: f64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CostLedgerSnapshot {
+    pub version: u8,
+    pub day_key: String,
+    pub calendar_week_key: String,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub week_reset_ms: Option<i64>,
+    #[serde(default)]
+    pub day_carry_usd: f64,
+    #[serde(default)]
+    pub week_carry_usd: f64,
+    #[serde(default)]
+    pub sessions: BTreeMap<String, SessionCostEntry>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct CostTotals {
+    pub today_usd: f64,
+    pub week_usd: f64,
+    pub estimated: bool,
+}
+
+pub const TRANSCRIPT_CURSOR_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TranscriptCursor {
+    pub version: u32,
+    pub offset: u64,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub session_started_at: Option<i64>,
+    #[serde(default)]
+    pub skills: Vec<String>,
+    #[serde(default)]
+    pub mcp_servers: Vec<String>,
+    #[serde(default)]
+    pub mcp_last_error: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub active_slash_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub completed_step_tps_x10: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub short_anchor: Option<SpeedAnchorPoint>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub long_anchor: Option<SpeedAnchorPoint>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub latest_planner_step: Option<PlannerStepTiming>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub last_step_at: Option<i64>,
+    #[serde(default)]
+    pub max_step_idx: usize,
+    #[serde(default)]
+    pub step_lines_seen: usize,
+    #[serde(default)]
+    pub folded_tools: Vec<ToolEntry>,
+    #[serde(default)]
+    pub subagents: Vec<SubagentEntry>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CachedQuotaSnapshot {
@@ -540,6 +618,8 @@ pub struct ProbeAnswers {
     pub update_cache: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub speed_cache: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub cost_ledger: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -613,6 +693,10 @@ pub struct LogicPaths {
     pub update_cache: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub speed_cache: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub cost_ledger: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub transcript_cursor: Option<String>,
     pub cli_settings: String,
     pub transcript: Option<String>,
     pub task_md: Option<String>,

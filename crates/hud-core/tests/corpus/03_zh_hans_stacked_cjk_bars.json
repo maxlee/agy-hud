@@ -1,0 +1,63 @@
+{
+  "id": "03-zh-hans-stacked-cjk-bars",
+  "nowMs": 1794218400000,
+  "columns": 86,
+  "config": {
+    "language": "zh-Hans",
+    "lineLayout": "expanded",
+    "display": {
+      "showDailyCost": true,
+      "showWeeklyCost": true,
+      "mergeGroups": [["context", "quota"]]
+    }
+  },
+  "stdin": {
+    "cwd": "/Users/dev/agy-hud",
+    "conversation_id": "conv-corpus-03",
+    "agent_state": "idle",
+    "cycle_mode": "plan",
+    "terminal_width": 86,
+    "workspace": {
+      "project_dir": "/Users/dev/agy-hud",
+      "current_dir": "/Users/dev/agy-hud"
+    },
+    "model": {
+      "id": "Gemini 4 Argon (Medium)",
+      "display_name": "Gemini 4 Argon (Medium)",
+      "effort": "medium"
+    },
+    "context_window": {
+      "context_window_size": 1048576,
+      "used_percentage": 35.0
+    },
+    "quota": {
+      "gemini-weekly": {
+        "remaining_fraction": 0.72,
+        "reset_in_seconds": 432000.0
+      }
+    },
+    "cost": {
+      "total_usd": 0.65,
+      "estimated": false
+    }
+  },
+  "probes": {
+    "cost_ledger": "{\"version\":1,\"dayKey\":\"2026-11-09\",\"calendarWeekKey\":\"2026-11-09\",\"weekResetMs\":1794650400000,\"dayCarryUsd\":1.2,\"weekCarryUsd\":4.1,\"sessions\":{\"conv-corpus-03\":{\"dayBaseline\":0.0,\"weekBaseline\":0.0,\"total\":0.65,\"updatedAt\":1794218400000}}}"
+  },
+  "transcript": {
+    "tools": [],
+    "skills": [],
+    "mcp_servers": [],
+    "mcp_errors": [],
+    "subagents": [],
+    "todos": [],
+    "session_started_at": 1794217800000,
+    "last_step_at": 1794218390000,
+    "step_count": 4
+  },
+  "expectedPlainLines": [
+    "╭─ ● 就绪 │ [规划] │ [Gemini 4 Argon · med] │ agy-hud │ ⏱ 10m",
+    "├─ 上下文       ████········ 35.0% │ $0.65 · 今日 $1.85 · 本周 $4.75",
+    "╰─ 配额(weekly) █▓····· 28%▲ (5d)"
+  ]
+}

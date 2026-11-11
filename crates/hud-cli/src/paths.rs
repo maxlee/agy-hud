@@ -17,6 +17,8 @@ pub struct AgyPaths {
     pub data_dir: PathBuf,
     pub quota_cache_path: PathBuf,
     pub update_cache_path: PathBuf,
+    pub cost_ledger_path: PathBuf,
+    pub transcript_cursor_dir: PathBuf,
     pub probe_cache_dir: PathBuf,
     pub config_path: PathBuf,
     pub undo_path: PathBuf,
@@ -85,6 +87,8 @@ impl AgyPaths {
             bin_dir,
             quota_cache_path: data_dir.join("quota-cache.json"),
             update_cache_path: data_dir.join("update-cache.json"),
+            cost_ledger_path: data_dir.join("cost-ledger.json"),
+            transcript_cursor_dir: data_dir.join("transcript-cursors"),
             data_dir,
             probe_cache_dir: hud_home.join("probe-cache"),
             config_path: hud_home.join("config.json"),
@@ -104,6 +108,11 @@ impl AgyPaths {
     pub fn probe_cache_file_for(&self, repo_root: &Path) -> PathBuf {
         let key = fnv1a_64_hex(&repo_root.to_string_lossy());
         self.probe_cache_dir.join(format!("{key}.json"))
+    }
+
+    pub fn transcript_cursor_file_for(&self, transcript_path: &Path) -> PathBuf {
+        let key = fnv1a_64_hex(&transcript_path.to_string_lossy());
+        self.transcript_cursor_dir.join(format!("{key}.json"))
     }
 }
 
@@ -354,6 +363,20 @@ pub fn build_logic_paths(
             .map(|d| d.join("update-cache.json").to_string_lossy().into_owned()),
         speed_cache: data_real_dir
             .map(|d| d.join("speed-cache.json").to_string_lossy().into_owned()),
+        cost_ledger: data_real_dir
+            .map(|d| d.join("cost-ledger.json").to_string_lossy().into_owned()),
+        transcript_cursor: match (data_real_dir, transcript_buf.as_deref()) {
+            (Some(d), Some(tp)) => {
+                let key = fnv1a_64_hex(&tp.to_string_lossy());
+                Some(
+                    d.join("transcript-cursors")
+                        .join(format!("{key}.json"))
+                        .to_string_lossy()
+                        .into_owned(),
+                )
+            }
+            _ => None,
+        },
         cli_settings: canonical_or_parent(&paths.cli_settings_path)
             .to_string_lossy()
             .into_owned(),
@@ -428,4 +451,66 @@ pub fn undo_config(paths: &AgyPaths) -> Result<(), String> {
     atomic_write_bytes(&paths.config_path, &prev, 0o600).map_err(|e| e.to_string())?;
     let _ = fs::remove_file(&paths.undo_path);
     Ok(())
+}
+
+struct ExclusiveFileLock<'a>(&'a Path);
+
+impl Drop for ExclusiveFileLock<'_> {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(self.0);
+    }
+}
+
+/// Executes `f` while holding an exclusive `create_new(true)` lockfile at `lock_path`,
+/// automatically recovering stale lockfiles older than `stale_ms` so crashed renders never wedge.
+pub fn with_exclusive_lock_file<T, F: FnOnce() -> T>(
+    lock_path: &Path,
+    stale_ms: u64,
+    f: F,
+) -> Option<T> {
+    if let Some(parent) = lock_path.parent() {
+        create_private_dir_all(parent).ok()?;
+    }
+
+    let mut acquired = false;
+    for attempt in 0..8 {
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(lock_path)
+        {
+            Ok(mut file) => {
+                let _ = writeln!(file, "{}", std::process::id());
+                acquired = true;
+                break;
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                if let Ok(meta) = fs::symlink_metadata(lock_path) {
+                    if meta.file_type().is_symlink() {
+                        let _ = fs::remove_file(lock_path);
+                        continue;
+                    }
+                    let is_stale = meta
+                        .modified()
+                        .ok()
+                        .and_then(|m| SystemTime::now().duration_since(m).ok())
+                        .is_some_and(|age| age.as_millis() as u64 >= stale_ms);
+                    if is_stale {
+                        let _ = fs::remove_file(lock_path);
+                        continue;
+                    }
+                }
+                if attempt + 1 < 8 {
+                    std::thread::sleep(std::time::Duration::from_millis(3));
+                }
+            }
+            Err(_) => return None,
+        }
+    }
+
+    if !acquired {
+        return None;
+    }
+    let _guard = ExclusiveFileLock(lock_path);
+    Some(f())
 }

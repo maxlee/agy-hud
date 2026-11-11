@@ -7,20 +7,21 @@ use hud_cli::collector::{
 use hud_cli::install::{install_status_line, uninstall_status_line};
 use hud_cli::paths::{
     AgyPaths, atomic_write_bytes, build_logic_paths, canonical_or_parent, existing_data_dir,
-    prepare_data_dir, undo_config, write_config_with_undo,
+    prepare_data_dir, undo_config, with_exclusive_lock_file, write_config_with_undo,
 };
 use hud_cli::quota_refresh::{maybe_spawn_background_quota_refresh, run_quota_subcommand};
 use hud_cli::update::{maybe_spawn_background_update_check, run_update_subcommand};
-use hud_core::ansi::terminal_filter;
+use hud_core::ansi::terminal_filter_with_repo;
 use hud_core::commands::{CommandContext, execute_subcommand};
 use hud_core::config::{MAX_CONFIG_BYTES, parse_config_str};
 use hud_core::probes::{
-    apply_speed_cache, parse_cached_quota_info, parse_memory_info, parse_speed_cache_info,
-    parse_update_cache_info, parse_vcs_info,
+    apply_speed_cache, parse_cached_quota_info, parse_cost_ledger_info, parse_memory_info,
+    parse_speed_cache_info, parse_update_cache_info, parse_vcs_info, reconcile_cost_ledger,
 };
-use hud_core::render::{RenderInput, render_hud_lines};
+use hud_core::render::{RenderInput, format_config_problem_line, render_hud_lines_full};
 use hud_core::types::{
-    AgyStdinData, DoctorFacts, HeartbeatInfo, InstalledPluginFacts, PluginFacts, RuntimeFacts,
+    AgyStdinData, CostLedgerSnapshot, DoctorFacts, HeartbeatInfo, InstalledPluginFacts,
+    PluginFacts, RuntimeFacts,
 };
 use serde_json::{Value, json};
 use std::io::{IsTerminal, Write};
@@ -197,16 +198,20 @@ fn detect_installed_plugin(paths: &AgyPaths) -> (String, Option<InstalledPluginF
     ("unavailable".to_string(), None)
 }
 
-fn print_filtered<S: AsRef<str>>(lines: &[S]) {
+fn print_filtered_with_repo<S: AsRef<str>>(lines: &[S], allowed_github_repo: Option<&str>) {
     if lines.is_empty() {
         return;
     }
     let mut stdout = std::io::stdout().lock();
     for line in lines {
-        let safe = terminal_filter(line.as_ref());
+        let safe = terminal_filter_with_repo(line.as_ref(), allowed_github_repo);
         let _ = writeln!(stdout, "{safe}");
     }
     let _ = stdout.flush();
+}
+
+fn print_filtered<S: AsRef<str>>(lines: &[S]) {
+    print_filtered_with_repo(lines, None);
 }
 
 fn resolve_plugin_root(current_exe: &Path, paths: &AgyPaths) -> PathBuf {
@@ -500,23 +505,71 @@ fn run() -> u8 {
         }
     }
 
+    let cost_totals = if stdin_payload.cost.is_some()
+        || loaded_cfg.config.display.show_daily_cost
+        || loaded_cfg.config.display.show_weekly_cost
+    {
+        if let Some(ref ledger_str_path) = logic_paths.cost_ledger {
+            let ledger_path = Path::new(ledger_str_path);
+            let lock_path = ledger_path.with_extension("lock");
+            with_exclusive_lock_file(&lock_path, 2_000, || {
+                let fresh_raw = read_bounded_string(ledger_path, 64 * 1024);
+                let existing_ledger = fresh_raw
+                    .as_deref()
+                    .and_then(|s| serde_json::from_str::<CostLedgerSnapshot>(s).ok())
+                    .filter(|l| l.version == 1 && !l.day_key.is_empty());
+                let (totals, maybe_updated) = reconcile_cost_ledger(
+                    existing_ledger.as_ref(),
+                    Some(&stdin_payload),
+                    started_ms,
+                );
+                if let Some(updated) = maybe_updated
+                    && let Ok(serialized) = serde_json::to_string(&updated)
+                {
+                    let _ = atomic_write_bytes(ledger_path, serialized.as_bytes(), 0o600);
+                    collected.probes.cost_ledger = Some(serialized);
+                } else if fresh_raw.is_some() {
+                    collected.probes.cost_ledger = fresh_raw;
+                }
+                totals
+            })
+            .unwrap_or_else(|| {
+                let existing = parse_cost_ledger_info(&collected.probes);
+                reconcile_cost_ledger(existing.as_ref(), Some(&stdin_payload), started_ms).0
+            })
+        } else {
+            let existing = parse_cost_ledger_info(&collected.probes);
+            reconcile_cost_ledger(existing.as_ref(), Some(&stdin_payload), started_ms).0
+        }
+    } else {
+        None
+    };
+
     let vcs = parse_vcs_info(Some(&stdin_payload), &collected.probes);
     let memory = parse_memory_info(&collected.probes);
     let cached_quota = parse_cached_quota_info(&collected.probes);
     let update_info = parse_update_cache_info(&collected.probes);
     let columns = stdin_payload.terminal_width.filter(|&w| w > 0);
 
-    let lines = render_hud_lines(RenderInput {
-        stdin: Some(&stdin_payload),
-        config: &loaded_cfg.config,
-        transcript: &collected.transcript,
-        vcs: vcs.as_ref(),
-        memory: memory.as_ref(),
-        cached_quota: cached_quota.as_ref(),
-        update_info: update_info.as_ref(),
-        columns,
-        now_ms: started_ms,
-    });
+    let mut lines = render_hud_lines_full(
+        RenderInput {
+            stdin: Some(&stdin_payload),
+            config: &loaded_cfg.config,
+            transcript: &collected.transcript,
+            vcs: vcs.as_ref(),
+            memory: memory.as_ref(),
+            cached_quota: cached_quota.as_ref(),
+            update_info: update_info.as_ref(),
+            columns,
+            now_ms: started_ms,
+        },
+        cost_totals.as_ref(),
+    );
+    if let Some(problem_line) =
+        format_config_problem_line(&loaded_cfg.problems, &loaded_cfg.config, columns)
+    {
+        lines.push(problem_line);
+    }
 
     // Persist last snapshot inside symlink-swept `<hudHome>/data/last-snapshot.json`
     if let Some(ref snap_path) = logic_paths.last_snapshot {
@@ -545,7 +598,8 @@ fn run() -> u8 {
         },
     );
 
-    print_filtered(&lines);
+    let allowed_github_repo = vcs.as_ref().and_then(|v| v.repo_url.as_deref());
+    print_filtered_with_repo(&lines, allowed_github_repo);
 
     if loaded_cfg.config.quota.background_refresh {
         maybe_spawn_background_quota_refresh(&paths, &current_exe, &stdin_payload, started_ms);

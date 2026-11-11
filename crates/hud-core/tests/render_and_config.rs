@@ -1,19 +1,27 @@
-use hud_core::ansi::{sanitize_title_text, strip_ansi, text_width};
+use hud_core::ansi::{
+    github_branch_link, mask_preserving_width, sanitize_title_text, strip_ansi,
+    terminal_filter_with_repo, text_width,
+};
 use hud_core::commands::{CommandContext, execute_subcommand};
 use hud_core::config::{CONFIG_SCHEMA, HudConfig, parse_config_str, parse_set_pairs};
 use hud_core::probes::{
-    apply_speed_cache, is_newer_semver, parse_github_latest_release, parse_usage_command_output,
-    parse_vcs_info,
+    apply_speed_cache, is_newer_semver, normalize_github_repo_url, parse_cost_ledger_info,
+    parse_github_latest_release, parse_usage_command_output, parse_vcs_info, reconcile_cost_ledger,
 };
-use hud_core::render::{RenderInput, render_hud_lines};
-use hud_core::stdin::{extract_quota_buckets_reconciled, format_session_cost, normalize_plan_tier};
-use hud_core::transcript::parse_transcript_and_tasks;
+use hud_core::render::{
+    RenderInput, format_config_problem_line, render_hud_lines, render_hud_lines_full,
+};
+use hud_core::stdin::{
+    compute_quota_pace, extract_quota_buckets_reconciled, format_session_cost,
+    format_workspace_breadcrumb, normalize_plan_tier,
+};
+use hud_core::transcript::{parse_transcript_and_tasks, parse_transcript_with_cursor};
 use hud_core::types::{
     AgyStdinData, CachedQuotaSnapshot, ContextWindowStdin, CostStdin, CurrentUsageStdin,
     DoctorFacts, EffortFormatMode, GlyphMode, InstalledPluginFacts, Language, LogicPaths,
-    ModelStdin, PluginFacts, ProbeAnswers, RawQuotaBucket, RuntimeFacts, SandboxStdin,
-    SubagentEntry, SubagentStatus, TodoItem, TodoStatus, ToolEntry, ToolStatus, TranscriptSummary,
-    UpdateCacheSnapshot, VimStdin, WorkspaceStdin,
+    ModelStdin, PathLevels, PluginFacts, ProbeAnswers, QuotaBucketView, QuotaPace, RawQuotaBucket,
+    RuntimeFacts, SandboxStdin, SubagentEntry, SubagentStatus, TodoItem, TodoStatus, ToolEntry,
+    ToolStatus, TranscriptCursor, TranscriptSummary, UpdateCacheSnapshot, VimStdin, WorkspaceStdin,
 };
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -177,25 +185,52 @@ fn adaptive_layout_handles_ultrawide_standard_narrow_and_zh_hans() {
 }
 
 #[test]
-fn config_schema_validates_all_43_keys_and_preview_showcase_renders_5_scenarios() {
-    assert_eq!(CONFIG_SCHEMA.len(), 43);
+fn config_schema_validates_all_52_keys_and_preview_showcase_renders_5_scenarios() {
+    assert_eq!(CONFIG_SCHEMA.len(), 52);
     let default_cfg = HudConfig::default();
     assert!(!default_cfg.quota.background_refresh);
     assert!(default_cfg.updates.enabled);
     assert!(default_cfg.display.show_speed);
     assert!(!default_cfg.display.show_title);
+    assert!(!default_cfg.display.show_launch_dir);
+    assert!(default_cfg.display.quota_pace);
+    assert_eq!(default_cfg.display.quota_threshold, 0);
+    assert!(!default_cfg.display.show_daily_cost);
+    assert!(!default_cfg.display.show_weekly_cost);
+    assert!(default_cfg.display.merge_groups.is_empty());
+    assert!(default_cfg.display.right_align.is_empty());
+    assert_eq!(default_cfg.vcs.push_warning_threshold, 0);
+    assert_eq!(default_cfg.vcs.push_critical_threshold, 0);
     assert_eq!(default_cfg.display.glyph_mode, GlyphMode::Unicode);
 
     let loaded = parse_config_str(Some(
-        r#"{"language":"zh-Hans","pathLevels":"full","vcs":{"cacheTtlMs":2500},"quota":{"backgroundRefresh":true},"display":{"showTitle":true,"glyphMode":"nerd"},"unknownKey":1}"#,
+        r#"{"language":"zh-Hans","pathLevels":"full","vcs":{"cacheTtlMs":2500,"pushWarningThreshold":5,"pushCriticalThreshold":15},"quota":{"backgroundRefresh":true},"display":{"showTitle":true,"glyphMode":"nerd","showLaunchDir":false,"quotaPace":false,"quotaThreshold":25,"showDailyCost":true,"showWeeklyCost":true,"mergeGroups":[["context","quota"],["tools","subagents"]],"rightAlign":["cost","duration"]},"unknownKey":1}"#,
     ));
     assert_eq!(loaded.config.language, Language::ZhHans);
     assert_eq!(loaded.config.vcs.cache_ttl_ms, 2500);
+    assert_eq!(loaded.config.vcs.push_warning_threshold, 5);
+    assert_eq!(loaded.config.vcs.push_critical_threshold, 15);
     assert!(loaded.config.quota.background_refresh);
     assert!(loaded.config.display.show_title);
+    assert!(!loaded.config.display.show_launch_dir);
+    assert!(!loaded.config.display.quota_pace);
+    assert_eq!(loaded.config.display.quota_threshold, 25);
+    assert!(loaded.config.display.show_daily_cost);
+    assert!(loaded.config.display.show_weekly_cost);
+    assert_eq!(loaded.config.display.merge_groups.len(), 2);
+    assert_eq!(loaded.config.display.right_align, vec!["cost", "duration"]);
     assert_eq!(loaded.config.display.glyph_mode, GlyphMode::Nerd);
     assert_eq!(loaded.problems.len(), 1);
     assert!(loaded.problems[0].contains("unknownKey"));
+
+    // Invalid mergeGroups (duplicate row across groups / < 2 items) and invalid rightAlign segment must report problems
+    let bad_layout = parse_config_str(Some(
+        r#"{"display":{"mergeGroups":[["context","quota"],["quota","counts"]],"rightAlign":["bogus"],"quotaThreshold":100}}"#,
+    ));
+    assert!(bad_layout.problems.len() >= 3);
+    assert!(bad_layout.config.display.merge_groups.is_empty());
+    assert!(bad_layout.config.display.right_align.is_empty());
+    assert_eq!(bad_layout.config.display.quota_threshold, 0);
 
     let bad_set = parse_set_pairs(
         &["display.barLength=999".to_string()],
@@ -1176,4 +1211,657 @@ fn hybrid_option_a_speed_strips_ttft_isolates_tool_exec_resists_short_dilution_a
         base_ms + 8_000,
     );
     assert!(confirm_spd.is_none());
+}
+
+#[test]
+fn quota_pace_burn_rate_threshold_hiding_and_static_severity_floor() {
+    let mk_bucket = |id: &str, used: f64, reset_sec: f64| QuotaBucketView {
+        id: id.to_string(),
+        label: id.to_string(),
+        remaining_percent: Some(100.0 - used),
+        used_percent: Some(used),
+        remaining_amount: None,
+        reset_in_seconds: Some(reset_sec),
+    };
+
+    // 1. < 10% used at start of window must NOT trigger false-positive pace alarm
+    assert_eq!(
+        compute_quota_pace(&mk_bucket("gemini-5h", 8.0, 17_900.0)),
+        QuotaPace::Normal
+    );
+
+    // 2. 5h window (`18_000s`): 1h elapsed (`14_400s` left => 20% elapsed), 30% used => projected 150% => Critical!
+    assert_eq!(
+        compute_quota_pace(&mk_bucket("gemini-5h", 30.0, 14_400.0)),
+        QuotaPace::Critical
+    );
+
+    // 3. weekly window (`604_800s`): half elapsed (`302_400s` left => 50% elapsed), 47.5% used => projected 95% => Warning!
+    assert_eq!(
+        compute_quota_pace(&mk_bucket("gemini-weekly", 47.5, 302_400.0)),
+        QuotaPace::Warning
+    );
+
+    // 4. Static critical (`>= 90%` used) near end of window (`projected ~ 97%` = Warning) MUST stay Red (never downgraded!)
+    let mut stdin = sample_stdin(120);
+    let mut quota = BTreeMap::new();
+    quota.insert(
+        "gemini-5h".to_string(),
+        RawQuotaBucket {
+            remaining_fraction: Some(0.08), // 92% used (Critical static!)
+            remaining_amount: None,
+            reset_time: None,
+            reset_in_seconds: Some(900.0), // 95% elapsed => 92 / 0.95 = 96.8% (Warning pace)
+            disabled: None,
+        },
+    );
+    stdin.quota = Some(quota);
+    let lines = render_hud_lines(RenderInput {
+        stdin: Some(&stdin),
+        config: &HudConfig::default(),
+        transcript: &TranscriptSummary::default(),
+        vcs: None,
+        memory: None,
+        cached_quota: None,
+        update_info: None,
+        columns: Some(120),
+        now_ms: 1_700_000_000_000,
+    });
+    assert!(
+        lines[2].contains("\x1b[31m") && strip_ansi(&lines[2]).contains("▲"),
+        "Static >=90% must stay red while displaying pace marker: {}",
+        lines[2]
+    );
+
+    // 5. `display.quotaThreshold`: hides normal low-usage quota, UNLESS pace > Normal!
+    let mut thr_cfg = HudConfig::default();
+    thr_cfg.display.quota_threshold = 50;
+
+    // 25% used with 1 day left on weekly (`85.7%` elapsed => projected ~29% = Normal) -> hidden!
+    let low_normal = sample_stdin(120);
+    let hidden_lines = render_hud_lines(RenderInput {
+        stdin: Some(&low_normal),
+        config: &thr_cfg,
+        transcript: &TranscriptSummary::default(),
+        vcs: None,
+        memory: None,
+        cached_quota: None,
+        update_info: None,
+        columns: Some(120),
+        now_ms: 1_700_000_000_000,
+    });
+    let hidden_plain: String = hidden_lines
+        .iter()
+        .map(|l| strip_ansi(l))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !hidden_plain.contains("Quota"),
+        "Normal low-usage quota below threshold should hide: {hidden_plain}"
+    );
+
+    // 30% used in 1h of 5h window (below 50% threshold, but Critical pace!) -> MUST surface with `^` in Ascii mode!
+    let mut fast_burn = sample_stdin(120);
+    let mut fast_q = BTreeMap::new();
+    fast_q.insert(
+        "gemini-5h".to_string(),
+        RawQuotaBucket {
+            remaining_fraction: Some(0.70), // 30% used (< 50 threshold!)
+            remaining_amount: None,
+            reset_time: None,
+            reset_in_seconds: Some(14_400.0), // 20% elapsed -> 150% projected!
+            disabled: None,
+        },
+    );
+    fast_burn.quota = Some(fast_q);
+    thr_cfg.display.glyph_mode = GlyphMode::Ascii;
+    let surfaced_lines = render_hud_lines(RenderInput {
+        stdin: Some(&fast_burn),
+        config: &thr_cfg,
+        transcript: &TranscriptSummary::default(),
+        vcs: None,
+        memory: None,
+        cached_quota: None,
+        update_info: None,
+        columns: Some(120),
+        now_ms: 1_700_000_000_000,
+    });
+    let surfaced_plain = strip_ansi(&surfaced_lines[2]);
+    assert!(
+        surfaced_plain.contains("Quota(5h)") && surfaced_plain.contains("^"),
+        "Fast-burning quota must override threshold and use ASCII '^': {surfaced_plain}"
+    );
+}
+
+#[test]
+fn completed_subagent_60s_retirement_active_priority_and_config_problem_line() {
+    let now_ms = 1_700_000_100_000i64;
+    let stdin = sample_stdin(120);
+    let tx = TranscriptSummary {
+        subagents: vec![
+            SubagentEntry {
+                name: "done-stale".to_string(),
+                role: Some("Old Auditor".to_string()),
+                model: None,
+                status: SubagentStatus::Completed,
+                started_at: Some(now_ms - 95_000),
+                ended_at: Some(now_ms - 65_000), // > 60s ago -> retired!
+            },
+            SubagentEntry {
+                name: "done-fresh".to_string(),
+                role: Some("Fresh Reviewer".to_string()),
+                model: None,
+                status: SubagentStatus::Completed,
+                started_at: Some(now_ms - 40_000),
+                ended_at: Some(now_ms - 20_000), // <= 60s ago -> kept, sorted AFTER active!
+            },
+            SubagentEntry {
+                name: "active-worker".to_string(),
+                role: Some("Live Builder".to_string()),
+                model: Some("gemini-3-flash".to_string()),
+                status: SubagentStatus::Running,
+                started_at: Some(now_ms - 12_000),
+                ended_at: None,
+            },
+        ],
+        ..TranscriptSummary::default()
+    };
+
+    let lines = render_hud_lines(RenderInput {
+        stdin: Some(&stdin),
+        config: &HudConfig::default(),
+        transcript: &tx,
+        vcs: None,
+        memory: None,
+        cached_quota: None,
+        update_info: None,
+        columns: Some(120),
+        now_ms,
+    });
+    let sub_line = lines
+        .iter()
+        .map(|l| strip_ansi(l))
+        .find(|l| l.contains("Live Builder"))
+        .expect("subagent row present");
+    assert!(
+        !sub_line.contains("Old Auditor"),
+        "Completed >60s must retire: {sub_line}"
+    );
+    let live_idx = sub_line.find("Live Builder").unwrap();
+    let fresh_idx = sub_line.find("Fresh Reviewer").unwrap();
+    assert!(
+        live_idx < fresh_idx,
+        "Active subagents must precede completed: {sub_line}"
+    );
+
+    // Config problem line preserves `/agy-hud:hud` even at ultra-narrow 42 columns!
+    let mut ascii_cfg = HudConfig::default();
+    ascii_cfg.display.glyph_mode = GlyphMode::Ascii;
+    let problems = vec![
+        "Unknown configuration key \"display.superLongInvalidPropertyNameForNarrowTerminal\""
+            .to_string(),
+    ];
+    let warn = format_config_problem_line(&problems, &ascii_cfg, Some(42)).expect("warning line");
+    let warn_plain = strip_ansi(&warn);
+    assert!(
+        warn_plain.ends_with(" . /agy-hud:hud"),
+        "Remediation command must never be truncated off: {warn_plain}"
+    );
+    assert!(
+        text_width(&warn_plain) <= 42,
+        "Problem line must fit 42 columns (got {}): {warn_plain}",
+        text_width(&warn_plain)
+    );
+}
+
+#[test]
+fn cost_ledger_watermark_idempotency_rollover_and_restart_carry() {
+    // 2026-11-09T10:00:00Z (Monday)
+    let mon_morning_ms = 1_794_218_400_000i64;
+    let mut s1 = sample_stdin(120);
+    s1.quota = None;
+    s1.conversation_id = Some("conv-alpha".to_string());
+    s1.cost = Some(CostStdin {
+        total_usd: Some(0.45),
+        subagent_usd: None,
+        estimated: Some(false),
+    });
+
+    // Tick 1: writes initial snapshot (`today_usd = $0.45`, `week_usd = $0.45`)
+    let (t1, w1) = reconcile_cost_ledger(None, Some(&s1), mon_morning_ms);
+    let snap1 = w1.expect("first write");
+    assert!((t1.unwrap().today_usd - 0.45).abs() < 1e-6);
+
+    // Tick 2 (300ms later, identical session cost): ZERO disk write (`w2.is_none()`) and NO double counting!
+    let (t2, w2) = reconcile_cost_ledger(Some(&snap1), Some(&s1), mon_morning_ms + 300);
+    assert!(
+        w2.is_none(),
+        "Unchanged 300ms tick must not rewrite cost-ledger.json"
+    );
+    assert!((t2.unwrap().today_usd - 0.45).abs() < 1e-6);
+
+    // Session B joins on same day with `$0.80` -> `Today $1.25`, `Week $1.25`
+    let mut s2 = sample_stdin(120);
+    s2.quota = None;
+    s2.conversation_id = Some("conv-beta".to_string());
+    s2.cost = Some(CostStdin {
+        total_usd: Some(0.80),
+        subagent_usd: None,
+        estimated: Some(false),
+    });
+    let (t3, w3) = reconcile_cost_ledger(Some(&snap1), Some(&s2), mon_morning_ms + 5_000);
+    let snap3 = w3.expect("second session write");
+    let totals3 = t3.unwrap();
+    assert!((totals3.today_usd - 1.25).abs() < 1e-6);
+    assert!((totals3.week_usd - 1.25).abs() < 1e-6);
+
+    // Next UTC day (Tuesday `mon_morning_ms + 86_400_000`), Session B advances from `$0.80` -> `$1.10`:
+    // Today must only count Tuesday's `$0.30` delta, while Week counts `$0.45 + $1.10 = $1.55`!
+    s2.cost.as_mut().unwrap().total_usd = Some(1.10);
+    let (t4, w4) = reconcile_cost_ledger(Some(&snap3), Some(&s2), mon_morning_ms + 86_400_000);
+    let snap4 = w4.expect("day rollover write");
+    let totals4 = t4.unwrap();
+    assert!(
+        (totals4.today_usd - 0.30).abs() < 1e-6,
+        "expected $0.30 daily delta after midnight rollover, got {}",
+        totals4.today_usd
+    );
+    assert!(
+        (totals4.week_usd - 1.55).abs() < 1e-6,
+        "expected $1.55 weekly total, got {}",
+        totals4.week_usd
+    );
+
+    // Process restart on Session B resets `total_usd` to `$0.15` -> folds prior `$0.30` into carry => `$0.45` daily!
+    s2.cost.as_mut().unwrap().total_usd = Some(0.15);
+    let (t5, w5) = reconcile_cost_ledger(Some(&snap4), Some(&s2), mon_morning_ms + 90_000_000);
+    let snap5 = w5.expect("restart carry write");
+    let totals5 = t5.unwrap();
+    assert!((totals5.today_usd - 0.45).abs() < 1e-6);
+    assert!((totals5.week_usd - 1.70).abs() < 1e-6);
+
+    // Roundtrip `CostLedgerSnapshot` via `parse_cost_ledger_info` and render `Today $0.45` & `Week $1.70`
+    let mut cfg = HudConfig::default();
+    cfg.display.show_daily_cost = true;
+    cfg.display.show_weekly_cost = true;
+    let probes = ProbeAnswers {
+        cost_ledger: Some(serde_json::to_string(&snap5).unwrap()),
+        ..ProbeAnswers::default()
+    };
+    let parsed_snap = parse_cost_ledger_info(&probes).expect("valid ledger snapshot");
+    let (reloaded_totals, _) =
+        reconcile_cost_ledger(Some(&parsed_snap), Some(&s2), mon_morning_ms + 90_000_000);
+    let rendered = render_hud_lines_full(
+        RenderInput {
+            stdin: Some(&s2),
+            config: &cfg,
+            transcript: &TranscriptSummary::default(),
+            vcs: None,
+            memory: None,
+            cached_quota: None,
+            update_info: None,
+            columns: Some(140),
+            now_ms: mon_morning_ms + 90_000_000,
+        },
+        reloaded_totals.as_ref(),
+    );
+    let joined: String = rendered
+        .iter()
+        .map(|l| strip_ansi(l))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        joined.contains("Today $0.45") && joined.contains("Week $1.70"),
+        "{joined}"
+    );
+}
+
+#[test]
+fn launch_dir_breadcrumb_git_push_thresholds_and_scoped_github_osc8() {
+    // 1. URL normalization rejects credentials, non-GitHub hosts, and path traversal
+    assert_eq!(
+        normalize_github_repo_url("git@github.com:org-1/agy-hud.git").as_deref(),
+        Some("https://github.com/org-1/agy-hud")
+    );
+    assert_eq!(
+        normalize_github_repo_url("https://github.com/org-1/agy-hud/"),
+        Some("https://github.com/org-1/agy-hud".to_string())
+    );
+    assert_eq!(
+        normalize_github_repo_url("https://token:secret@github.com/org-1/agy-hud.git"),
+        None
+    );
+    assert_eq!(
+        normalize_github_repo_url("https://evil.example.com/org-1/agy-hud.git"),
+        None
+    );
+
+    // 2. Breadcrumb formatting (`agy-hud › hud-core`)
+    let mut stdin = sample_stdin(140);
+    stdin.workspace = Some(WorkspaceStdin {
+        project_dir: Some("/Users/dev/agy-hud".to_string()),
+        current_dir: Some("/Users/dev/agy-hud/crates/hud-core".to_string()),
+    });
+    assert_eq!(
+        format_workspace_breadcrumb(
+            Some("/Users/dev/agy-hud"),
+            Some("/Users/dev/agy-hud/crates/hud-core"),
+            PathLevels::One,
+            true,
+            GlyphMode::Unicode,
+        ),
+        "agy-hud › hud-core"
+    );
+    assert_eq!(
+        format_workspace_breadcrumb(
+            Some("/Users/dev/agy-hud"),
+            Some("/Users/dev/agy-hud/crates/hud-core"),
+            PathLevels::One,
+            true,
+            GlyphMode::Ascii,
+        ),
+        "agy-hud > hud-core"
+    );
+
+    // 3. Git push thresholds + capability-scoped GitHub OSC 8 link
+    let repo = "https://github.com/Max/agy-hud";
+    let probes = ProbeAnswers {
+        vcs: Some(
+            json!({
+                "type": "git",
+                "branch": "feat/p2",
+                "dirty": true,
+                "ahead": 12,
+                "repoUrl": repo
+            })
+            .to_string(),
+        ),
+        ..ProbeAnswers::default()
+    };
+    let vcs = parse_vcs_info(Some(&stdin), &probes).expect("vcs");
+    assert_eq!(vcs.repo_url.as_deref(), Some(repo));
+
+    let mut cfg = HudConfig::default();
+    cfg.vcs.show_ahead_behind = true;
+    cfg.vcs.push_warning_threshold = 5;
+    cfg.vcs.push_critical_threshold = 10;
+
+    let lines = render_hud_lines(RenderInput {
+        stdin: Some(&stdin),
+        config: &cfg,
+        transcript: &TranscriptSummary::default(),
+        vcs: Some(&vcs),
+        memory: None,
+        cached_quota: None,
+        update_info: None,
+        columns: Some(140),
+        now_ms: 1_700_000_000_000,
+    });
+    let filtered = terminal_filter_with_repo(&lines[0], Some(repo));
+    assert!(
+        filtered.contains("\x1b]8;;https://github.com/Max/agy-hud/tree/feat/p2\x1b\\")
+            && strip_ansi(&filtered).contains("feat/p2"),
+        "Matching GitHub repo tree link must pass terminal filter: {filtered:?}"
+    );
+    assert!(
+        filtered.contains("\x1b[31m") && strip_ansi(&filtered).contains("↑12"),
+        "ahead=12 >= pushCriticalThreshold=10 must color ↑12 red: {filtered:?}"
+    );
+
+    // Spoofed OSC 8 URL to another GitHub repo MUST be stripped by `terminal_filter_with_repo`!
+    let spoof = github_branch_link("https://github.com/attacker/exfil", "secret", "main", true);
+    let stripped_spoof = terminal_filter_with_repo(&spoof, Some(repo));
+    assert!(!stripped_spoof.contains("attacker/exfil"));
+    assert_eq!(strip_ansi(&stripped_spoof), "main");
+}
+
+#[test]
+fn composable_merge_groups_cjk_bar_alignment_and_right_align() {
+    let mut stdin = sample_stdin(160);
+    stdin.cost = Some(CostStdin {
+        total_usd: Some(1.24),
+        subagent_usd: None,
+        estimated: Some(false),
+    });
+    let mut cfg = HudConfig::default();
+    cfg.display.merge_groups = vec![vec!["context".to_string(), "quota".to_string()]];
+    cfg.display.right_align = vec!["quota".to_string()];
+
+    // 1. At 160 columns, `["context", "quota"]` merges onto a single row AND `quota` right-aligns to effective width (`160`)!
+    let wide_lines = render_hud_lines(RenderInput {
+        stdin: Some(&stdin),
+        config: &cfg,
+        transcript: &TranscriptSummary::default(),
+        vcs: None,
+        memory: None,
+        cached_quota: None,
+        update_info: None,
+        columns: Some(160),
+        now_ms: 1_700_000_000_000,
+    });
+    let merged_row = strip_ansi(&wide_lines[1]);
+    assert!(
+        merged_row.contains("Ctx") && merged_row.contains("Quota(weekly)"),
+        "Wide terminal should merge context + quota onto one row: {merged_row}"
+    );
+    assert_eq!(
+        text_width(&merged_row),
+        160, // rail (3) + line_budget (157) = 160
+        "rightAlign group member should pad row flush to effective width (160): '{merged_row}'"
+    );
+
+    // 2. At 84 columns in `zh-Hans` (`LineLayout::Expanded`), `["context", "quota"]` cannot fit on one line,
+    // so it auto-stacks AND aligns bar start columns across CJK `上下文` (6 cols) and `配额(weekly)` (12 cols)!
+    cfg.language = Language::ZhHans;
+    cfg.line_layout = hud_core::types::LineLayout::Expanded;
+    let narrow_zh = render_hud_lines(RenderInput {
+        stdin: Some(&stdin),
+        config: &cfg,
+        transcript: &TranscriptSummary::default(),
+        vcs: None,
+        memory: None,
+        cached_quota: None,
+        update_info: None,
+        columns: Some(84),
+        now_ms: 1_700_000_000_000,
+    });
+    let ctx_plain = strip_ansi(&narrow_zh[1]);
+    let qta_plain = strip_ansi(&narrow_zh[2]);
+    let ctx_bar_col = text_width(&ctx_plain[..ctx_plain.find('█').unwrap()]);
+    let qta_bar_col = text_width(&qta_plain[..qta_plain.find('█').unwrap()]);
+    assert_eq!(
+        ctx_bar_col, qta_bar_col,
+        "Auto-stacked CJK bars must align at identical display column!\nctx: {ctx_plain}\nqta: {qta_plain}"
+    );
+}
+
+#[test]
+fn width_preserving_report_scrub_and_incremental_transcript_cursor_parity() {
+    // 1. Width-preserving privacy mask preserves exact visual width for ASCII, CJK, and Emoji
+    for sample in [
+        "/Users/max/ secret-客户项目",
+        "feat/登录修复-🚀",
+        "Investigate payment timeout in checkout_v2",
+    ] {
+        let masked = mask_preserving_width(sample);
+        assert_eq!(
+            text_width(&masked),
+            text_width(sample),
+            "Masked width mismatch for {sample}"
+        );
+        assert_ne!(masked, sample);
+    }
+
+    // 2. `report` outputs minimal non-default config diff + scrubbed `"case"` fixture
+    let stdin = sample_stdin(120);
+    let snap = json!({
+        "stdin": stdin,
+        "probes": {
+            "vcs": json!({ "type": "git", "branch": "feat/secret-branch", "dirty": true, "repoUrl": "https://github.com/private/repo" }).to_string(),
+            "costLedger": json!({ "todayUsd": 2.5, "weekUsd": 9.0 }).to_string()
+        }
+    })
+    .to_string();
+    let facts = DoctorFacts {
+        cwd: "/Users/max/secret-repo".to_string(),
+        home_dir: "/Users/max".to_string(),
+        platform: "macos".to_string(),
+        terminal: "Ghostty".to_string(),
+        remote_session: false,
+        runtime: RuntimeFacts {
+            engine: "rust-native".to_string(),
+            version: "1.4.0".to_string(),
+            exec_path: "/Users/max/.gemini/antigravity-cli/agy-hud/bin/agy-hud".to_string(),
+            supported: true,
+        },
+        plugin: PluginFacts {
+            root: "/Users/max/.gemini/config/plugins/agy-hud".to_string(),
+            version: "1.4.0".to_string(),
+        },
+        installed_plugin_status: "installed".to_string(),
+        installed_plugin: None,
+        config_path: "/Users/max/.gemini/antigravity-cli/agy-hud/config.json".to_string(),
+        heartbeat: None,
+    };
+    let report = execute_subcommand(
+        "report",
+        &[],
+        &CommandContext {
+            config_text: Some(r#"{"language":"zh-Hans","display":{"barLength":10}}"#),
+            cli_settings_text: None,
+            last_snapshot_text: Some(&snap),
+            update_cache_text: None,
+            transcript_head: None,
+            transcript_tail: None,
+            task_md_text: None,
+            facts: &facts,
+            paths: &LogicPaths::default(),
+            now_ms: 1_700_000_000_000,
+        },
+    );
+    let joined = report.lines.join("\n");
+    assert!(!joined.contains("secret-branch"));
+    assert!(!joined.contains("private/repo"));
+    let parsed_report: serde_json::Value = serde_json::from_str(&joined).expect("report JSON");
+    assert_eq!(parsed_report["config"]["language"], "zh-Hans");
+    assert!(
+        parsed_report["config"]["vcs"].is_null(),
+        "Default sections must be omitted from minimal report config"
+    );
+    assert!(parsed_report["case"]["expectedPlainLines"].is_array());
+
+    // 3. Incremental `parse_transcript_with_cursor` across 3 chunks matches full one-pass parse!
+    let steps = [
+        json!({
+            "step_index": 0,
+            "type": "USER_INPUT",
+            "status": "DONE",
+            "created_at": "2026-11-10T01:00:00Z",
+            "content": "<USER_REQUEST>/plan Architect incremental HUD cursor</USER_REQUEST>"
+        }),
+        json!({
+            "step_index": 1,
+            "type": "PLANNER_RESPONSE",
+            "status": "DONE",
+            "created_at": "2026-11-10T01:00:05Z",
+            "output_tokens": 240,
+            "tool_calls": [
+                { "name": "read_file", "status": "DONE", "args": { "Path": "/Users/dev/project/skills/hud/SKILL.md" } },
+                { "name": "call_mcp_tool", "status": "ERROR", "args": { "ServerName": "supabase-mcp-server", "ToolName": "list_tables" } }
+            ]
+        }),
+        json!({
+            "step_index": 2,
+            "type": "PLANNER_RESPONSE",
+            "status": "DONE",
+            "created_at": "2026-11-10T01:00:12Z",
+            "output_tokens": 310,
+            "tool_calls": [
+                { "name": "call_mcp_tool", "status": "DONE", "args": { "ServerName": "supabase-mcp-server", "ToolName": "list_tables" } },
+                { "name": "edit_file", "status": "DONE", "args": { "Path": "/Users/dev/project/src/lib.rs" } }
+            ]
+        }),
+        json!({
+            "step_index": 3,
+            "type": "PLANNER_RESPONSE",
+            "status": "RUNNING",
+            "created_at": "2026-11-10T01:00:18Z",
+            "content": "Streaming uncommitted tail...",
+            "tool_calls": [
+                { "name": "run_command", "status": "RUNNING", "args": { "CommandLine": "cargo test" } }
+            ]
+        }),
+    ];
+    let lines_str: Vec<String> = steps
+        .iter()
+        .map(|v| format!("{}\n", serde_json::to_string(v).unwrap()))
+        .collect();
+    let head_line = lines_str[0].trim_end();
+    let full_text = lines_str.concat();
+
+    // Full one-pass reference
+    let full_ref =
+        parse_transcript_and_tasks(Some(head_line), Some(&full_text), None, Some(&stdin));
+
+    // Chunked incremental cursor: step 0+1 -> step 1+2 -> step 2+3 (uncommitted tail stays re-evaluated)
+    let chunk1 = format!("{}{}", lines_str[0], lines_str[1]);
+    let (_, c1_opt) =
+        parse_transcript_with_cursor(None, Some(head_line), Some(&chunk1), 0, None, Some(&stdin));
+    let c1 = c1_opt.expect("cursor after step 0+1");
+    assert_eq!(
+        c1.offset,
+        lines_str[0].len() as u64,
+        "Cursor commits step 0 and keeps latest PLANNER_RESPONSE (step 1) uncommitted"
+    );
+
+    let chunk2 = format!("{}{}", lines_str[1], lines_str[2]);
+    let (_, c2_opt) = parse_transcript_with_cursor(
+        Some(&c1),
+        Some(head_line),
+        Some(&chunk2),
+        c1.offset,
+        None,
+        Some(&stdin),
+    );
+    let c2 = c2_opt.expect("cursor after step 2");
+    assert_eq!(
+        c2.offset,
+        (lines_str[0].len() + lines_str[1].len()) as u64,
+        "Cursor advances past step 1 and keeps latest PLANNER_RESPONSE (step 2) uncommitted"
+    );
+
+    let chunk3 = format!("{}{}", lines_str[2], lines_str[3]);
+    let (inc_summary, c3_opt) = parse_transcript_with_cursor(
+        Some(&c2),
+        Some(head_line),
+        Some(&chunk3),
+        c2.offset,
+        None,
+        Some(&stdin),
+    );
+    let c3 = c3_opt.expect("cursor after step 3");
+    assert_eq!(
+        c3.offset,
+        (lines_str[0].len() + lines_str[1].len() + lines_str[2].len()) as u64,
+        "Cursor advances past step 2 and keeps RUNNING step 3 uncommitted"
+    );
+    assert_eq!(inc_summary.session_started_at, full_ref.session_started_at);
+    assert_eq!(inc_summary.active_slash_mode, full_ref.active_slash_mode);
+    assert_eq!(inc_summary.skills, full_ref.skills);
+    assert_eq!(inc_summary.mcp_servers, full_ref.mcp_servers);
+    assert_eq!(inc_summary.mcp_errors, full_ref.mcp_errors);
+    assert_eq!(inc_summary.tools, full_ref.tools);
+    assert_eq!(
+        inc_summary.latest_planner_step,
+        full_ref.latest_planner_step
+    );
+    assert_eq!(
+        inc_summary.completed_step_tps_x10,
+        full_ref.completed_step_tps_x10
+    );
+
+    // Confirm `TranscriptCursor` roundtrips cleanly through JSON
+    let cursor_json = serde_json::to_string(&c3).unwrap();
+    let decoded_cursor: TranscriptCursor = serde_json::from_str(&cursor_json).unwrap();
+    assert_eq!(decoded_cursor, c3);
 }

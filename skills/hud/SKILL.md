@@ -56,10 +56,13 @@ Use `sh scripts/hud-cli.sh` (relative to this skill directory) to inspect, previ
      ```
 
 4. **Apply or Undo configuration changes (`set`)**
-   - Save validated `key=value` pairs (automatically backs up undo state):
+   - Save validated `key=value` pairs across all 52 schema keys (automatically backs up undo state):
      ```bash
      sh scripts/hud-cli.sh set language=zh-Hans vcs.showFileStats=true
      sh scripts/hud-cli.sh set display.glyphMode=ascii display.showTitle=true
+     sh scripts/hud-cli.sh set display.showDailyCost=true display.showWeeklyCost=true display.showLaunchDir=true
+     sh scripts/hud-cli.sh set display.quotaPace=true display.quotaThreshold=25 vcs.pushWarningThreshold=5
+     sh scripts/hud-cli.sh set 'display.mergeGroups=[["context","quota"]]' 'display.rightAlign=["quota"]'
      sh scripts/hud-cli.sh set quota.backgroundRefresh=true
      ```
    - Manually refresh the official `/usage` quota cache on demand:

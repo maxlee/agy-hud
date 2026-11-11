@@ -56,19 +56,19 @@
 | :--- | :--- | :--- |
 | **运行状态与模式** | 实时 `空闲` / `思考中` / `调用工具` / `等待确认` 状态，`[计划]` / `[自动]` / `[接受]` 模式（自动识别 `/plan` 与 `VIM` 模式徽章） | `display.showState`, `display.showMode` |
 | **模型、档位与速率** | 模型简称、推理强度（`low`/`med`/`high`）、订阅档位（`Pro`/`Ultra`）以及剥离 `TTFT` 的真实生成速率 `~tok/s` | `display.showModel`, `display.showPlanTier`, `display.showSpeed` |
-| **项目路径与 VCS** | 支持点击跳转的 `file://` OSC 8 目录链接 + `git`（含 Worktree、脏标记、领先/落后、文件增删）、`jj`（书签、`@change_id`、冲突计数）与 `hg` | `display.showProject`, `vcs.enabled`, `vcs.showFileStats` |
-| **上下文与会话指标** | 1/8 精细块级进度条、`!200k` 阈值告警、Prompt `Cache` 命中率、估算开销、子代理/后台任务/产物计数、沙箱徽章 | `display.showContextBar`, `display.showCacheHitRate`, `display.showCost` |
-| **配额进度与倒计时** | 按当前模型智能路由配额桶（`5h` / `weekly`），支持已用/剩余百分比进度条与重置倒计时 | `display.showQuota`, `display.quotaValue`, `quota.backgroundRefresh` |
-| **实时活动明细行** | 同名工具调用折叠计数（`×N`）、已激活 `Skills` 与 `MCP` 服务（异常自动标红 `!`）、四态 `Subagents`（`◐`/`◷`/`✗`/`✓`）与 `task.md` 进度 | `display.showTools`, `display.showSkillsAndMcp`, `display.showSubagents`, `display.showTodos` |
+| **项目路径与 VCS** | 支持点击跳转的 `file://` OSC 8 目录链接（含可选 `项目根 › 子目录` 面包屑）、GitHub 分支点击跳转、`git`（含 Worktree、脏标记、`↑N` 未推送阈值变色、文件增删）、`jj` 与 `hg` | `display.showProject`, `display.showLaunchDir`, `vcs.pushWarningThreshold`, `vcs.showFileStats` |
+| **上下文与跨会话账本** | 1/8 精细块级进度条、`!200k` 阈值告警、Prompt `Cache` 命中率、当前/今日/本周累计花费（`今日` / `本周`）、子代理/后台任务/产物计数、沙箱徽章 | `display.showContextBar`, `display.showCost`, `display.showDailyCost`, `display.showWeeklyCost` |
+| **配额消耗速率（Pace）** | 按当前模型智能路由配额桶（`5h` / `weekly`），实时预测重置前耗尽风险（`▲` 增速预警）、低占用自动隐藏阈值及重置倒计时 | `display.showQuota`, `display.quotaPace`, `display.quotaThreshold`, `quota.backgroundRefresh` |
+| **活动明细与可组合行** | 同名工具调用折叠计数（`×N`）、`Skills` 与 `MCP` 服务（异常标红 `!`）、四态 `Subagents`（完成满 60 秒自动退场）、`task.md` 进度，以及自由并排合并与右对齐 | `display.mergeGroups`, `display.rightAlign`, `display.showTools`, `display.showSubagents`, `display.showTodos` |
 
 ---
 
 ## ✨ 核心特性
 
-- **⚡ 原生 ~1–3 ms 极致性能**：LTO 裁剪后单二进制体积仅 `~930 KB`，无任何虚拟机冷启动开销；`std::thread::scope` 多线程并行采集，`transcript.jsonl` 采用有界 `O(1)` 首部（`32 KB`）+ 尾部（`512 KB`）定长切片读取。
-- **🎯 混合毫秒级 `~tok/s` 测速引擎（`v1.4.0` 全新升级）**：借助 `agy` 每 `300 ms` 的状态栏心跳，精确剥离 `thinking`/Prefill 首字延迟（`TTFT`）与工具执行等待时间，结合两点斜率校准与按模型隔离的 Token-Weighted EWMA 平滑算法，彻底告别短工具回合导致的速率跳水。
-- **🎨 深浅色主题自适应与中日韩宽度对齐**：绝不使用硬编码白色（`37m`/`97m`）或浅灰（`90m`）前景色，在 Dark 与 Solarized Light 浅色终端下均清晰可读；精确计算 CJK 双列字符、ZWJ 组合 Emoji 与 OSC 8 闭合标签，内置 `unicode`、`nerd`、`ascii` 三套图标模式。
-- **🌿 原生多版本控制（`git` / `jj` / `hg` & CitC）**：自动识别共置 Jujutsu（`jj`）、嵌套 Git Worktree（超时自动降级至零子进程 `.git/HEAD` 解析）、Mercurial（`hg`）与 CitC 客户端工作区，配合按工作区 FNV-1a 哈希分片的 `O(1)` `mtime` 缓存。
+- **⚡ 原生 ~1–3 ms 极致性能 + `O(Δ)` 增量游标**：LTO 裁剪后单二进制体积仅 `~930 KB`，无任何虚拟机冷启动开销；`std::thread::scope` 多线程并行采集，`transcript.jsonl` 支持增量字节偏移游标（`transcript-cursors/<fnv64>.json`），超长多 MB 会话依然完整保留早期激活的技能、MCP 与工具累计计数。
+- **🎯 混合毫秒级 `~tok/s` 测速与配额增速预警（`▲`）**：精确剥离 `thinking`/Prefill 首字延迟（`TTFT`）与工具等待时间；同时 `display.quotaPace` 根据时间窗口剩余比例智能预测配额耗尽速度（提前亮起琥珀/红色 `▲`），`display.showDailyCost` / `showWeeklyCost` 跨会话幂等汇总今日/本周开销。
+- **🎨 完整字素簇宽度引擎与可组合布局**：零硬编码黑白灰前景色，深浅色主题通吃；纯 Rust 完整支持 Unicode Extended Grapheme Clusters（ZWJ 组合 Emoji、肤色修饰符、国旗双区域指示符、CJK 双列对齐），支持 `display.mergeGroups` 多行自由合并（窄屏自动堆叠并对齐中文进度条起始列）与 `display.rightAlign` 右对齐。
+- **🌿 纵深安全加固的 `git` / `jj` / `hg` 探针**：内置 Windows `CreateProcessW` 工作目录可执行劫持防御、作用域感知的 Git `[include]` 过滤器精准拆弹（保留全局 `git-lfs`，仅清空不可信仓库过滤器，异常过滤器名自动降级至零子进程 `.git/HEAD`）、GitHub 分支点击跳转与 `↑N` 未推送阈值变色提醒。
 - **🔄 内置 SHA-256 校验自更新**：每 6 小时后台静默检查新版本并在顶栏温和提示（`↑ vX.Y.Z · /agy-hud:hud-update`），一键校验升级并完整保留 `--stack` 与个性化配置。
 
 ---
@@ -149,11 +149,11 @@ agy plugin install .
 | `uninstall [--plugin] [--keep-config]` | 移除 `statusLine`、清理备份与数据目录，无损恢复 `agy` 官方默认状态栏 |
 | `doctor [--pretty]` | 检查运行引擎、插件启用状态、`statusLine` 挂载、配置合法性及终端图标对齐情况 |
 | `preview [--state <name>] [--last] [--set k=v]` | 预览 `showcase`（5 大场景）、`idle`、`tool_use`、`confirm`、`high-context` 或最近一次真实快照 |
-| `schema [关键词]` | 检索全部 **43** 个受强类型校验的配置项、类型、默认值与说明 |
+| `schema [关键词]` | 检索全部 **52** 个受强类型校验的配置项、类型、默认值与说明 |
 | `set <key>=<value> ...` / `set --undo` | 原子修改 `~/.gemini/antigravity-cli/agy-hud/config.json` 或一键回滚上一次修改 |
 | `update [--check] [--force]` | 检查或执行经过 SHA-256 校验的自升级 |
 | `quota refresh` | 在隔离临时目录执行一次 `agy -p /usage` 官方配额缓存校准 |
-| `report [--note "..."]` | 导出隐私脱敏后的诊断 JSON（自动抹除本地路径、会话 ID、标题、邮箱与 VCS 客户端名） |
+| `report [--note "..."]` | 导出保持视觉宽度的隐私脱敏诊断 JSON 及可直接回归回放的 `.case` 快照 |
 
 ### 常用配置示例
 
@@ -163,6 +163,15 @@ agy plugin install .
 
 # 切换为简体中文界面并开启 VCS 文件增删统计
 ~/.gemini/antigravity-cli/agy-hud/bin/agy-hud set language=zh-Hans vcs.showFileStats=true
+
+# 开启跨会话今日/本周花费统计、子目录启动面包屑与 Git 未推送提交数阈值变色
+~/.gemini/antigravity-cli/agy-hud/bin/agy-hud set display.showDailyCost=true display.showWeeklyCost=true display.showLaunchDir=true vcs.pushWarningThreshold=5 vcs.pushCriticalThreshold=15
+
+# 宽屏将上下文与配额合并为单行并右对齐配额（窄屏自动回退堆叠且对齐中英文进度条起始列）
+~/.gemini/antigravity-cli/agy-hud/bin/agy-hud set 'display.mergeGroups=[["context","quota"]]' 'display.rightAlign=["quota"]'
+
+# 配额低于 25% 时静默隐藏（若消耗增速过快触发 `▲` 预警则自动提前浮现）
+~/.gemini/antigravity-cli/agy-hud/bin/agy-hud set display.quotaThreshold=25 display.quotaPace=true
 
 # 切换图标字符集：unicode（默认）| nerd（Nerd Fonts）| ascii（纯 7-bit 安全字符）
 ~/.gemini/antigravity-cli/agy-hud/bin/agy-hud set display.glyphMode=nerd

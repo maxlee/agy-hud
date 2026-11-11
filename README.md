@@ -56,19 +56,19 @@ Ctx ███████░ 89.6% !200k │ Quota(weekly) 92% (1h 30m)
 | :--- | :--- | :--- |
 | **State & Mode** | Live `IDLE` / `WORK` / `TOOL` / `CONFIRM` state, `[PLAN]` / `[AUTO]` / `[ACCEPT]` cycle mode (plus `/plan` detection & `VIM` mode badge) | `display.showState`, `display.showMode` |
 | **Model, Tier & Speed** | Compact model name, reasoning effort (`low`/`med`/`high`), normalized plan tier (`Pro`/`Ultra`), and TTFT-stripped `~tok/s` decode rate | `display.showModel`, `display.showPlanTier`, `display.showSpeed` |
-| **Workspace & VCS** | Clickable `file://` OSC 8 project path + `git` (worktrees, dirty, ahead/behind, file stats), `jj` (bookmarks, `@change_id`, conflicts), or `hg` | `display.showProject`, `vcs.enabled`, `vcs.showFileStats` |
-| **Context & Meta** | Fine-grained 8th-block Unicode context bar, `!200k` alert, prompt `Cache` hit %, session cost, subagent/task/artifact counts, Sandbox badge | `display.showContextBar`, `display.showCacheHitRate`, `display.showCost` |
-| **Quota Pace** | Model-routed quota buckets (`5h` / `weekly`), used or remaining percentage bar, and human-readable reset countdown | `display.showQuota`, `display.quotaValue`, `quota.backgroundRefresh` |
-| **Activity Rows** | Folded tool invocations (`×N` deduplication), active `Skills` & `MCP` servers (with `!` error alerts), `Subagents` (`◐`/`◷`/`✗`/`✓`), and `task.md` progress | `display.showTools`, `display.showSkillsAndMcp`, `display.showSubagents`, `display.showTodos` |
+| **Workspace & VCS** | Clickable `file://` OSC 8 project path (plus optional `project › subdir` breadcrumb), clickable GitHub branch OSC 8 links, `git` (worktrees, dirty, unpushed `↑N` thresholds, file stats), `jj` (bookmarks, `@change_id`, conflicts), or `hg` | `display.showProject`, `display.showLaunchDir`, `vcs.pushWarningThreshold`, `vcs.showFileStats` |
+| **Context & Meta** | Fine-grained 8th-block Unicode context bar, `!200k` alert, prompt `Cache` hit %, session/daily/weekly cost (`Today` / `Week`), subagent/task/artifact counts, Sandbox badge | `display.showContextBar`, `display.showCost`, `display.showDailyCost`, `display.showWeeklyCost` |
+| **Quota Pace** | Model-routed quota buckets (`5h` / `weekly`), burn-rate projection (`▲` pace alert when projected > 90% / > 100% before reset), optional low-usage threshold hiding, and reset countdown | `display.showQuota`, `display.quotaPace`, `display.quotaThreshold`, `quota.backgroundRefresh` |
+| **Activity & Composable Rows** | Folded tool invocations (`×N` deduplication), active `Skills` & `MCP` servers (`!` error alerts), `Subagents` (`◐`/`◷`/`✗`/`✓` with 60s completed retirement), `task.md` progress, and customizable row merging / right-alignment | `display.mergeGroups`, `display.rightAlign`, `display.showTools`, `display.showSubagents`, `display.showTodos` |
 
 ---
 
 ## ✨ Highlights
 
-- **⚡ Native ~1–3 ms Warm Execution**: Single LTO-optimized binary (`~930 KB`), zero VM startup overhead, `std::thread::scope` parallel probes, and bounded `O(1)` `transcript.jsonl` head (`32 KB`) + tail (`512 KB`) seeking.
-- **🎯 Hybrid TTFT-Stripped `~tok/s` Engine (`v1.4.0`)**: Tracks `agy`'s `300 ms` `statusLine` ticks to separate `thinking`/prefill latency (`TTFT`) and post-decode tool execution time from pure streaming decode throughput, reinforced by 2-point slope calibration and per-model Token-Weighted EWMA.
-- **🎨 Theme-Safe & CJK/Emoji-Aware Rendering**: Emits zero hardcoded white (`37m`/`97m`) or gray (`90m`) foreground codes so text stays legible on both Dark and Solarized Light terminals. Respects East Asian 2-column widths, ZWJ emoji clusters, OSC 8 hyperlink closure, and 3 glyph sets (`unicode`, `nerd`, `ascii`).
-- **🌿 First-Class `git`, `jj` & `hg` Support**: Automatically detects colocated Jujutsu (`jj`), nested Git worktrees (with zero-subprocess `.git/HEAD` fallback on timeout), Mercurial (`hg`), and CitC client workspaces, backed by per-workspace FNV-1a sharded `mtime` caches.
+- **⚡ Native ~1–3 ms Warm Execution + Incremental `O(Δ)` Cursor**: Single LTO-optimized binary (`~930 KB`), zero VM startup overhead, `std::thread::scope` parallel probes, and an incremental `transcript.jsonl` byte-offset cursor (`transcript-cursors/<fnv64>.json`) that preserves early skills/MCP/tool counts even in multi-megabyte sessions.
+- **🎯 Hybrid TTFT-Stripped `~tok/s` & Quota Burn-Rate (`▲`)**: Separates `thinking`/prefill latency (`TTFT`) and tool wait time from pure streaming decode throughput, while `display.quotaPace` projects `5h`/`weekly` quota burn velocity (`▲` amber/red warning before you hit 0%) and `display.showDailyCost` / `showWeeklyCost` tracks cross-session spend without double counting.
+- **🎨 Theme-Safe, Grapheme-Cluster-Accurate & Composable Layout**: Zero hardcoded white (`37m`/`97m`) or gray (`90m`) foreground codes. Full Unicode extended grapheme cluster width engine (ZWJ emoji sequences, skin-tone modifiers, regional flag pairs, CJK 2-col alignment), `display.mergeGroups` + `display.rightAlign` row composition, and 3 glyph sets (`unicode`, `nerd`, `ascii`).
+- **🌿 Hardened `git`, `jj` & `hg` Support**: Windows `CreateProcessW` `PATH`-hijack protection, scope-aware Git `[include]` filter neutralization (preserving global `git-lfs` while disarming untrusted repo filters, with zero-subprocess `.git/HEAD` fallback), clickable GitHub branch OSC 8 links, unpushed `↑N` thresholds, and FNV-1a sharded `mtime` caches.
 - **🔄 Built-in Verified Self-Update**: Non-blocking 6-hour release check surfaces a subtle header badge (`↑ vX.Y.Z · /agy-hud:hud-update`) and upgrades in one SHA-256-verified step while preserving `--stack` and user `config.json`.
 - **🌏 Native Bilingual UI**: Switch effortlessly between English (`en`) and Simplified Chinese (`zh-Hans`).
 
@@ -150,11 +150,11 @@ Invoke via `~/.gemini/antigravity-cli/agy-hud/bin/agy-hud` (or `./scripts/agy-hu
 | `uninstall [--plugin] [--keep-config]` | Remove `statusLine`, clean backups & HUD directory, and restore official `agy` default |
 | `doctor [--pretty]` | Inspect runtime, plugin enablement, `statusLine` wiring, config validity, and glyph alignment |
 | `preview [--state <name>] [--last] [--set k=v]` | Render `showcase`, `idle`, `tool_use`, `confirm`, `high-context`, inline JSON, or last live snapshot |
-| `schema [query]` | Browse all **43** validated configuration keys, types, defaults, and descriptions |
+| `schema [query]` | Browse all **52** validated configuration keys, types, defaults, and descriptions |
 | `set <key>=<value> ...` / `set --undo` | Atomically update `~/.gemini/antigravity-cli/agy-hud/config.json` or revert the previous change |
 | `update [--check] [--force]` | Check for or apply the latest SHA-256-verified release from GitHub |
 | `quota refresh` | Run an isolated one-shot `agy -p /usage` sync to reconcile local quota cache |
-| `report [--note "..."]` | Export a privacy-scrubbed diagnostic JSON bundle (redacts paths, IDs, titles, emails, VCS clients) |
+| `report [--note "..."]` | Export a width-preserving privacy-scrubbed diagnostic JSON bundle + replayable `.case` regression fixture |
 
 ### Common Customization Recipes
 
@@ -164,6 +164,15 @@ Invoke via `~/.gemini/antigravity-cli/agy-hud/bin/agy-hud` (or `./scripts/agy-hu
 
 # Switch UI to Simplified Chinese and enable +/- VCS file stats
 ~/.gemini/antigravity-cli/agy-hud/bin/agy-hud set language=zh-Hans vcs.showFileStats=true
+
+# Enable cross-session Today/Week cost ledger, launch-dir breadcrumb & Git push alerts
+~/.gemini/antigravity-cli/agy-hud/bin/agy-hud set display.showDailyCost=true display.showWeeklyCost=true display.showLaunchDir=true vcs.pushWarningThreshold=5 vcs.pushCriticalThreshold=15
+
+# Merge Context + Quota onto one row (with automatic narrow-terminal CJK column stacking) and right-align Quota
+~/.gemini/antigravity-cli/agy-hud/bin/agy-hud set 'display.mergeGroups=[["context","quota"]]' 'display.rightAlign=["quota"]'
+
+# Hide quota bar until 25% used (automatically surfaces earlier if burn pace `▲` is fast)
+~/.gemini/antigravity-cli/agy-hud/bin/agy-hud set display.quotaThreshold=25 display.quotaPace=true
 
 # Switch glyph mode: unicode (default) | nerd (Nerd Fonts) | ascii (strict 7-bit)
 ~/.gemini/antigravity-cli/agy-hud/bin/agy-hud set display.glyphMode=nerd

@@ -1,10 +1,12 @@
 use hud_cli::collector::{
     DetectedRepo, GIT_SAFE_PREFIX, HG_SAFE_PREFIX, JJ_PROBE_ARGS, ProbeRunner, SystemProbeRunner,
     compute_vcs_signature, detect_vcs_repo, extract_git_filter_names, probe_git, probe_hg,
-    probe_jj, probe_vcs_cached,
+    probe_jj, probe_vcs_cached, probe_vcs_uncached, read_and_parse_transcript_incremental,
+    resolve_executable_in_path,
 };
 use hud_cli::install::format_statusline_command_for_platform;
 use hud_cli::paths::{AgyPaths, build_logic_paths, derive_task_md_path};
+use hud_core::ansi::strip_ansi;
 use hud_core::types::{AgyStdinData, VcsStdin, VcsType, WorkspaceStdin};
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -1300,4 +1302,337 @@ fn doctor_detects_disabled_plugin_in_gemini_config_json() {
         findings.contains("Installed agy-hud plugin is disabled"),
         "expected disabled plugin finding, got: {findings}"
     );
+}
+
+#[test]
+fn windows_and_unix_executable_resolution_defeats_cwd_and_relative_path_hijack() {
+    let tmp = TempDir::new("path-hijack-defense");
+    let untrusted_cwd = tmp.path.join("untrusted-repo");
+    let rel_bin = untrusted_cwd.join("rel-bin");
+    let trusted_bin = tmp.path.join("trusted-system-bin");
+    fs::create_dir_all(&rel_bin).unwrap();
+    fs::create_dir_all(&trusted_bin).unwrap();
+
+    // Plant decoy binaries in untrusted repo cwd + relative PATH + .bat/.cmd in trusted_bin
+    for decoy in [
+        untrusted_cwd.join("git.exe"),
+        untrusted_cwd.join("git.bat"),
+        untrusted_cwd.join("git"),
+        rel_bin.join("git.exe"),
+        rel_bin.join("git"),
+        trusted_bin.join("git.bat"),
+        trusted_bin.join("git.cmd"),
+    ] {
+        fs::write(&decoy, b"decoy").unwrap();
+    }
+
+    // Before real `git.exe` exists in `trusted_bin`, Windows resolution MUST return None (ignoring .bat/.cmd & relative dirs!)
+    let path_entries =
+        std::env::join_paths([Path::new("."), Path::new("rel-bin"), trusted_bin.as_path()])
+            .unwrap();
+    assert_eq!(
+        resolve_executable_in_path("git", Some(&path_entries), true),
+        None,
+        "Windows lookup must reject relative PATH entries and .bat/.cmd shims"
+    );
+
+    // Plant genuine `git.exe` in absolute `trusted_bin` -> resolves strictly to `trusted_bin/git.exe`
+    let real_win_exe = trusted_bin.join("git.exe");
+    fs::write(&real_win_exe, b"MZ-real").unwrap();
+    assert_eq!(
+        resolve_executable_in_path("git", Some(&path_entries), true).as_deref(),
+        Some(real_win_exe.as_path())
+    );
+    // Rejects relative command paths like `./git` or `sub\git`
+    assert_eq!(
+        resolve_executable_in_path("./git", Some(&path_entries), true),
+        None
+    );
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let real_unix_bin = trusted_bin.join("git");
+        fs::write(&real_unix_bin, b"#!/bin/sh\n").unwrap();
+        // Non-executable file (`0o644`) must be skipped on Unix
+        fs::set_permissions(&real_unix_bin, fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(
+            resolve_executable_in_path("git", Some(&path_entries), false),
+            None
+        );
+        // Executable file (`0o755`) in absolute PATH dir resolves cleanly
+        fs::set_permissions(&real_unix_bin, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            resolve_executable_in_path("git", Some(&path_entries), false).as_deref(),
+            Some(real_unix_bin.as_path())
+        );
+    }
+}
+
+#[test]
+fn scope_aware_git_include_filter_neutralization_and_unsafe_filter_head_fallback() {
+    struct ScopedGitMock {
+        scoped_output: Option<String>,
+        calls: Mutex<Vec<Vec<String>>>,
+    }
+
+    impl ProbeRunner for ScopedGitMock {
+        fn run(&self, _cmd: &str, args: &[String], _cwd: Option<&Path>) -> Option<String> {
+            self.calls.lock().unwrap().push(args.to_vec());
+            if args.iter().any(|a| a == "--show-scope") {
+                return self.scoped_output.clone();
+            }
+            if args.iter().any(|a| a == "status") {
+                return Some("# branch.head feat/include-safe\n# branch.ab +2 -0\n".to_string());
+            }
+            None
+        }
+    }
+
+    let tmp = TempDir::new("git-include-scope");
+    let repo_a = tmp.path.join("repo-a");
+    let git_a = repo_a.join(".git");
+    fs::create_dir_all(&git_a).unwrap();
+    fs::write(git_a.join("HEAD"), "ref: refs/heads/feat/include-safe\n").unwrap();
+    fs::write(
+        git_a.join("config"),
+        "[core]\n\trepositoryformatversion = 0\n[include]\n\tpath = ../.gitconfig-extra\n[remote \"origin\"]\n\turl = git@github.com:Max/agy-hud.git\n",
+    )
+    .unwrap();
+
+    // 1. `[include]` triggers `--show-scope -z`, preserves `global` `lfs`, neutralizes `local` `inc-evil`!
+    let mock_a = ScopedGitMock {
+        scoped_output: Some(
+            "global\0filter.lfs.process\ngit-lfs filter-process\0local\0filter.inc-evil.clean\nsh -c pwn\0"
+                .to_string(),
+        ),
+        calls: Mutex::new(Vec::new()),
+    };
+    let detected_a = detect_vcs_repo(&repo_a).expect("detect repo_a");
+    let info_a = probe_vcs_uncached(&detected_a, &mock_a).expect("probe_vcs_uncached repo_a");
+    assert_eq!(info_a.branch, "feat/include-safe");
+    assert_eq!(info_a.ahead, 2);
+    assert_eq!(
+        info_a.repo_url.as_deref(),
+        Some("https://github.com/Max/agy-hud")
+    );
+
+    let calls_a = mock_a.calls.lock().unwrap();
+    assert_eq!(calls_a.len(), 2, "expected config --show-scope + status");
+    let status_args = &calls_a[1];
+    assert!(
+        status_args.iter().any(|a| a == "filter.inc-evil.clean="),
+        "included local filter must be neutralized: {status_args:?}"
+    );
+    assert!(
+        !status_args.iter().any(|a| a.contains("filter.lfs.")),
+        "global git-lfs filter must NOT be neutralized: {status_args:?}"
+    );
+    drop(calls_a);
+
+    // 2. Unskippable filter name (`filter.bad=name.clean`) aborts BEFORE `git status` and falls back to `.git/HEAD`!
+    let repo_b = tmp.path.join("repo-b");
+    let git_b = repo_b.join(".git");
+    fs::create_dir_all(&git_b).unwrap();
+    fs::write(git_b.join("HEAD"), "ref: refs/heads/fallback-branch\n").unwrap();
+    fs::write(
+        git_b.join("config"),
+        "[filter \"bad=name\"]\n\tclean = evil\n[remote \"origin\"]\n\turl = https://github.com/Max/agy-hud.git\n",
+    )
+    .unwrap();
+
+    let mock_b = ScopedGitMock {
+        scoped_output: None,
+        calls: Mutex::new(Vec::new()),
+    };
+    let detected_b = detect_vcs_repo(&repo_b).expect("detect repo_b");
+    let info_b = probe_vcs_uncached(&detected_b, &mock_b).expect("zero-subprocess HEAD fallback");
+    assert_eq!(info_b.branch, "fallback-branch");
+    assert_eq!(
+        info_b.repo_url.as_deref(),
+        Some("https://github.com/Max/agy-hud")
+    );
+    assert!(
+        mock_b.calls.lock().unwrap().is_empty(),
+        "Unsafe filter name in .git/config must abort before spawning ANY git subprocess!"
+    );
+}
+
+#[test]
+fn incremental_transcript_cursor_preserves_early_metadata_beyond_512kb_tail() {
+    let tmp = TempDir::new("incremental-cursor");
+    let tx_path = tmp.path.join("transcript.jsonl");
+    let cursor_path = tmp.path.join("cursor.json");
+
+    // Step 0 & Step 1 at byte 0: `/plan` slash mode, `hud` skill, and `context7` MCP call
+    let mut f = fs::File::create(&tx_path).unwrap();
+    writeln!(
+        f,
+        "{}",
+        json!({
+            "step_index": 0,
+            "type": "USER_INPUT",
+            "status": "DONE",
+            "created_at": "2026-11-10T02:00:00Z",
+            "content": "<USER_REQUEST>/plan Optimize transcript cursor</USER_REQUEST>"
+        })
+    )
+    .unwrap();
+    writeln!(
+        f,
+        "{}",
+        json!({
+            "step_index": 1,
+            "type": "PLANNER_RESPONSE",
+            "status": "DONE",
+            "created_at": "2026-11-10T02:00:04Z",
+            "output_tokens": 180,
+            "tool_calls": [
+                { "name": "read_file", "status": "DONE", "args": { "Path": "/Users/max/.gemini/plugins/agy-hud/skills/hud/SKILL.md" } },
+                { "name": "call_mcp_tool", "status": "DONE", "args": { "ServerName": "context7", "ToolName": "query-docs" } }
+            ]
+        })
+    )
+    .unwrap();
+    writeln!(
+        f,
+        "{}",
+        json!({
+            "step_index": 2,
+            "type": "PLANNER_RESPONSE",
+            "status": "DONE",
+            "created_at": "2026-11-10T02:00:09Z",
+            "output_tokens": 120,
+            "content": "Initial setup complete."
+        })
+    )
+    .unwrap();
+    f.flush().unwrap();
+
+    let stdin = AgyStdinData {
+        agent_state: Some("idle".to_string()),
+        ..AgyStdinData::default()
+    };
+
+    // Tick 1: builds initial `cursor.json` while file is small
+    let s1 = read_and_parse_transcript_incremental(
+        Some(&tx_path),
+        Some(&cursor_path),
+        None,
+        Some(&stdin),
+    );
+    assert_eq!(s1.active_slash_mode.as_deref(), Some("plan"));
+    assert_eq!(s1.skills, vec!["plan".to_string(), "hud".to_string()]);
+    assert_eq!(s1.mcp_servers, vec!["context7".to_string()]);
+    assert!(cursor_path.is_file(), "cursor.json must be persisted");
+
+    // Append > 600 KB of filler `PLANNER_RESPONSE` steps (exceeding the 512 KB cold-start tail cap!)
+    let filler_payload = "x".repeat(12_000);
+    for idx in 3..58 {
+        writeln!(
+            f,
+            "{}",
+            json!({
+                "step_index": idx,
+                "type": "PLANNER_RESPONSE",
+                "status": "DONE",
+                "created_at": "2026-11-10T02:05:00Z",
+                "output_tokens": 90,
+                "content": filler_payload,
+                "tool_calls": [
+                    { "name": "edit_file", "status": "DONE", "args": { "Path": "/Users/max/repo/src/main.rs" } }
+                ]
+            })
+        )
+        .unwrap();
+    }
+    f.flush().unwrap();
+    assert!(
+        fs::metadata(&tx_path).unwrap().len() > 600 * 1024,
+        "transcript must exceed 512 KB tail cap"
+    );
+
+    // Tick 2: incremental cursor seeks from committed offset and preserves early skills, MCP, slash mode & tool counts!
+    let s2 = read_and_parse_transcript_incremental(
+        Some(&tx_path),
+        Some(&cursor_path),
+        None,
+        Some(&stdin),
+    );
+    assert_eq!(s2.active_slash_mode.as_deref(), Some("plan"));
+    assert_eq!(s2.skills, vec!["plan".to_string(), "hud".to_string()]);
+    assert_eq!(s2.mcp_servers, vec!["context7".to_string()]);
+    let edit_entry = s2
+        .tools
+        .iter()
+        .find(|t| t.name == "edit_file")
+        .expect("folded edit_file count");
+    assert_eq!(edit_entry.count, 55);
+}
+
+#[test]
+fn live_binary_cross_session_cost_ledger_and_invalid_config_warning_line() {
+    let tmp = TempDir::new("live-ledger-and-warn");
+    let cli_dir = tmp.path.join("cli");
+    let hud_home = cli_dir.join("agy-hud");
+    fs::create_dir_all(&hud_home).unwrap();
+
+    // Write config enabling daily/weekly cost + an invalid key to trigger live `⚠ Config: ... · /agy-hud:hud`
+    fs::write(
+        hud_home.join("config.json"),
+        r#"{"display":{"showDailyCost":true,"showWeeklyCost":true},"invalidMysteryFlag":123}"#,
+    )
+    .unwrap();
+
+    let env_vars: [(&str, &Path); 2] = [
+        ("AGY_CLI_DIR", cli_dir.as_path()),
+        ("AGY_HUD_HOME", hud_home.as_path()),
+    ];
+
+    let payload_s1 = json!({
+        "cwd": tmp.path,
+        "conversation_id": "live-session-1",
+        "agent_state": "idle",
+        "terminal_width": 130,
+        "model": { "id": "Gemini 3 Flash", "display_name": "Gemini 3 Flash" },
+        "context_window": { "context_window_size": 1048576, "used_percentage": 20.0 },
+        "cost": { "total_usd": 0.40, "estimated": false }
+    })
+    .to_string();
+
+    let (ok1, out1) = run_bin(&[], &env_vars, Some(&payload_s1));
+    assert!(ok1, "session 1 render failed: {out1}");
+    let plain1 = strip_ansi(&out1);
+    assert!(plain1.contains("Today $0.40"), "plain1: {plain1}");
+    assert!(plain1.contains("Week $0.40"), "plain1: {plain1}");
+    assert!(
+        plain1.contains("invalidMysteryFlag") && plain1.contains("/agy-hud:hud"),
+        "live statusLine must surface config warning with /agy-hud:hud remediation: {plain1}"
+    );
+
+    // Session 2 joins with `$0.85` -> `Today $1.25`, `Week $1.25`
+    let payload_s2 = json!({
+        "cwd": tmp.path,
+        "conversation_id": "live-session-2",
+        "agent_state": "idle",
+        "terminal_width": 130,
+        "model": { "id": "Gemini 3 Flash", "display_name": "Gemini 3 Flash" },
+        "context_window": { "context_window_size": 1048576, "used_percentage": 25.0 },
+        "cost": { "total_usd": 0.85, "estimated": false }
+    })
+    .to_string();
+
+    let (ok2, out2) = run_bin(&[], &env_vars, Some(&payload_s2));
+    assert!(ok2, "session 2 render failed: {out2}");
+    let plain2 = strip_ansi(&out2);
+    assert!(plain2.contains("Today $1.25"), "plain2: {plain2}");
+    assert!(plain2.contains("Week $1.25"), "plain2: {plain2}");
+
+    // Repeated 300ms tick with identical `$0.85` on Session 2 must NOT double count!
+    let (ok3, out3) = run_bin(&[], &env_vars, Some(&payload_s2));
+    assert!(ok3);
+    let plain3 = strip_ansi(&out3);
+    assert!(plain3.contains("Today $1.25"), "plain3: {plain3}");
+    assert!(plain3.contains("Week $1.25"), "plain3: {plain3}");
+    assert!(hud_home.join("data/cost-ledger.json").is_file());
 }

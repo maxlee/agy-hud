@@ -1,19 +1,20 @@
 use crate::ansi::{
-    BOLD, DIM, ITALIC, RESET, colors, file_link, paint, render_bar_with_mode, sanitize_text,
-    sanitize_title_text, text_width, truncate_ansi_with_ellipsis,
+    BOLD, DIM, ITALIC, RESET, colors, file_link, github_branch_link, paint, render_bar_with_mode,
+    sanitize_text, sanitize_title_text, text_width, truncate_ansi_with_ellipsis,
 };
 use crate::config::HudConfig;
 use crate::i18n::{Labels, get_labels};
 use crate::probes::{is_newer_semver, normalize_semver_tag, resolve_output_speed};
 use crate::stdin::{
-    extract_context_metrics, extract_quota_buckets_reconciled, format_compact_tokens,
-    format_duration_seconds, format_model_name_with_glyphs, format_session_cost,
-    format_workspace_path, normalize_plan_tier,
+    compute_quota_pace, extract_context_metrics, extract_quota_buckets_reconciled,
+    format_compact_tokens, format_duration_seconds, format_model_name_with_glyphs,
+    format_session_cost, format_workspace_breadcrumb, normalize_plan_tier,
 };
 use crate::types::{
-    AgyStdinData, CachedQuotaSnapshot, ContextValueMode, GlyphMode, HUD_VERSION, LineLayout,
-    MemoryProbeInfo, ModelFormatMode, PathLevels, QuotaValueMode, SubagentStatus, TodoStatus,
-    ToolStatus, TranscriptSummary, UpdateCacheSnapshot, VcsProbeInfo,
+    AgyStdinData, CachedQuotaSnapshot, ContextValueMode, CostTotals, GlyphMode, HUD_VERSION,
+    LineLayout, MemoryProbeInfo, ModelFormatMode, PathLevels, QuotaPace, QuotaValueMode,
+    SubagentEntry, SubagentStatus, TodoStatus, ToolStatus, TranscriptSummary, UpdateCacheSnapshot,
+    VcsProbeInfo,
 };
 
 pub struct RenderInput<'a> {
@@ -224,15 +225,38 @@ fn render_vcs_segment(
 
     let mut extras = Vec::new();
     if show_extras && config.vcs.show_ahead_behind {
-        let mut ab = String::new();
-        if vcs.ahead > 0 {
-            ab.push_str(&format!("{up_arrow}{}", vcs.ahead));
-        }
-        if vcs.behind > 0 {
-            ab.push_str(&format!("{down_arrow}{}", vcs.behind));
-        }
-        if !ab.is_empty() {
-            extras.push(paint(&ab, &[colors::CYAN]));
+        let ahead_elevated = vcs.ahead > 0
+            && ((config.vcs.push_critical_threshold > 0
+                && vcs.ahead >= config.vcs.push_critical_threshold)
+                || (config.vcs.push_warning_threshold > 0
+                    && vcs.ahead >= config.vcs.push_warning_threshold));
+        if ahead_elevated {
+            let ahead_styles: &[&str] = if config.vcs.push_critical_threshold > 0
+                && vcs.ahead >= config.vcs.push_critical_threshold
+            {
+                &[colors::RED, BOLD]
+            } else {
+                &[colors::YELLOW, BOLD]
+            };
+            let mut combined = paint(&format!("{up_arrow}{}", vcs.ahead), ahead_styles);
+            if vcs.behind > 0 {
+                combined.push_str(&paint(
+                    &format!("{down_arrow}{}", vcs.behind),
+                    &[colors::CYAN],
+                ));
+            }
+            extras.push(combined);
+        } else {
+            let mut ab = String::new();
+            if vcs.ahead > 0 {
+                ab.push_str(&format!("{up_arrow}{}", vcs.ahead));
+            }
+            if vcs.behind > 0 {
+                ab.push_str(&format!("{down_arrow}{}", vcs.behind));
+            }
+            if !ab.is_empty() {
+                extras.push(paint(&ab, &[colors::CYAN]));
+            }
         }
     }
     if vcs.conflicts > 0 {
@@ -266,10 +290,19 @@ fn render_vcs_segment(
         String::new()
     };
 
+    let styled_branch = paint(&vcs.branch, &[branch_color, BOLD]);
+    let linked_branch = match vcs.repo_url.as_deref() {
+        Some(repo_url)
+            if config.hyperlinks && !vcs.branch.starts_with('@') && vcs.branch != "detached" =>
+        {
+            github_branch_link(repo_url, &vcs.branch, &styled_branch, true)
+        }
+        _ => styled_branch,
+    };
+
     format!(
-        "{nerd_prefix}{}{}{dirty_mark}{extra_text}{}",
+        "{nerd_prefix}{}{linked_branch}{dirty_mark}{extra_text}{}",
         paint(&format!("{prefix}:("), &[DIM]),
-        paint(&vcs.branch, &[branch_color, BOLD]),
         paint(")", &[DIM]),
     )
 }
@@ -281,6 +314,7 @@ struct HeaderOpts {
     show_duration: bool,
     show_update: bool,
     path_levels: PathLevels,
+    show_launch_dir: bool,
     model_format: ModelFormatMode,
     show_plan_tier: bool,
     show_speed: bool,
@@ -444,6 +478,21 @@ fn render_quota_segment(
 
     let rendered: Vec<String> = buckets
         .into_iter()
+        .filter(|b| {
+            if config.display.quota_threshold == 0 {
+                return true;
+            }
+            let pace = if config.display.quota_pace {
+                compute_quota_pace(b)
+            } else {
+                QuotaPace::Normal
+            };
+            if pace > QuotaPace::Normal {
+                return true;
+            }
+            b.used_percent
+                .is_none_or(|u| u >= config.display.quota_threshold as f64)
+        })
         .take(opts.max_quota_buckets)
         .map(|b| {
             let label = if b.label.is_empty() {
@@ -452,23 +501,50 @@ fn render_quota_segment(
                 format!("{}({})", labels.metrics.quota, b.label)
             };
             if let (Some(used), Some(rem)) = (b.used_percent, b.remaining_percent) {
+                let pace = if config.display.quota_pace {
+                    compute_quota_pace(&b)
+                } else {
+                    QuotaPace::Normal
+                };
+                let static_sev = if used >= 90.0 {
+                    QuotaPace::Critical
+                } else if used >= 70.0 {
+                    QuotaPace::Warning
+                } else {
+                    QuotaPace::Normal
+                };
+                let effective_sev = static_sev.max(pace);
                 let display_pct = match config.display.quota_value {
                     QuotaValueMode::Remaining => {
                         format!("{:.0}% {}", rem, labels.metrics.remaining)
                     }
                     QuotaValueMode::Used => format!("{:.0}%", used),
                 };
-                let pct_styles: &[&str] = if used >= 90.0 {
-                    &[colors::RED, BOLD]
-                } else if used >= 70.0 {
-                    &[colors::YELLOW, BOLD]
-                } else {
-                    &[BOLD]
+                let pct_styles: &[&str] = match effective_sev {
+                    QuotaPace::Critical => &[colors::RED, BOLD],
+                    QuotaPace::Warning => &[colors::YELLOW, BOLD],
+                    QuotaPace::Normal => &[BOLD],
+                };
+                let pace_suffix = match pace {
+                    QuotaPace::Critical => paint(
+                        if gm == GlyphMode::Ascii { "^" } else { "▲" },
+                        &[colors::RED, BOLD],
+                    ),
+                    QuotaPace::Warning => paint(
+                        if gm == GlyphMode::Ascii { "^" } else { "▲" },
+                        &[colors::YELLOW, BOLD],
+                    ),
+                    QuotaPace::Normal => String::new(),
+                };
+                let bar_normal_color = match effective_sev {
+                    QuotaPace::Critical => colors::RED,
+                    QuotaPace::Warning => colors::YELLOW,
+                    QuotaPace::Normal => colors::CYAN,
                 };
                 let mini_bar = if opts.quota_bar_enabled {
                     format!(
                         "{} ",
-                        render_bar_with_mode(used, mini_len, 70.0, 90.0, colors::CYAN, gm)
+                        render_bar_with_mode(used, mini_len, 70.0, 90.0, bar_normal_color, gm)
                     )
                 } else {
                     String::new()
@@ -486,7 +562,7 @@ fn render_quota_segment(
                     _ => String::new(),
                 };
                 format!(
-                    "{} {mini_bar}{}{reset}",
+                    "{} {mini_bar}{}{pace_suffix}{reset}",
                     paint(&label, &[DIM]),
                     paint(&display_pct, pct_styles),
                 )
@@ -509,34 +585,90 @@ fn render_quota_segment(
     rendered.join(&sep(gm))
 }
 
-fn render_counts_and_meta(
+struct MetaTaggedItem {
+    tag: &'static str,
+    rendered: String,
+}
+
+fn collect_counts_and_meta_items(
     stdin: Option<&AgyStdinData>,
     transcript: &TranscriptSummary,
     memory: Option<&MemoryProbeInfo>,
+    cost_totals: Option<&CostTotals>,
     config: &HudConfig,
     labels: &Labels,
     opts: &MetricsOpts,
-) -> String {
+) -> Vec<MetaTaggedItem> {
     if !opts.show_meta {
-        return String::new();
+        return Vec::new();
     }
     let gm = config.display.glyph_mode;
     let mut items = Vec::new();
 
-    if opts.show_cost
-        && let Some(cost) = stdin.and_then(|s| s.cost.as_ref())
-        && let Some(usd) = cost.total_usd
-        && let Some(formatted_usd) = format_session_cost(usd)
-    {
-        let prefix = if cost.estimated.unwrap_or(false) {
-            "~"
-        } else {
-            ""
-        };
-        items.push(paint(
-            &format!("{prefix}{formatted_usd}"),
-            &[colors::YELLOW, BOLD],
-        ));
+    if opts.show_cost {
+        if config.display.show_cost
+            && let Some(cost) = stdin.and_then(|s| s.cost.as_ref())
+            && let Some(usd) = cost.total_usd
+            && let Some(formatted_usd) = format_session_cost(usd)
+        {
+            let prefix = if cost.estimated.unwrap_or(false) {
+                "~"
+            } else {
+                ""
+            };
+            items.push(MetaTaggedItem {
+                tag: "cost",
+                rendered: paint(&format!("{prefix}{formatted_usd}"), &[colors::YELLOW, BOLD]),
+            });
+        }
+
+        let fallback_est = stdin
+            .and_then(|s| s.cost.as_ref())
+            .and_then(|c| c.estimated)
+            .unwrap_or(true);
+        let fallback_usd = stdin
+            .and_then(|s| s.cost.as_ref())
+            .and_then(|c| c.total_usd);
+
+        if config.display.show_daily_cost {
+            let (usd_opt, est) = match cost_totals {
+                Some(ct) => (Some(ct.today_usd), ct.estimated),
+                None => (fallback_usd, fallback_est),
+            };
+            if let Some(usd) = usd_opt
+                && let Some(formatted) = format_session_cost(usd)
+            {
+                let prefix = if est { "~" } else { "" };
+                items.push(MetaTaggedItem {
+                    tag: "dailyCost",
+                    rendered: format!(
+                        "{} {}",
+                        paint(labels.metrics.today, &[DIM]),
+                        paint(&format!("{prefix}{formatted}"), &[colors::YELLOW, BOLD]),
+                    ),
+                });
+            }
+        }
+
+        if config.display.show_weekly_cost {
+            let (usd_opt, est) = match cost_totals {
+                Some(ct) => (Some(ct.week_usd), ct.estimated),
+                None => (fallback_usd, fallback_est),
+            };
+            if let Some(usd) = usd_opt
+                && let Some(formatted) = format_session_cost(usd)
+            {
+                let prefix = if est { "~" } else { "" };
+                items.push(MetaTaggedItem {
+                    tag: "weeklyCost",
+                    rendered: format!(
+                        "{} {}",
+                        paint(labels.metrics.week, &[DIM]),
+                        paint(&format!("{prefix}{formatted}"), &[colors::YELLOW, BOLD]),
+                    ),
+                });
+            }
+        }
     }
 
     if config.display.show_counts {
@@ -557,11 +689,14 @@ fn render_counts_and_meta(
             } else {
                 &[BOLD]
             };
-            items.push(format!(
-                "{} {}",
-                paint(labels.metrics.subagents, &[DIM]),
-                paint(&agent_label, val_styles),
-            ));
+            items.push(MetaTaggedItem {
+                tag: "counts",
+                rendered: format!(
+                    "{} {}",
+                    paint(labels.metrics.subagents, &[DIM]),
+                    paint(&agent_label, val_styles),
+                ),
+            });
         } else if let Some(subagents) = stdin.and_then(|s| s.subagents.as_ref())
             && !subagents.is_empty()
         {
@@ -580,41 +715,53 @@ fn render_counts_and_meta(
             } else {
                 &[BOLD]
             };
-            items.push(format!(
-                "{} {}",
-                paint(labels.metrics.subagents, &[DIM]),
-                paint(&agent_label, val_styles),
-            ));
+            items.push(MetaTaggedItem {
+                tag: "counts",
+                rendered: format!(
+                    "{} {}",
+                    paint(labels.metrics.subagents, &[DIM]),
+                    paint(&agent_label, val_styles),
+                ),
+            });
         }
 
         if let Some(tasks) = stdin.and_then(|s| s.task_count)
             && tasks > 0
         {
-            items.push(format!(
-                "{} {}",
-                paint(labels.metrics.tasks, &[DIM]),
-                paint(&tasks.to_string(), &[colors::CYAN, BOLD]),
-            ));
+            items.push(MetaTaggedItem {
+                tag: "counts",
+                rendered: format!(
+                    "{} {}",
+                    paint(labels.metrics.tasks, &[DIM]),
+                    paint(&tasks.to_string(), &[colors::CYAN, BOLD]),
+                ),
+            });
         }
 
         if !opts.compact_meta
             && let Some(arts) = stdin.and_then(|s| s.artifact_count)
             && arts > 0
         {
-            items.push(format!(
-                "{} {}",
-                paint(labels.metrics.artifacts, &[DIM]),
-                paint(&arts.to_string(), &[BOLD]),
-            ));
+            items.push(MetaTaggedItem {
+                tag: "counts",
+                rendered: format!(
+                    "{} {}",
+                    paint(labels.metrics.artifacts, &[DIM]),
+                    paint(&arts.to_string(), &[BOLD]),
+                ),
+            });
         }
 
         if let Some(queued) = stdin.and_then(|s| s.pending_input_count)
             && queued > 0
         {
-            items.push(paint(
-                &format!("+{queued} {}", labels.metrics.queued),
-                &[colors::YELLOW, BOLD],
-            ));
+            items.push(MetaTaggedItem {
+                tag: "counts",
+                rendered: paint(
+                    &format!("+{queued} {}", labels.metrics.queued),
+                    &[colors::YELLOW, BOLD],
+                ),
+            });
         }
     }
 
@@ -628,11 +775,14 @@ fn render_counts_and_meta(
         } else {
             &[BOLD]
         };
-        items.push(format!(
-            "{} {}",
-            paint(labels.metrics.memory, &[DIM]),
-            paint(&format!("{}%", mem.used_percent), mem_styles),
-        ));
+        items.push(MetaTaggedItem {
+            tag: "memory",
+            rendered: format!(
+                "{} {}",
+                paint(labels.metrics.memory, &[DIM]),
+                paint(&format!("{}%", mem.used_percent), mem_styles),
+            ),
+        });
     }
 
     if config.display.show_sandbox
@@ -646,10 +796,32 @@ fn render_counts_and_meta(
             GlyphMode::Nerd => format!("\u{f0a3} {}", labels.metrics.sandbox_on),
             GlyphMode::Unicode => format!("🛡 {}", labels.metrics.sandbox_on),
         };
-        items.push(paint(&badge, &[colors::GREEN, BOLD]));
+        items.push(MetaTaggedItem {
+            tag: "sandbox",
+            rendered: paint(&badge, &[colors::GREEN, BOLD]),
+        });
     }
 
-    items.join(&dot(gm))
+    items
+}
+
+fn render_counts_and_meta(
+    stdin: Option<&AgyStdinData>,
+    transcript: &TranscriptSummary,
+    memory: Option<&MemoryProbeInfo>,
+    cost_totals: Option<&CostTotals>,
+    config: &HudConfig,
+    labels: &Labels,
+    opts: &MetricsOpts,
+) -> String {
+    let gm = config.display.glyph_mode;
+    let items =
+        collect_counts_and_meta_items(stdin, transcript, memory, cost_totals, config, labels, opts);
+    items
+        .into_iter()
+        .map(|i| i.rendered)
+        .collect::<Vec<_>>()
+        .join(&dot(gm))
 }
 
 fn build_tools_line_with_limit(
@@ -759,6 +931,17 @@ fn render_skills_mcp_line(
     (!parts.is_empty()).then(|| parts.join(&sep(gm)))
 }
 
+const SUBAGENT_COMPLETE_HOLD_MS: i64 = 60_000;
+
+fn subagent_sort_rank(status: SubagentStatus) -> u8 {
+    match status {
+        SubagentStatus::Running => 0,
+        SubagentStatus::Blocked => 1,
+        SubagentStatus::Error => 2,
+        SubagentStatus::Completed => 3,
+    }
+}
+
 fn render_subagents_line(
     transcript: &TranscriptSummary,
     config: &HudConfig,
@@ -770,9 +953,28 @@ fn render_subagents_line(
     let gm = config.display.glyph_mode;
     let ascii = gm == GlyphMode::Ascii;
 
-    let formatted: Vec<String> = transcript
+    let mut visible: Vec<&SubagentEntry> = transcript
         .subagents
         .iter()
+        .filter(|ag| {
+            if ag.status != SubagentStatus::Completed {
+                return true;
+            }
+            match ag.ended_at {
+                Some(end_ms) if now_ms > 0 => {
+                    now_ms.saturating_sub(end_ms) <= SUBAGENT_COMPLETE_HOLD_MS
+                }
+                _ => true,
+            }
+        })
+        .collect();
+    if visible.is_empty() {
+        return None;
+    }
+    visible.sort_by_key(|ag| subagent_sort_rank(ag.status));
+
+    let formatted: Vec<String> = visible
+        .into_iter()
         .take(4)
         .map(|ag| {
             let active = matches!(ag.status, SubagentStatus::Running | SubagentStatus::Blocked);
@@ -909,7 +1111,51 @@ fn join_with_rail(lines: Vec<String>, use_box_rail: bool, gm: GlyphMode) -> Vec<
         .collect()
 }
 
-fn build_header_line(input: &RenderInput<'_>, labels: &Labels, opts: &HeaderOpts) -> String {
+fn join_left_right(
+    left: String,
+    right: String,
+    fallback_sep: &str,
+    line_budget: Option<usize>,
+) -> String {
+    if left.is_empty() {
+        return right;
+    }
+    if right.is_empty() {
+        return left;
+    }
+    if let Some(budget) = line_budget {
+        let lw = text_width(&left);
+        let rw = text_width(&right);
+        if lw + 2 + rw <= budget {
+            let pad = " ".repeat(budget - lw - rw);
+            return format!("{left}{pad}{right}");
+        }
+    }
+    format!("{left}{fallback_sep}{right}")
+}
+
+fn align_bar_prefix_pair(ctx_line: &mut String, quota_line: &mut String) {
+    let Some(ctx_sp) = ctx_line.find(' ') else {
+        return;
+    };
+    let Some(quota_sp) = quota_line.find(' ') else {
+        return;
+    };
+    let ctx_label_w = text_width(&ctx_line[..ctx_sp]);
+    let quota_label_w = text_width(&quota_line[..quota_sp]);
+    if ctx_label_w < quota_label_w {
+        ctx_line.insert_str(ctx_sp, &" ".repeat(quota_label_w - ctx_label_w));
+    } else if quota_label_w < ctx_label_w {
+        quota_line.insert_str(quota_sp, &" ".repeat(ctx_label_w - quota_label_w));
+    }
+}
+
+fn build_header_line(
+    input: &RenderInput<'_>,
+    labels: &Labels,
+    opts: &HeaderOpts,
+    line_budget: Option<usize>,
+) -> String {
     let RenderInput {
         stdin,
         config,
@@ -921,6 +1167,9 @@ fn build_header_line(input: &RenderInput<'_>, labels: &Labels, opts: &HeaderOpts
     } = *input;
     let gm = config.display.glyph_mode;
     let mut header_parts: Vec<String> = Vec::new();
+    let mut right_parts: Vec<String> = Vec::new();
+    let right_align = &config.display.right_align;
+
     if config.display.show_state {
         header_parts.push(render_state_badge(stdin, labels, gm));
     }
@@ -975,21 +1224,28 @@ fn build_header_line(input: &RenderInput<'_>, labels: &Labels, opts: &HeaderOpts
         }
     }
     if opts.show_folder || opts.show_vcs {
-        let raw_dir = stdin.and_then(|s| {
+        let project_dir = stdin.and_then(|s| {
+            s.workspace
+                .as_ref()
+                .and_then(|w| w.project_dir.as_deref())
+                .filter(|d| !d.trim().is_empty())
+        });
+        let cur_or_cwd = stdin.and_then(|s| {
             s.workspace
                 .as_ref()
                 .and_then(|w| w.current_dir.as_deref())
                 .filter(|d| !d.trim().is_empty())
                 .or_else(|| s.cwd.as_deref().filter(|d| !d.trim().is_empty()))
-                .or_else(|| {
-                    s.workspace
-                        .as_ref()
-                        .and_then(|w| w.project_dir.as_deref())
-                        .filter(|d| !d.trim().is_empty())
-                })
         });
+        let raw_dir = cur_or_cwd.or(project_dir);
         let linked_dir = if opts.show_folder {
-            let short_dir = format_workspace_path(raw_dir, opts.path_levels);
+            let short_dir = format_workspace_breadcrumb(
+                project_dir,
+                raw_dir,
+                opts.path_levels,
+                opts.show_launch_dir,
+                gm,
+            );
             match raw_dir {
                 Some(dir) if !short_dir.is_empty() => {
                     let folder_prefix = if gm == GlyphMode::Nerd {
@@ -1041,13 +1297,23 @@ fn build_header_line(input: &RenderInput<'_>, labels: &Labels, opts: &HeaderOpts
                 GlyphMode::Nerd => format!("\u{ee9c} {dur}"),
                 GlyphMode::Unicode => format!("⏱ {dur}"),
             };
-            header_parts.push(paint(&badge, &[DIM]));
+            let styled = paint(&badge, &[DIM]);
+            if right_align.iter().any(|s| s == "duration") {
+                right_parts.push(styled);
+            } else {
+                header_parts.push(styled);
+            }
         }
     }
     if opts.show_custom_tag && !config.display.custom_tag.is_empty() {
         let tag = sanitize_text(&config.display.custom_tag);
         if !tag.is_empty() {
-            header_parts.push(paint(&tag, &[colors::CYAN]));
+            let styled = paint(&tag, &[colors::CYAN]);
+            if right_align.iter().any(|s| s == "customTag") {
+                right_parts.push(styled);
+            } else {
+                header_parts.push(styled);
+            }
         }
     }
     if opts.show_update
@@ -1068,17 +1334,25 @@ fn build_header_line(input: &RenderInput<'_>, labels: &Labels, opts: &HeaderOpts
     }
 
     let sep_str = sep(gm);
-    header_parts
+    let left_str = header_parts
         .into_iter()
         .filter(|s| !s.is_empty())
         .collect::<Vec<_>>()
-        .join(&sep_str)
+        .join(&sep_str);
+    let right_str = right_parts
+        .into_iter()
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join(&sep_str);
+    join_left_right(left_str, right_str, &sep_str, line_budget)
 }
 
 fn build_context_meta_line(
     input: &RenderInput<'_>,
+    cost_totals: Option<&CostTotals>,
     labels: &Labels,
     effective_width: Option<usize>,
+    line_budget: Option<usize>,
     opts: &MetricsOpts,
 ) -> String {
     let RenderInput {
@@ -1090,13 +1364,34 @@ fn build_context_meta_line(
     } = *input;
     let gm = config.display.glyph_mode;
     let sep_str = sep(gm);
+    let dot_str = dot(gm);
     let ctx_seg = render_context_segment(stdin, config, labels, effective_width, opts);
-    let meta_seg = render_counts_and_meta(stdin, transcript, memory, config, labels, opts);
-    [ctx_seg, meta_seg]
+    let meta_items =
+        collect_counts_and_meta_items(stdin, transcript, memory, cost_totals, config, labels, opts);
+    if meta_items.is_empty() {
+        return ctx_seg;
+    }
+
+    let right_align = &config.display.right_align;
+    let align_all_meta = right_align.iter().any(|s| s == "meta");
+    let mut left_meta = Vec::new();
+    let mut right_meta = Vec::new();
+    for item in meta_items {
+        if align_all_meta || right_align.iter().any(|s| s == item.tag) {
+            right_meta.push(item.rendered);
+        } else {
+            left_meta.push(item.rendered);
+        }
+    }
+
+    let left_meta_str = left_meta.join(&dot_str);
+    let left_combined = [ctx_seg, left_meta_str]
         .into_iter()
         .filter(|s| !s.is_empty())
         .collect::<Vec<_>>()
-        .join(&sep_str)
+        .join(&sep_str);
+    let right_meta_str = right_meta.join(&dot_str);
+    join_left_right(left_combined, right_meta_str, &sep_str, line_budget)
 }
 
 fn build_quota_line(
@@ -1125,6 +1420,7 @@ fn build_quota_line(
 
 fn build_metrics_line(
     input: &RenderInput<'_>,
+    cost_totals: Option<&CostTotals>,
     labels: &Labels,
     effective_width: Option<usize>,
     opts: &MetricsOpts,
@@ -1160,7 +1456,8 @@ fn build_metrics_line(
     if !quota_seg.is_empty() {
         metrics_parts.push(quota_seg);
     }
-    let meta_seg = render_counts_and_meta(stdin, transcript, memory, config, labels, opts);
+    let meta_seg =
+        render_counts_and_meta(stdin, transcript, memory, cost_totals, config, labels, opts);
     if !meta_seg.is_empty() {
         metrics_parts.push(meta_seg);
     }
@@ -1171,7 +1468,166 @@ fn build_metrics_line(
         .join(&sep_str)
 }
 
+fn compose_expanded_rows(
+    named_rows: Vec<(&'static str, String)>,
+    config: &HudConfig,
+    sep_str: &str,
+    line_budget: Option<usize>,
+) -> Vec<String> {
+    if config.display.merge_groups.is_empty() {
+        return named_rows
+            .into_iter()
+            .filter_map(|(_, line)| (!line.is_empty()).then_some(line))
+            .collect();
+    }
+
+    let mut row_map: std::collections::BTreeMap<&str, String> = named_rows
+        .iter()
+        .filter(|(_, l)| !l.is_empty())
+        .map(|(k, l)| (*k, l.clone()))
+        .collect();
+    let mut consumed: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    let mut out = Vec::new();
+
+    for (name, _) in &named_rows {
+        if consumed.contains(name) {
+            continue;
+        }
+        if let Some(group) = config
+            .display
+            .merge_groups
+            .iter()
+            .find(|g| g.iter().any(|member| member == name))
+        {
+            let mut present: Vec<(&str, String)> = Vec::new();
+            for member in group {
+                consumed.insert(member.as_str());
+                if let Some(val) = row_map.remove(member.as_str()) {
+                    present.push((member.as_str(), val));
+                }
+            }
+            if present.is_empty() {
+                continue;
+            }
+            if present.len() == 1 {
+                out.push(present.pop().unwrap().1);
+                continue;
+            }
+
+            let joined = present
+                .iter()
+                .map(|(_, s)| s.as_str())
+                .collect::<Vec<_>>()
+                .join(sep_str);
+            let fits = line_budget.is_none_or(|budget| text_width(&joined) <= budget);
+            if fits {
+                let last_is_right = config
+                    .display
+                    .right_align
+                    .iter()
+                    .any(|r| r == present[present.len() - 1].0);
+                if last_is_right && line_budget.is_some() {
+                    let (_, last_line) = present.pop().unwrap();
+                    let left = present
+                        .into_iter()
+                        .map(|(_, s)| s)
+                        .collect::<Vec<_>>()
+                        .join(sep_str);
+                    out.push(join_left_right(left, last_line, sep_str, line_budget));
+                } else {
+                    out.push(joined);
+                }
+            } else {
+                // Auto-stack fallback: align bar labels if context & quota stacked together
+                let ctx_pos = present.iter().position(|(k, _)| *k == "context");
+                let quota_pos = present.iter().position(|(k, _)| *k == "quota");
+                if let (Some(ci), Some(qi)) = (ctx_pos, quota_pos) {
+                    let mut ctx_clone = present[ci].1.clone();
+                    let mut quota_clone = present[qi].1.clone();
+                    align_bar_prefix_pair(&mut ctx_clone, &mut quota_clone);
+                    present[ci].1 = ctx_clone;
+                    present[qi].1 = quota_clone;
+                }
+                for (_, line) in present {
+                    out.push(line);
+                }
+            }
+        } else {
+            consumed.insert(name);
+            if let Some(val) = row_map.remove(name) {
+                out.push(val);
+            }
+        }
+    }
+
+    out
+}
+
+/// Formats an explicit warning line when `config.json` fails parsing or schema validation,
+/// truncating the error description BEFORE the ` · /agy-hud:hud` remediation hint so the
+/// recovery command is never clipped off narrow terminals.
+pub fn format_config_problem_line(
+    problems: &[String],
+    config: &HudConfig,
+    columns: Option<usize>,
+) -> Option<String> {
+    let first = problems.first()?;
+    let gm = config.display.glyph_mode;
+    let clean_msg = sanitize_text(first);
+    if clean_msg.is_empty() {
+        return None;
+    }
+
+    let prefix = match gm {
+        GlyphMode::Ascii => "! Config: ",
+        GlyphMode::Unicode | GlyphMode::Nerd => "⚠ Config: ",
+    };
+    let suffix = match gm {
+        GlyphMode::Ascii => " . /agy-hud:hud",
+        GlyphMode::Unicode | GlyphMode::Nerd => " · /agy-hud:hud",
+    };
+
+    let effective_width = match (config.max_width, columns) {
+        (Some(mw), Some(lw)) => Some(mw.min(lw)),
+        (Some(mw), None) => Some(mw),
+        (None, lw) => lw,
+    };
+
+    let body = match effective_width {
+        Some(budget) if budget > 0 => {
+            let fixed_w = text_width(prefix) + text_width(suffix);
+            if budget > fixed_w + 4 {
+                let clipped_msg =
+                    truncate_ansi_with_ellipsis(&clean_msg, budget - fixed_w, ellipsis(gm));
+                format!(
+                    "{}{}",
+                    paint(&format!("{prefix}{clipped_msg}"), &[colors::YELLOW, BOLD]),
+                    paint(suffix, &[colors::CYAN, BOLD]),
+                )
+            } else {
+                let minimal = format!("{prefix}/agy-hud:hud");
+                let clipped = truncate_ansi_with_ellipsis(&minimal, budget, ellipsis(gm));
+                paint(&clipped, &[colors::YELLOW, BOLD])
+            }
+        }
+        _ => format!(
+            "{}{}",
+            paint(&format!("{prefix}{clean_msg}"), &[colors::YELLOW, BOLD]),
+            paint(suffix, &[colors::CYAN, BOLD]),
+        ),
+    };
+
+    Some(format!("{RESET}{body}{RESET}"))
+}
+
 pub fn render_hud_lines(input: RenderInput<'_>) -> Vec<String> {
+    render_hud_lines_full(input, None)
+}
+
+pub fn render_hud_lines_full(
+    input: RenderInput<'_>,
+    cost_totals: Option<&CostTotals>,
+) -> Vec<String> {
     let RenderInput {
         stdin,
         config,
@@ -1218,6 +1674,7 @@ pub fn render_hud_lines(input: RenderInput<'_>) -> Vec<String> {
         } else {
             config.path_levels
         },
+        show_launch_dir: config.display.show_launch_dir && layout_mode != LineLayout::Compact,
         model_format: if layout_mode == LineLayout::Compact {
             ModelFormatMode::Short
         } else {
@@ -1231,7 +1688,7 @@ pub fn render_hud_lines(input: RenderInput<'_>) -> Vec<String> {
         show_mode: config.display.show_mode,
     };
 
-    let mut line1 = build_header_line(&input, labels, &header_opts);
+    let mut line1 = build_header_line(&input, labels, &header_opts, line_budget);
     if let Some(budget) = line_budget {
         let header_steps: [fn(&mut HeaderOpts); 7] = [
             |o| o.show_title = false,
@@ -1241,6 +1698,7 @@ pub fn render_hud_lines(input: RenderInput<'_>) -> Vec<String> {
             },
             |o| {
                 o.path_levels = PathLevels::One;
+                o.show_launch_dir = false;
                 if o.model_format == ModelFormatMode::Full {
                     o.model_format = ModelFormatMode::Compact;
                 }
@@ -1263,17 +1721,20 @@ pub fn render_hud_lines(input: RenderInput<'_>) -> Vec<String> {
                 break;
             }
             apply_step(&mut header_opts);
-            line1 = build_header_line(&input, labels, &header_opts);
+            line1 = build_header_line(&input, labels, &header_opts, line_budget);
         }
     }
 
+    let has_any_cost = config.display.show_cost
+        || config.display.show_daily_cost
+        || config.display.show_weekly_cost;
     let base_metrics_opts = MetricsOpts {
         compact_meta: layout_mode == LineLayout::Compact,
         show_cache_hit_rate: config.display.show_cache_hit_rate,
         quota_bar_enabled: config.display.quota_bar_enabled,
         context_value: config.display.context_value,
         show_200k: true,
-        show_cost: config.display.show_cost,
+        show_cost: has_any_cost,
         show_context_bar: config.display.show_context_bar,
         show_quota_reset: config.display.show_quota_reset,
         max_quota_buckets: if layout_mode == LineLayout::Compact {
@@ -1287,7 +1748,8 @@ pub fn render_hud_lines(input: RenderInput<'_>) -> Vec<String> {
     let sep_str = sep(gm);
     let raw_lines = if layout_mode == LineLayout::Compact {
         let mut compact_opts = base_metrics_opts;
-        let mut line2 = build_metrics_line(&input, labels, effective_width, &compact_opts);
+        let mut line2 =
+            build_metrics_line(&input, cost_totals, labels, effective_width, &compact_opts);
         if let Some(budget) = line_budget {
             let compact_steps: [fn(&mut MetricsOpts); 5] = [
                 |o| {
@@ -1316,7 +1778,8 @@ pub fn render_hud_lines(input: RenderInput<'_>) -> Vec<String> {
                     break;
                 }
                 apply_step(&mut compact_opts);
-                line2 = build_metrics_line(&input, labels, effective_width, &compact_opts);
+                line2 =
+                    build_metrics_line(&input, cost_totals, labels, effective_width, &compact_opts);
             }
         }
 
@@ -1357,8 +1820,24 @@ pub fn render_hud_lines(input: RenderInput<'_>) -> Vec<String> {
         }
         out
     } else {
+        let split_meta_row = config
+            .display
+            .merge_groups
+            .iter()
+            .any(|g| g.iter().any(|m| m == "meta"));
+
         let mut ctx_opts = base_metrics_opts;
-        let mut ctx_line = build_context_meta_line(&input, labels, effective_width, &ctx_opts);
+        if split_meta_row {
+            ctx_opts.show_meta = false;
+        }
+        let mut ctx_line = build_context_meta_line(
+            &input,
+            cost_totals,
+            labels,
+            effective_width,
+            line_budget,
+            &ctx_opts,
+        );
         if let Some(budget) = line_budget {
             let ctx_steps: [fn(&mut MetricsOpts); 5] = [
                 |o| o.compact_meta = true,
@@ -1378,9 +1857,30 @@ pub fn render_hud_lines(input: RenderInput<'_>) -> Vec<String> {
                     break;
                 }
                 apply_step(&mut ctx_opts);
-                ctx_line = build_context_meta_line(&input, labels, effective_width, &ctx_opts);
+                ctx_line = build_context_meta_line(
+                    &input,
+                    cost_totals,
+                    labels,
+                    effective_width,
+                    line_budget,
+                    &ctx_opts,
+                );
             }
         }
+
+        let standalone_meta = if split_meta_row {
+            render_counts_and_meta(
+                stdin,
+                transcript,
+                input.memory,
+                cost_totals,
+                config,
+                labels,
+                &base_metrics_opts,
+            )
+        } else {
+            String::new()
+        };
 
         let mut quota_opts = base_metrics_opts;
         let mut quota_line = build_quota_line(&input, labels, effective_width, &quota_opts);
@@ -1401,26 +1901,28 @@ pub fn render_hud_lines(input: RenderInput<'_>) -> Vec<String> {
             }
         }
 
-        let mut activity_lines = Vec::new();
-        if let Some(tl) = render_tools_line(transcript, config, line_budget) {
-            activity_lines.push(tl);
-        }
-        if let Some(sml) = render_skills_mcp_line(transcript, config, labels) {
-            activity_lines.push(sml);
-        }
-        if let Some(sl) = render_subagents_line(transcript, config, now_ms) {
-            activity_lines.push(sl);
-        }
-        if let Some(tdl) = render_todos_line(transcript, config, labels) {
-            activity_lines.push(tdl);
-        }
+        let tools_line = render_tools_line(transcript, config, line_budget).unwrap_or_default();
+        let skills_line = render_skills_mcp_line(transcript, config, labels).unwrap_or_default();
+        let subagents_line = render_subagents_line(transcript, config, now_ms).unwrap_or_default();
+        let todos_line = render_todos_line(transcript, config, labels).unwrap_or_default();
 
-        if config.line_layout == LineLayout::Adaptive
-            && activity_lines.is_empty()
+        let has_activity = !tools_line.is_empty()
+            || !skills_line.is_empty()
+            || !subagents_line.is_empty()
+            || !todos_line.is_empty();
+
+        if config.display.merge_groups.is_empty()
+            && config.line_layout == LineLayout::Adaptive
+            && !has_activity
             && effective_width.is_some_and(|w| w >= 180)
         {
-            let merged_metrics =
-                build_metrics_line(&input, labels, effective_width, &base_metrics_opts);
+            let merged_metrics = build_metrics_line(
+                &input,
+                cost_totals,
+                labels,
+                effective_width,
+                &base_metrics_opts,
+            );
             let wide_line = [&line1, &merged_metrics]
                 .into_iter()
                 .filter(|s| !s.is_empty())
@@ -1440,18 +1942,18 @@ pub fn render_hud_lines(input: RenderInput<'_>) -> Vec<String> {
                 )
             }
         } else {
-            let mut all = Vec::with_capacity(3 + activity_lines.len());
-            if !line1.is_empty() {
-                all.push(line1);
-            }
-            if !ctx_line.is_empty() {
-                all.push(ctx_line);
-            }
-            if !quota_line.is_empty() {
-                all.push(quota_line);
-            }
-            all.extend(activity_lines);
-            join_with_rail(all, true, gm)
+            let named_rows = vec![
+                ("header", line1),
+                ("context", ctx_line),
+                ("quota", quota_line),
+                ("meta", standalone_meta),
+                ("tools", tools_line),
+                ("skills", skills_line),
+                ("subagents", subagents_line),
+                ("todos", todos_line),
+            ];
+            let composed = compose_expanded_rows(named_rows, config, &sep_str, line_budget);
+            join_with_rail(composed, true, gm)
         }
     };
 
