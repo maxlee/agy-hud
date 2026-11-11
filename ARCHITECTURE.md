@@ -1,4 +1,4 @@
-# `agy-hud` v1.5.1 — 100% Pure Rust Single-Engine Architecture
+# `agy-hud` v1.6.0 — 100% Pure Rust Single-Engine Architecture
 
 `agy-hud` is a **100% Pure Rust** native statusLine HUD for the Google Antigravity CLI (`agy`). There is **zero Node.js / TypeScript runtime or wrapper code** in the repository.
 
@@ -13,7 +13,7 @@ Instead of spawning a second runtime VM per render, `agy-hud` enforces capabilit
 1. **`crates/hud-core` (Pure Logic Crate — Zero I/O, `#![forbid(unsafe_code)]`)**
    - Depends **only** on `serde` and `serde_json` (11 total transitive crates, zero network/OS crates).
    - Strictly forbidden from referencing `std::fs`, `std::process`, `std::net`, `std::env`, or `std::os`.
-   - Owns all untrusted JSON/JSONL/Markdown parsing (`stdin.rs`, `transcript.rs`, `probes.rs`), `CONFIG_SCHEMA` validation (`config.rs`, 52 keys), extended grapheme cluster width/truncation & capability-scoped `terminal_filter_with_repo` output escape firewall (`ansi.rs`), composable multi-layout CJK-aware rendering (`render.rs`), quota pace & cross-session cost ledger reconciliation, width-preserving privacy scrubbing (`commands.rs`), and the declarative corpus snapshot suite (`tests/corpus/*.json` + `tests/corpus_cases.rs`).
+   - Owns all untrusted JSON/JSONL/Markdown parsing (`stdin.rs`, `transcript.rs`, `probes.rs`), `CONFIG_SCHEMA` validation (`config.rs`, 53 keys), extended grapheme cluster width/truncation & capability-scoped `terminal_filter_with_repo` output escape firewall (`ansi.rs`), composable multi-layout CJK-aware rendering (`render.rs`), `256k` auto-compaction watermark scaling & `↻N` compaction tracking, quota pace & cross-session cost ledger reconciliation, width-preserving privacy scrubbing (`commands.rs`), and the declarative corpus snapshot suite (`tests/corpus/*.json` + `tests/corpus_cases.rs`).
 2. **`crates/hud-cli` (Thin Capability Binary — `#![forbid(unsafe_code)]`)**
    - Owns non-blocking early-exit `stdin` JSON reading (`1000 ms` open-pipe guard, `256 KB` cap, `AGY_HUD_NESTED=1` fast inert exit), incremental `O(Δ)` `transcript.jsonl` byte-cursor reading (`<hudHome>/data/transcript-cursors/<fnv64>.json`, keeping only the active tail step uncommitted), exclusive-lockfile cross-session cost ledger persistence (`<hudHome>/data/cost-ledger.json` + `cost-ledger.lock`), symlink-swept `<hudHome>/data` management, `std::thread::scope` parallel probe execution, and opt-in isolated `/usage` quota refresh (`quota_refresh.rs`).
    - Resolves probe executables (`git`, `jj`, `hg`, `sysctl`, `vm_stat`) strictly from **absolute** directories in `PATH` (`resolve_executable_in_path`), defeating Windows `CreateProcessW` working-directory hijacking (`git.exe` / `git.bat` / `git.cmd` planted in an untrusted repo `cwd`) and relative `PATH` injection.

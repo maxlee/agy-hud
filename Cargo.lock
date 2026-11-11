@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "hud-cli"
-version = "1.5.1"
+version = "1.6.0"
 dependencies = [
  "hud-core",
  "serde",
@@ -13,7 +13,7 @@ dependencies = [
 
 [[package]]
 name = "hud-core"
-version = "1.5.1"
+version = "1.6.0"
 dependencies = [
  "serde",
  "serde_json",

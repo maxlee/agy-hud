@@ -1,0 +1,67 @@
+{
+  "id": "06-compaction-scale-and-badge",
+  "nowMs": 1794218400000,
+  "columns": 124,
+  "config": {
+    "language": "zh-Hans",
+    "lineLayout": "expanded"
+  },
+  "stdin": {
+    "cwd": "/Users/dev/agy-hud",
+    "conversation_id": "conv-corpus-06",
+    "agent_state": "idle",
+    "cycle_mode": "auto",
+    "plan_tier": "Pro",
+    "terminal_width": 124,
+    "workspace": {
+      "project_dir": "/Users/dev/agy-hud",
+      "current_dir": "/Users/dev/agy-hud"
+    },
+    "model": {
+      "id": "Gemini 4 Argon (Medium)",
+      "display_name": "Gemini 4 Argon (Medium)",
+      "effort": "medium"
+    },
+    "context_window": {
+      "context_window_size": 1048576,
+      "used_percentage": 13.9,
+      "current_usage": {
+        "input_tokens": 26000,
+        "output_tokens": 0,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 120000
+      }
+    },
+    "quota": {
+      "gemini-weekly": {
+        "remaining_fraction": 0.72,
+        "reset_in_seconds": 432000.0
+      }
+    },
+    "cost": {
+      "total_usd": 0.42,
+      "estimated": false
+    }
+  },
+  "probes": {
+    "vcs": "{\"type\":\"git\",\"branch\":\"main\",\"dirty\":false}"
+  },
+  "transcript": {
+    "tools": [],
+    "skills": [],
+    "mcp_servers": [],
+    "mcp_errors": [],
+    "subagents": [],
+    "todos": [],
+    "session_started_at": 1794217800000,
+    "last_step_at": 1794218398000,
+    "step_count": 48,
+    "compaction_count": 4,
+    "last_compaction_tokens": 256915
+  },
+  "expectedPlainLines": [
+    "╭─ ● 就绪 │ [自动] │ [Gemini 4 Argon · med] Pro │ agy-hud git:(main) │ ⏱ 10m",
+    "├─ 上下文 ██████▓····· 57.0% (146k/256k · ↻4) · ⚡ 82% 缓存 │ $0.42",
+    "╰─ 配额(weekly) █▓····· 28%▲ (5d)"
+  ]
+}

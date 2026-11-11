@@ -680,6 +680,8 @@ fn sample_presets(now_ms: i64) -> HashMap<&'static str, SamplePreset> {
         session_started_at: Some(now_ms - 740_000),
         last_step_at: Some(now_ms - 2_000),
         step_count: 24,
+        compaction_count: 2,
+        last_compaction_tokens: Some(256_000),
         active_slash_mode: None,
         completed_step_tps_x10: Some(640),
         resolved_tps_x10: None,
@@ -810,11 +812,14 @@ fn sample_presets(now_ms: i64) -> HashMap<&'static str, SamplePreset> {
         }),
     });
     high_stdin.quota = Some(high_quota);
+    let mut high_transcript = rich_transcript;
+    high_transcript.compaction_count = 0;
+    high_transcript.last_compaction_tokens = None;
     presets.insert(
         "high-context",
         SamplePreset {
             stdin: high_stdin,
-            transcript: rich_transcript,
+            transcript: high_transcript,
             probes: rich_probes,
         },
     );
@@ -827,6 +832,10 @@ struct StoredSnapshot {
     stdin: Option<AgyStdinData>,
     #[serde(default)]
     probes: ProbeAnswers,
+    #[serde(default, rename = "compactionCount")]
+    compaction_count: Option<u32>,
+    #[serde(default, rename = "lastCompactionTokens")]
+    last_compaction_tokens: Option<u64>,
 }
 
 fn run_preview(args: &[String], ctx: &CommandContext<'_>) -> CommandOutput {
@@ -871,6 +880,12 @@ fn run_preview(args: &[String], ctx: &CommandContext<'_>) -> CommandOutput {
             ctx.task_md_text,
             snap.stdin.as_ref(),
         );
+        if let Some(cc) = snap.compaction_count {
+            transcript.compaction_count = transcript.compaction_count.max(cc);
+        }
+        if transcript.last_compaction_tokens.is_none() {
+            transcript.last_compaction_tokens = snap.last_compaction_tokens;
+        }
         let speed_cache = parse_speed_cache_info(&snap.probes);
         let _ = apply_speed_cache(
             snap.stdin.as_ref(),
@@ -1199,11 +1214,17 @@ fn run_report(args: &[String], ctx: &CommandContext<'_>) -> CommandOutput {
         .and_then(|s| s.terminal_width)
         .or(Some(100));
 
+    let report_transcript = TranscriptSummary {
+        compaction_count: snap.as_ref().and_then(|s| s.compaction_count).unwrap_or(0),
+        last_compaction_tokens: snap.as_ref().and_then(|s| s.last_compaction_tokens),
+        ..TranscriptSummary::default()
+    };
+
     let rendered: Vec<String> = render_hud_lines_full(
         RenderInput {
             stdin: scrubbed_stdin.as_ref(),
             config: &scrubbed_cfg,
-            transcript: &TranscriptSummary::default(),
+            transcript: &report_transcript,
             vcs: vcs.as_ref(),
             memory: memory.as_ref(),
             cached_quota: None,
@@ -1233,6 +1254,29 @@ fn run_report(args: &[String], ctx: &CommandContext<'_>) -> CommandOutput {
             .to_string()
     };
 
+    let mut case_map = Map::new();
+    case_map.insert(
+        "id".to_string(),
+        json!(if case_id.is_empty() {
+            "reported-case"
+        } else {
+            case_id.as_str()
+        }),
+    );
+    case_map.insert("nowMs".to_string(), json!(ctx.now_ms));
+    case_map.insert("columns".to_string(), json!(cols));
+    case_map.insert(
+        "config".to_string(),
+        Value::Object(minimal_config_map.clone()),
+    );
+    case_map.insert("stdin".to_string(), json!(scrubbed_stdin));
+    case_map.insert("probes".to_string(), json!(scrubbed_probes));
+    if report_transcript.compaction_count > 0 || report_transcript.last_compaction_tokens.is_some()
+    {
+        case_map.insert("transcript".to_string(), json!(report_transcript));
+    }
+    case_map.insert("expectedPlainLines".to_string(), json!(rendered));
+
     let payload = json!({
         "note": note,
         "pluginVersion": ctx.facts.plugin.version,
@@ -1241,15 +1285,7 @@ fn run_report(args: &[String], ctx: &CommandContext<'_>) -> CommandOutput {
         "config": minimal_config_map,
         "scrubbedStdin": scrubbed_stdin,
         "renderedPlainLines": rendered,
-        "case": {
-            "id": if case_id.is_empty() { "reported-case" } else { case_id.as_str() },
-            "nowMs": ctx.now_ms,
-            "columns": cols,
-            "config": minimal_config_map,
-            "stdin": scrubbed_stdin,
-            "probes": scrubbed_probes,
-            "expectedPlainLines": rendered,
-        }
+        "case": Value::Object(case_map),
     });
 
     let pretty = serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_string());

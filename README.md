@@ -30,7 +30,7 @@
 
 ```text
 ╭─ 🔧 TOOL │ [AUTO] │ [Gemini 4 Argon · med] Pro · ~118 tok/s │ agy-hud git:(feat/rust-hud* ↑2) │ ⏱ 12m
-├─ Ctx ██░····· 28.4% (152k/1.0M) · ⚡ 75% Cache │ ~$0.38 · agents 1/2 · tasks 1 · art 2 · 🛡 Sandbox ON
+├─ Ctx ████▓··· 59.3% (152k/256k · ↻2) · ⚡ 75% Cache │ ~$0.38 · agents 1/2 · tasks 1 · art 2 · 🛡 Sandbox ON
 ├─ Quota(weekly) ▓···· 16% (4d 18h)
 ├─ ◐ run_command: Cargo test execution · ✓ edit_file ×2: render.rs · ✓ read_file ×5: SKILL.md
 ├─ Skills: hud, agy-customizations │ MCP: context7
@@ -42,7 +42,7 @@
 
 ```text
 # Ultra-wide terminal (>= 180 cols, idle) — collapses cleanly into one crisp line:
-✓ IDLE │ [AUTO] │ [Gemini 4 Argon · med] Pro · ~118 tok/s │ agy-hud git:(main) │ ⏱ 5m │ Ctx ██░····· 28.4% (152k/1.0M) · ⚡ 75% Cache │ Quota(weekly) ▓···· 16% (4d 18h)
+✓ IDLE │ [AUTO] │ [Gemini 4 Argon · med] Pro · ~118 tok/s │ agy-hud git:(main) │ ⏱ 5m │ Ctx ███████····· 59.3% (152k/256k) · ⚡ 75% Cache │ Quota(weekly) ▓···· 16% (4d 18h)
 
 # Narrow split pane (< 76 cols, high context) — progressive degradation without wrapping:
 ⚡ WORK │ [AUTO] │ [Argon · M] │ agy-hud git:(main*)
@@ -57,7 +57,7 @@ Ctx ███████░ 89.6% !200k │ Quota(weekly) 92% (1h 30m)
 | **State & Mode** | Live `IDLE` / `WORK` / `TOOL` / `CONFIRM` state, `[PLAN]` / `[AUTO]` / `[ACCEPT]` cycle mode (plus `/plan` detection & `VIM` mode badge) | `display.showState`, `display.showMode` |
 | **Model, Tier & Speed** | Compact model name, reasoning effort (`low`/`med`/`high`), normalized plan tier (`Pro`/`Ultra`), and TTFT-stripped `~tok/s` decode rate | `display.showModel`, `display.showPlanTier`, `display.showSpeed` |
 | **Workspace & VCS** | Clickable `file://` OSC 8 project path (plus optional `project › subdir` breadcrumb), clickable GitHub branch OSC 8 links, `git` (worktrees, dirty, unpushed `↑N` thresholds, file stats), `jj` (bookmarks, `@change_id`, conflicts), or `hg` | `display.showProject`, `display.showLaunchDir`, `vcs.pushWarningThreshold`, `vcs.showFileStats` |
-| **Context & Meta** | Fine-grained 8th-block Unicode context bar, `!200k` alert, prompt `Cache` hit %, session/daily/weekly cost (`Today` / `Week`), subagent/task/artifact counts, Sandbox badge | `display.showContextBar`, `display.showCost`, `display.showDailyCost`, `display.showWeeklyCost` |
+| **Context & Meta** | Compaction-watermark-scaled (`256k`) 8th-block Unicode context bar + `↻N` auto-compaction counter badge, `200k+` alert, prompt `Cache` hit %, session/daily/weekly cost (`Today` / `Week`), subagent/task/artifact counts, Sandbox badge | `display.contextScale`, `display.showContextBar`, `display.showDailyCost`, `display.showWeeklyCost` |
 | **Quota Pace** | Model-routed quota buckets (`5h` / `weekly`), burn-rate projection (`▲` pace alert when projected > 90% / > 100% before reset), optional low-usage threshold hiding, and reset countdown | `display.showQuota`, `display.quotaPace`, `display.quotaThreshold`, `quota.backgroundRefresh` |
 | **Activity & Composable Rows** | Folded tool invocations (`×N` deduplication), active `Skills` & `MCP` servers (`!` error alerts), `Subagents` (`◐`/`◷`/`✗`/`✓` with 60s completed retirement), `task.md` progress, and customizable row merging / right-alignment | `display.mergeGroups`, `display.rightAlign`, `display.showTools`, `display.showSubagents`, `display.showTodos` |
 
@@ -150,7 +150,7 @@ Invoke via `~/.gemini/antigravity-cli/agy-hud/bin/agy-hud` (or `./scripts/agy-hu
 | `uninstall [--plugin] [--keep-config]` | Remove `statusLine`, clean backups & HUD directory, and restore official `agy` default |
 | `doctor [--pretty]` | Inspect runtime, plugin enablement, `statusLine` wiring, config validity, and glyph alignment |
 | `preview [--state <name>] [--last] [--set k=v]` | Render `showcase`, `idle`, `tool_use`, `confirm`, `high-context`, inline JSON, or last live snapshot |
-| `schema [query]` | Browse all **52** validated configuration keys, types, defaults, and descriptions |
+| `schema [query]` | Browse all **53** validated configuration keys, types, defaults, and descriptions |
 | `set <key>=<value> ...` / `set --undo` | Atomically update `~/.gemini/antigravity-cli/agy-hud/config.json` or revert the previous change |
 | `update [--check] [--force]` | Check for or apply the latest SHA-256-verified release from GitHub |
 | `quota refresh` | Run an isolated one-shot `agy -p /usage` sync to reconcile local quota cache |
@@ -173,6 +173,9 @@ Invoke via `~/.gemini/antigravity-cli/agy-hud/bin/agy-hud` (or `./scripts/agy-hu
 
 # Hide quota bar until 25% used (automatically surfaces earlier if burn pace `▲` is fast)
 ~/.gemini/antigravity-cli/agy-hud/bin/agy-hud set display.quotaThreshold=25 display.quotaPace=true
+
+# Switch context bar denominator between 256k auto-compaction watermark (default) and raw 1.0M model ceiling
+~/.gemini/antigravity-cli/agy-hud/bin/agy-hud set display.contextScale=compaction
 
 # Switch glyph mode: unicode (default) | nerd (Nerd Fonts) | ascii (strict 7-bit)
 ~/.gemini/antigravity-cli/agy-hud/bin/agy-hud set display.glyphMode=nerd

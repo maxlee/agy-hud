@@ -6,7 +6,7 @@ use crate::config::HudConfig;
 use crate::i18n::{Labels, get_labels};
 use crate::probes::{is_newer_semver, normalize_semver_tag, resolve_output_speed};
 use crate::stdin::{
-    compute_quota_pace, extract_context_metrics, extract_quota_buckets_reconciled,
+    compute_quota_pace, extract_context_metrics_scaled, extract_quota_buckets_reconciled,
     format_compact_tokens, format_duration_seconds, format_model_name_with_glyphs,
     format_session_cost, format_workspace_breadcrumb, normalize_plan_tier,
 };
@@ -331,6 +331,7 @@ struct MetricsOpts {
     quota_bar_enabled: bool,
     context_value: ContextValueMode,
     show_200k: bool,
+    show_compactions: bool,
     show_cost: bool,
     show_context_bar: bool,
     show_quota_reset: bool,
@@ -340,13 +341,19 @@ struct MetricsOpts {
 
 fn render_context_segment(
     stdin: Option<&AgyStdinData>,
+    transcript: &TranscriptSummary,
     config: &HudConfig,
     labels: &Labels,
     effective_width: Option<usize>,
     opts: &MetricsOpts,
 ) -> String {
     let gm = config.display.glyph_mode;
-    let metrics = extract_context_metrics(stdin);
+    let metrics = extract_context_metrics_scaled(
+        stdin,
+        config.display.context_scale,
+        transcript.compaction_count,
+        transcript.last_compaction_tokens,
+    );
     let pct_str = format!("{:.1}%", metrics.used_percent);
     let rem_str = format!(
         "{:.1}% {}",
@@ -362,39 +369,86 @@ fn render_context_segment(
         _ => None,
     };
 
+    let compaction_badge = if opts.show_compactions && transcript.compaction_count > 0 {
+        let raw_badge = match gm {
+            GlyphMode::Ascii => format!("c{}", transcript.compaction_count),
+            GlyphMode::Unicode | GlyphMode::Nerd => format!("↻{}", transcript.compaction_count),
+        };
+        let badge_styles: &[&str] = if transcript.compaction_count >= 3 {
+            &[colors::YELLOW, BOLD]
+        } else {
+            &[colors::CYAN, BOLD]
+        };
+        Some(paint(&raw_badge, badge_styles))
+    } else {
+        None
+    };
+    let mid_dot = match gm {
+        GlyphMode::Ascii => " . ",
+        GlyphMode::Unicode | GlyphMode::Nerd => " · ",
+    };
+    let num_styles: &[&str] =
+        if metrics.used_percent >= (config.display.context_critical_threshold as f64) {
+            &[colors::RED, BOLD]
+        } else if metrics.used_percent >= (config.display.context_warning_threshold as f64) {
+            &[colors::YELLOW, BOLD]
+        } else {
+            &[BOLD]
+        };
+
     let value_text = match opts.context_value {
-        ContextValueMode::Tokens => paint(&tok_str.unwrap_or(pct_str), &[BOLD]),
-        ContextValueMode::Remaining => paint(&rem_str, &[BOLD]),
-        ContextValueMode::Both => {
-            let num_styles: &[&str] = if metrics.used_percent
-                >= (config.display.context_critical_threshold as f64)
-            {
-                &[colors::RED, BOLD]
-            } else if metrics.used_percent >= (config.display.context_warning_threshold as f64) {
-                &[colors::YELLOW, BOLD]
-            } else {
-                &[BOLD]
-            };
-            match tok_str {
-                Some(tok) => format!(
-                    "{} {}",
-                    paint(&pct_str, num_styles),
-                    paint(&format!("({tok})"), &[DIM])
-                ),
-                None => paint(&pct_str, num_styles),
+        ContextValueMode::Tokens => {
+            let base = paint(&tok_str.unwrap_or(pct_str), &[BOLD]);
+            match compaction_badge {
+                Some(badge) => format!("{base}{}{badge}", paint(mid_dot, &[DIM])),
+                None => base,
             }
         }
+        ContextValueMode::Remaining => {
+            let base = paint(&rem_str, &[BOLD]);
+            match compaction_badge {
+                Some(badge) => format!(
+                    "{base} {}{}{}",
+                    paint("(", &[DIM]),
+                    badge,
+                    paint(")", &[DIM])
+                ),
+                None => base,
+            }
+        }
+        ContextValueMode::Both => match (tok_str, compaction_badge) {
+            (Some(tok), Some(badge)) => format!(
+                "{} {}{}{}",
+                paint(&pct_str, num_styles),
+                paint(&format!("({tok}{mid_dot}"), &[DIM]),
+                badge,
+                paint(")", &[DIM]),
+            ),
+            (Some(tok), None) => format!(
+                "{} {}",
+                paint(&pct_str, num_styles),
+                paint(&format!("({tok})"), &[DIM])
+            ),
+            (None, Some(badge)) => format!(
+                "{} {}{}{}",
+                paint(&pct_str, num_styles),
+                paint("(", &[DIM]),
+                badge,
+                paint(")", &[DIM]),
+            ),
+            (None, None) => paint(&pct_str, num_styles),
+        },
         ContextValueMode::Percent => {
-            let num_styles: &[&str] = if metrics.used_percent
-                >= (config.display.context_critical_threshold as f64)
-            {
-                &[colors::RED, BOLD]
-            } else if metrics.used_percent >= (config.display.context_warning_threshold as f64) {
-                &[colors::YELLOW, BOLD]
-            } else {
-                &[BOLD]
-            };
-            paint(&pct_str, num_styles)
+            let base = paint(&pct_str, num_styles);
+            match compaction_badge {
+                Some(badge) => format!(
+                    "{base} {}{}{}",
+                    paint("(", &[DIM]),
+                    badge,
+                    paint(")", &[DIM])
+                ),
+                None => base,
+            }
         }
     };
 
@@ -1365,7 +1419,7 @@ fn build_context_meta_line(
     let gm = config.display.glyph_mode;
     let sep_str = sep(gm);
     let dot_str = dot(gm);
-    let ctx_seg = render_context_segment(stdin, config, labels, effective_width, opts);
+    let ctx_seg = render_context_segment(stdin, transcript, config, labels, effective_width, opts);
     let meta_items =
         collect_counts_and_meta_items(stdin, transcript, memory, cost_totals, config, labels, opts);
     if meta_items.is_empty() {
@@ -1439,6 +1493,7 @@ fn build_metrics_line(
     let mut metrics_parts: Vec<String> = Vec::new();
     metrics_parts.push(render_context_segment(
         stdin,
+        transcript,
         config,
         labels,
         effective_width,
@@ -1734,6 +1789,7 @@ pub fn render_hud_lines_full(
         quota_bar_enabled: config.display.quota_bar_enabled,
         context_value: config.display.context_value,
         show_200k: true,
+        show_compactions: true,
         show_cost: has_any_cost,
         show_context_bar: config.display.show_context_bar,
         show_quota_reset: config.display.show_quota_reset,
@@ -1764,6 +1820,7 @@ pub fn render_hud_lines_full(
                 },
                 |o| {
                     o.show_200k = false;
+                    o.show_compactions = false;
                     o.show_cost = false;
                     o.max_quota_buckets = 1;
                 },
@@ -1849,7 +1906,10 @@ pub fn render_hud_lines_full(
                     o.show_200k = false;
                     o.show_cost = false;
                 },
-                |o| o.show_context_bar = false,
+                |o| {
+                    o.show_context_bar = false;
+                    o.show_compactions = false;
+                },
                 |o| o.show_meta = false,
             ];
             for apply_step in ctx_steps {

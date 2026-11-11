@@ -1,8 +1,8 @@
 use crate::ansi::sanitize_text;
 use crate::transcript::parse_iso_ms;
 use crate::types::{
-    AgyStdinData, CachedQuotaSnapshot, EffortFormatMode, GlyphMode, ModelFormatMode, ModelStdin,
-    PathLevels, QuotaBucketView, QuotaPace, RawQuotaBucket,
+    AgyStdinData, CachedQuotaSnapshot, ContextScaleMode, EffortFormatMode, GlyphMode,
+    ModelFormatMode, ModelStdin, PathLevels, QuotaBucketView, QuotaPace, RawQuotaBucket,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -289,6 +289,61 @@ pub fn extract_context_metrics(stdin: Option<&AgyStdinData>) -> ContextMetrics {
         window_size,
         exceeds_200k,
         cache_hit_percent,
+    }
+}
+
+pub const DEFAULT_COMPACTION_CEILING_TOKENS: u64 = 256_000;
+
+/// Extracts context metrics scaled either to the session's active auto-compaction watermark
+/// (`ContextScaleMode::Compaction`, `256k` default on `>= 1M` models) or the raw model window
+/// (`ContextScaleMode::Window`).
+pub fn extract_context_metrics_scaled(
+    stdin: Option<&AgyStdinData>,
+    scale: ContextScaleMode,
+    compaction_count: u32,
+    last_compaction_tokens: Option<u64>,
+) -> ContextMetrics {
+    let raw = extract_context_metrics(stdin);
+    if scale == ContextScaleMode::Window {
+        return raw;
+    }
+    let (Some(used_tok), Some(phys_win)) = (raw.used_tokens, raw.window_size) else {
+        return raw;
+    };
+    if phys_win <= DEFAULT_COMPACTION_CEILING_TOKENS {
+        return raw;
+    }
+
+    // Antigravity CLI triggers `CHECKPOINT` auto-compaction on 1.0M Gemini models at ~256k
+    // active prompt tokens (with normal single-turn overshoot into ~256k..=320k). Keep a
+    // steady 256k ceiling within that band while adapting if a future model compacts elsewhere.
+    let cand_ceiling = match last_compaction_tokens {
+        Some(obs) if obs >= 32_000 && !(200_000..=320_000).contains(&obs) => obs.min(phys_win),
+        _ => DEFAULT_COMPACTION_CEILING_TOKENS,
+    };
+    if cand_ceiling == 0 || cand_ceiling >= phys_win {
+        return raw;
+    }
+
+    // Fall back to the physical model window when active tokens clearly bypass auto-compaction
+    // (e.g., direct API sessions without 256k compaction or high-context uncompacted windows).
+    let bypass_threshold = if compaction_count == 0 {
+        cand_ceiling.saturating_mul(115) / 100
+    } else {
+        cand_ceiling.saturating_mul(125) / 100
+    };
+    if used_tok > bypass_threshold {
+        return raw;
+    }
+
+    let used_percent = ((used_tok as f64 / cand_ceiling as f64) * 100.0).clamp(0.0, 100.0);
+    let remaining_percent = (100.0 - used_percent).max(0.0);
+
+    ContextMetrics {
+        used_percent,
+        remaining_percent,
+        window_size: Some(cand_ceiling),
+        ..raw
     }
 }
 

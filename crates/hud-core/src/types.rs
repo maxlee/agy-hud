@@ -33,6 +33,14 @@ pub enum ContextValueMode {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
+pub enum ContextScaleMode {
+    #[default]
+    Compaction,
+    Window,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
 pub enum QuotaValueMode {
     #[default]
     Used,
@@ -418,6 +426,10 @@ pub struct TranscriptSummary {
     pub session_started_at: Option<i64>,
     pub last_step_at: Option<i64>,
     pub step_count: usize,
+    #[serde(default)]
+    pub compaction_count: u32,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub last_compaction_tokens: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -530,7 +542,7 @@ pub struct CostTotals {
     pub estimated: bool,
 }
 
-pub const TRANSCRIPT_CURSOR_VERSION: u32 = 1;
+pub const TRANSCRIPT_CURSOR_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -561,6 +573,10 @@ pub struct TranscriptCursor {
     pub max_step_idx: usize,
     #[serde(default)]
     pub step_lines_seen: usize,
+    #[serde(default)]
+    pub compaction_count: u32,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub last_compaction_tokens: Option<u64>,
     #[serde(default)]
     pub folded_tools: Vec<ToolEntry>,
     #[serde(default)]

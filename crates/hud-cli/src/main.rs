@@ -1,8 +1,9 @@
 #![forbid(unsafe_code)]
 
 use hud_cli::collector::{
-    MAX_TASK_MD_BYTES, SystemProbeRunner, collect_render_inputs, drain_stdin_nested,
-    exec_file_safe, read_bounded_string, read_stdin_payload, read_transcript_slices,
+    MAX_CURSOR_DELTA_BYTES, MAX_TASK_MD_BYTES, SystemProbeRunner, collect_render_inputs,
+    drain_stdin_nested, exec_file_safe, read_bounded_string, read_stdin_payload,
+    read_transcript_slices,
 };
 use hud_cli::install::{install_status_line, uninstall_status_line};
 use hud_cli::paths::{
@@ -423,9 +424,15 @@ fn run() -> u8 {
         {
             let snap_paths = build_logic_paths(&paths, Some(&snap_stdin), data_real.as_deref());
             if let Some(tp_str) = snap_paths.transcript.as_deref() {
-                let (h, t) = read_transcript_slices(Path::new(tp_str));
-                tx_head = h;
-                tx_tail = t;
+                let tp = Path::new(tp_str);
+                if let Some(full) = read_bounded_string(tp, MAX_CURSOR_DELTA_BYTES) {
+                    tx_head = full.lines().next().map(str::to_string);
+                    tx_tail = Some(full);
+                } else {
+                    let (h, t) = read_transcript_slices(tp);
+                    tx_head = h;
+                    tx_tail = t;
+                }
             }
             if let Some(tm_str) = snap_paths.task_md.as_deref() {
                 task_md_text = read_bounded_string(Path::new(tm_str), MAX_TASK_MD_BYTES);
@@ -578,6 +585,8 @@ fn run() -> u8 {
             "at": started_ms,
             "stdin": &stdin_payload,
             "probes": &collected.probes,
+            "compactionCount": collected.transcript.compaction_count,
+            "lastCompactionTokens": collected.transcript.last_compaction_tokens,
         });
         if let Ok(bytes) = serde_json::to_vec(&snap_json) {
             let _ = atomic_write_bytes(Path::new(snap_path), &bytes, 0o600);

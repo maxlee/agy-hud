@@ -1,6 +1,6 @@
 use crate::types::{
-    ContextValueMode, EffortFormatMode, GlyphMode, Language, LineLayout, ModelFormatMode,
-    PathLevels, QuotaValueMode,
+    ContextScaleMode, ContextValueMode, EffortFormatMode, GlyphMode, Language, LineLayout,
+    ModelFormatMode, PathLevels, QuotaValueMode,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -77,6 +77,8 @@ pub struct DisplayConfig {
     pub show_context_bar: bool,
     pub bar_length: usize,
     pub context_value: ContextValueMode,
+    #[serde(default)]
+    pub context_scale: ContextScaleMode,
     pub context_warning_threshold: u64,
     pub context_critical_threshold: u64,
     pub show_cache_hit_rate: bool,
@@ -127,6 +129,7 @@ impl Default for DisplayConfig {
             show_context_bar: true,
             bar_length: 12,
             context_value: ContextValueMode::Both,
+            context_scale: ContextScaleMode::Compaction,
             context_warning_threshold: 60,
             context_critical_threshold: 85,
             show_cache_hit_rate: true,
@@ -377,7 +380,12 @@ pub const CONFIG_SCHEMA: &[SchemaEntry] = &[
     SchemaEntry {
         key: "display.contextValue",
         kind: SchemaValueKind::Enum(&["\"percent\"", "\"tokens\"", "\"remaining\"", "\"both\""]),
-        description: "Context metric format: percent (\"14.2%\"), tokens (\"149k/1.0M\"), remaining (\"85.8% left\"), or both.",
+        description: "Context metric format: percent (\"14.2%\"), tokens (\"149k/256k\"), remaining (\"85.8% left\"), or both.",
+    },
+    SchemaEntry {
+        key: "display.contextScale",
+        kind: SchemaValueKind::Enum(&["\"compaction\"", "\"window\""]),
+        description: "Context denominator scale: compaction (256k auto-compaction watermark, default) or window (raw 1.0M model ceiling).",
     },
     SchemaEntry {
         key: "display.contextWarningThreshold",

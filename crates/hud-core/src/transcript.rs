@@ -21,6 +21,9 @@ struct RawStep {
     step_type: Option<String>,
     status: Option<String>,
     created_at: Option<String>,
+    input_tokens: Option<u64>,
+    cache_read_tokens: Option<u64>,
+    cache_creation_tokens: Option<u64>,
     output_tokens: Option<u64>,
     thinking: Option<String>,
     content: Option<Value>,
@@ -587,6 +590,8 @@ struct StepAccumulator {
     last_step_at: Option<i64>,
     max_step_idx: usize,
     step_lines_seen: usize,
+    compaction_count: u32,
+    last_compaction_tokens: Option<u64>,
 }
 
 impl StepAccumulator {
@@ -609,6 +614,8 @@ impl StepAccumulator {
                 last_step_at: None,
                 max_step_idx: 0,
                 step_lines_seen: 0,
+                compaction_count: 0,
+                last_compaction_tokens: None,
             };
         };
 
@@ -642,6 +649,8 @@ impl StepAccumulator {
             last_step_at: c.last_step_at,
             max_step_idx: c.max_step_idx,
             step_lines_seen: c.step_lines_seen,
+            compaction_count: c.compaction_count,
+            last_compaction_tokens: c.last_compaction_tokens,
         }
     }
 
@@ -670,6 +679,17 @@ impl StepAccumulator {
             }
 
             let step_type = step.step_type.as_deref().unwrap_or("");
+            if step_type.eq_ignore_ascii_case("CHECKPOINT") {
+                self.compaction_count = self.compaction_count.saturating_add(1);
+                let prompt_tok = step
+                    .input_tokens
+                    .unwrap_or(0)
+                    .saturating_add(step.cache_read_tokens.unwrap_or(0))
+                    .saturating_add(step.cache_creation_tokens.unwrap_or(0));
+                if prompt_tok > 0 {
+                    self.last_compaction_tokens = Some(prompt_tok);
+                }
+            }
             if step_type == "USER_INPUT" {
                 if let Some(ref mut lp) = self.latest_planner_step {
                     lp.has_trailing_user_input = true;
@@ -902,6 +922,8 @@ impl StepAccumulator {
             last_step_at: self.last_step_at,
             max_step_idx: self.max_step_idx,
             step_lines_seen: self.step_lines_seen,
+            compaction_count: self.compaction_count,
+            last_compaction_tokens: self.last_compaction_tokens,
             folded_tools,
             subagents,
         }
@@ -987,6 +1009,8 @@ impl StepAccumulator {
             } else {
                 self.step_lines_seen
             },
+            compaction_count: self.compaction_count,
+            last_compaction_tokens: self.last_compaction_tokens,
         }
     }
 }
@@ -1308,5 +1332,100 @@ mod tests {
         assert_eq!(run_tool.status, ToolStatus::Completed);
         assert_eq!(run_tool.count, 2);
         assert_eq!(run_tool.target.as_deref(), Some("Passing tests"));
+    }
+
+    #[test]
+    fn checkpoint_steps_accumulate_compaction_count_and_survive_cursor_upgrades() {
+        let initial_steps = [
+            json!({
+                "step_index": 0,
+                "source": "USER_EXPLICIT",
+                "type": "USER_INPUT",
+                "status": "DONE",
+                "created_at": "2026-11-09T03:00:00Z",
+                "content": "Start long session"
+            }),
+            json!({
+                "step_index": 1,
+                "source": "SYSTEM",
+                "type": "CHECKPOINT",
+                "status": "DONE",
+                "created_at": "2026-11-09T03:10:00Z",
+                "input_tokens": 3512,
+                "cache_read_tokens": 253_403,
+                "output_tokens": 3763,
+                "content": "# Resuming from a compaction"
+            }),
+            json!({
+                "step_index": 2,
+                "source": "MODEL",
+                "type": "PLANNER_RESPONSE",
+                "status": "DONE",
+                "created_at": "2026-11-09T03:10:05Z",
+                "output_tokens": 200,
+                "content": "Continuing work"
+            }),
+        ];
+        let part1 = initial_steps
+            .iter()
+            .map(serde_json::to_string)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+            .join("\n")
+            + "\n";
+        let head = part1.lines().next();
+
+        let (summary1, cursor1) =
+            parse_transcript_with_cursor(None, head, Some(&part1), 0, None, None);
+        assert_eq!(summary1.compaction_count, 1);
+        assert_eq!(summary1.last_compaction_tokens, Some(256_915));
+        let cur1 = cursor1.expect("cursor emitted before latest turn");
+        assert_eq!(cur1.version, TRANSCRIPT_CURSOR_VERSION);
+        assert_eq!(cur1.compaction_count, 1);
+        assert_eq!(cur1.last_compaction_tokens, Some(256_915));
+
+        // Append a second CHECKPOINT + trailing turn and resume from `cur1.offset`
+        let more_steps = [
+            json!({
+                "step_index": 3,
+                "source": "SYSTEM",
+                "type": "CHECKPOINT",
+                "status": "DONE",
+                "created_at": "2026-11-09T03:25:00Z",
+                "input_tokens": 4100,
+                "cache_read_tokens": 254_706,
+                "output_tokens": 3100,
+                "content": "# Resuming from a compaction"
+            }),
+            json!({
+                "step_index": 4,
+                "source": "USER_EXPLICIT",
+                "type": "USER_INPUT",
+                "status": "DONE",
+                "created_at": "2026-11-09T03:26:00Z",
+                "content": "Next task"
+            }),
+        ];
+        let full = part1.clone()
+            + &more_steps
+                .iter()
+                .map(serde_json::to_string)
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+                .join("\n")
+            + "\n";
+        let delta = &full[cur1.offset as usize..];
+        let (summary2, cursor2) =
+            parse_transcript_with_cursor(Some(&cur1), head, Some(delta), cur1.offset, None, None);
+        assert_eq!(summary2.compaction_count, 2);
+        assert_eq!(summary2.last_compaction_tokens, Some(258_806));
+        assert_eq!(cursor2.unwrap().compaction_count, 2);
+
+        // Stale v1 cursor must be rejected on upgrade
+        let mut stale_v1 = cur1;
+        stale_v1.version = 1;
+        let (summary_stale, _) =
+            parse_transcript_with_cursor(Some(&stale_v1), head, Some(&full), 0, None, None);
+        assert_eq!(summary_stale.compaction_count, 2);
     }
 }

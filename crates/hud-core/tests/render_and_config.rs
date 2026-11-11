@@ -17,11 +17,12 @@ use hud_core::stdin::{
 };
 use hud_core::transcript::{parse_transcript_and_tasks, parse_transcript_with_cursor};
 use hud_core::types::{
-    AgyStdinData, CachedQuotaSnapshot, ContextWindowStdin, CostStdin, CurrentUsageStdin,
-    DoctorFacts, EffortFormatMode, GlyphMode, InstalledPluginFacts, Language, LogicPaths,
-    ModelStdin, PathLevels, PluginFacts, ProbeAnswers, QuotaBucketView, QuotaPace, RawQuotaBucket,
-    RuntimeFacts, SandboxStdin, SubagentEntry, SubagentStatus, TodoItem, TodoStatus, ToolEntry,
-    ToolStatus, TranscriptCursor, TranscriptSummary, UpdateCacheSnapshot, VimStdin, WorkspaceStdin,
+    AgyStdinData, CachedQuotaSnapshot, ContextScaleMode, ContextValueMode, ContextWindowStdin,
+    CostStdin, CurrentUsageStdin, DoctorFacts, EffortFormatMode, GlyphMode, InstalledPluginFacts,
+    Language, LogicPaths, ModelStdin, PathLevels, PluginFacts, ProbeAnswers, QuotaBucketView,
+    QuotaPace, RawQuotaBucket, RuntimeFacts, SandboxStdin, SubagentEntry, SubagentStatus, TodoItem,
+    TodoStatus, ToolEntry, ToolStatus, TranscriptCursor, TranscriptSummary, UpdateCacheSnapshot,
+    VimStdin, WorkspaceStdin,
 };
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -185,9 +186,13 @@ fn adaptive_layout_handles_ultrawide_standard_narrow_and_zh_hans() {
 }
 
 #[test]
-fn config_schema_validates_all_52_keys_and_preview_showcase_renders_5_scenarios() {
-    assert_eq!(CONFIG_SCHEMA.len(), 52);
+fn config_schema_validates_all_53_keys_and_preview_showcase_renders_5_scenarios() {
+    assert_eq!(CONFIG_SCHEMA.len(), 53);
     let default_cfg = HudConfig::default();
+    assert_eq!(
+        default_cfg.display.context_scale,
+        ContextScaleMode::Compaction
+    );
     assert!(!default_cfg.quota.background_refresh);
     assert!(default_cfg.updates.enabled);
     assert!(default_cfg.display.show_speed);
@@ -1864,4 +1869,255 @@ fn width_preserving_report_scrub_and_incremental_transcript_cursor_parity() {
     let cursor_json = serde_json::to_string(&c3).unwrap();
     let decoded_cursor: TranscriptCursor = serde_json::from_str(&cursor_json).unwrap();
     assert_eq!(decoded_cursor, c3);
+}
+
+#[test]
+fn compaction_scale_watermark_bar_colors_badge_modes_and_snapshot_report_fidelity() {
+    let mut stdin = sample_stdin(128);
+    stdin.exceeds_200k_tokens = Some(false);
+    stdin.context_window = Some(ContextWindowStdin {
+        total_input_tokens: None,
+        total_output_tokens: None,
+        context_window_size: Some(1_048_576),
+        used_percentage: Some(13.9),
+        remaining_percentage: Some(86.1),
+        current_usage: Some(CurrentUsageStdin {
+            input_tokens: Some(26_000),
+            output_tokens: Some(0),
+            cache_creation_input_tokens: Some(0),
+            cache_read_input_tokens: Some(120_000),
+        }),
+    });
+
+    let mut transcript = TranscriptSummary {
+        compaction_count: 4,
+        last_compaction_tokens: Some(256_915),
+        ..TranscriptSummary::default()
+    };
+
+    // 1. Default `ContextScaleMode::Compaction`: 146k / 256k = 57.0% + `↻4` badge in English & zh-Hans
+    let en_lines = render_hud_lines(RenderInput {
+        stdin: Some(&stdin),
+        config: &HudConfig::default(),
+        transcript: &transcript,
+        vcs: None,
+        memory: None,
+        cached_quota: None,
+        update_info: None,
+        columns: Some(128),
+        now_ms: 1_700_000_000_000,
+    });
+    let en_plain = en_lines
+        .iter()
+        .map(|l| strip_ansi(l))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        en_plain.contains("57.0% (146k/256k · ↻4)"),
+        "expected compaction-scaled bar & badge, got: {en_plain}"
+    );
+    // `compaction_count >= 3` paints `↻4` yellow (`\x1b[33m\x1b[1m`)
+    let en_raw = en_lines.join("\n");
+    assert!(en_raw.contains("\x1b[33m\x1b[1m↻4\x1b[0m"));
+
+    let zh_cfg = HudConfig {
+        language: Language::ZhHans,
+        ..HudConfig::default()
+    };
+    let zh_lines = render_hud_lines(RenderInput {
+        stdin: Some(&stdin),
+        config: &zh_cfg,
+        transcript: &transcript,
+        vcs: None,
+        memory: None,
+        cached_quota: None,
+        update_info: None,
+        columns: Some(128),
+        now_ms: 1_700_000_000_000,
+    });
+    let zh_plain = zh_lines
+        .iter()
+        .map(|l| strip_ansi(l))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(zh_plain.contains("上下文 "));
+    assert!(zh_plain.contains("57.0% (146k/256k · ↻4)"));
+
+    // 2. Warning (>= 60% -> 160k/256k = 62.5%) & Critical (>= 85% -> 224k/256k = 87.5%) colors
+    let mut warn_stdin = stdin.clone();
+    warn_stdin
+        .context_window
+        .as_mut()
+        .unwrap()
+        .current_usage
+        .as_mut()
+        .unwrap()
+        .cache_read_input_tokens = Some(134_000); // 26k + 134k = 160k (62.5%)
+    let warn_raw = render_hud_lines(RenderInput {
+        stdin: Some(&warn_stdin),
+        config: &HudConfig::default(),
+        transcript: &transcript,
+        vcs: None,
+        memory: None,
+        cached_quota: None,
+        update_info: None,
+        columns: Some(128),
+        now_ms: 1_700_000_000_000,
+    })
+    .join("\n");
+    assert!(warn_raw.contains("\x1b[33m\x1b[1m62.5%\x1b[0m"));
+
+    let mut crit_stdin = stdin.clone();
+    crit_stdin
+        .context_window
+        .as_mut()
+        .unwrap()
+        .current_usage
+        .as_mut()
+        .unwrap()
+        .cache_read_input_tokens = Some(198_000); // 26k + 198k = 224k (87.5%)
+    let crit_raw = render_hud_lines(RenderInput {
+        stdin: Some(&crit_stdin),
+        config: &HudConfig::default(),
+        transcript: &transcript,
+        vcs: None,
+        memory: None,
+        cached_quota: None,
+        update_info: None,
+        columns: Some(128),
+        now_ms: 1_700_000_000_000,
+    })
+    .join("\n");
+    assert!(crit_raw.contains("\x1b[31m\x1b[1m87.5%\x1b[0m"));
+
+    // 3. `display.contextScale = "window"` shows physical 1.0M ceiling while retaining `↻4`
+    let win_cfg = parse_config_str(Some(r#"{"display":{"contextScale":"window"}}"#)).config;
+    assert_eq!(win_cfg.display.context_scale, ContextScaleMode::Window);
+    let win_plain = render_hud_lines(RenderInput {
+        stdin: Some(&stdin),
+        config: &win_cfg,
+        transcript: &transcript,
+        vcs: None,
+        memory: None,
+        cached_quota: None,
+        update_info: None,
+        columns: Some(128),
+        now_ms: 1_700_000_000_000,
+    })
+    .iter()
+    .map(|l| strip_ansi(l))
+    .collect::<Vec<_>>()
+    .join("\n");
+    assert!(
+        win_plain.contains("13.9% (146k/1.0M · ↻4)"),
+        "expected raw window scale with badge, got: {win_plain}"
+    );
+
+    // 4. ASCII glyph mode (`c4`) and `Tokens` / `Percent` / `Remaining` contextValue modes
+    transcript.compaction_count = 2; // < 3 -> cyan badge
+    let mut mode_cfg = HudConfig::default();
+    mode_cfg.display.glyph_mode = GlyphMode::Ascii;
+    let ascii_plain = render_hud_lines(RenderInput {
+        stdin: Some(&stdin),
+        config: &mode_cfg,
+        transcript: &transcript,
+        vcs: None,
+        memory: None,
+        cached_quota: None,
+        update_info: None,
+        columns: Some(128),
+        now_ms: 1_700_000_000_000,
+    })
+    .iter()
+    .map(|l| strip_ansi(l))
+    .collect::<Vec<_>>()
+    .join("\n");
+    assert!(ascii_plain.contains("57.0% (146k/256k . c2)"));
+
+    mode_cfg.display.glyph_mode = GlyphMode::Unicode;
+    for (cv, expected_sub) in [
+        (ContextValueMode::Tokens, "146k/256k · ↻2"),
+        (ContextValueMode::Percent, "57.0% (↻2)"),
+        (ContextValueMode::Remaining, "43.0% left (↻2)"),
+    ] {
+        mode_cfg.display.context_value = cv;
+        let cv_plain = render_hud_lines(RenderInput {
+            stdin: Some(&stdin),
+            config: &mode_cfg,
+            transcript: &transcript,
+            vcs: None,
+            memory: None,
+            cached_quota: None,
+            update_info: None,
+            columns: Some(128),
+            now_ms: 1_700_000_000_000,
+        })
+        .iter()
+        .map(|l| strip_ansi(l))
+        .collect::<Vec<_>>()
+        .join("\n");
+        assert!(
+            cv_plain.contains(expected_sub),
+            "mode {cv:?} missing '{expected_sub}' in: {cv_plain}"
+        );
+    }
+
+    // 5. `preview --last` and `report` preserve `compactionCount` & `lastCompactionTokens` from snapshot
+    let snap_json = json!({
+        "at": 1_700_000_000_000i64,
+        "stdin": &stdin,
+        "probes": {},
+        "compactionCount": 5,
+        "lastCompactionTokens": 257_369
+    })
+    .to_string();
+    let facts = DoctorFacts {
+        cwd: "/Users/dev/demo-app".to_string(),
+        home_dir: "/Users/dev".to_string(),
+        platform: "macos".to_string(),
+        terminal: "Ghostty".to_string(),
+        remote_session: false,
+        runtime: RuntimeFacts {
+            engine: "rust-native".to_string(),
+            version: "1.5.1".to_string(),
+            exec_path: "/Users/dev/.gemini/antigravity-cli/agy-hud/bin/agy-hud".to_string(),
+            supported: true,
+        },
+        plugin: PluginFacts {
+            root: "/Users/dev/.gemini/config/plugins/agy-hud".to_string(),
+            version: "1.5.1".to_string(),
+        },
+        installed_plugin_status: "installed".to_string(),
+        installed_plugin: None,
+        config_path: "/Users/dev/.gemini/antigravity-cli/agy-hud/config.json".to_string(),
+        heartbeat: None,
+    };
+    let cmd_ctx = CommandContext {
+        facts: &facts,
+        paths: &LogicPaths::default(),
+        now_ms: 1_700_000_000_000,
+        config_text: None,
+        cli_settings_text: None,
+        last_snapshot_text: Some(&snap_json),
+        update_cache_text: None,
+        transcript_head: None,
+        transcript_tail: None,
+        task_md_text: None,
+    };
+    let last_prev = execute_subcommand("preview", &["--last".to_string()], &cmd_ctx);
+    assert!(!last_prev.failed);
+    let last_plain = last_prev
+        .lines
+        .iter()
+        .map(|l| strip_ansi(l))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(last_plain.contains("57.0% (146k/256k · ↻5)"));
+
+    let rep = execute_subcommand("report", &["compaction-check".to_string()], &cmd_ctx);
+    assert!(!rep.failed);
+    let rep_val: serde_json::Value = serde_json::from_str(&rep.lines.join("\n")).unwrap();
+    assert_eq!(rep_val["case"]["transcript"]["compaction_count"], 5);
+    let rep_lines = rep_val["renderedPlainLines"].to_string();
+    assert!(rep_lines.contains("57.0% (146k/256k · ↻5)"));
 }
