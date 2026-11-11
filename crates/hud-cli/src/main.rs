@@ -464,11 +464,8 @@ fn run() -> u8 {
     }
 
     // Live Antigravity CLI `statusLine` render mode
-    if is_nested_hud() {
+    if is_nested_hud() || is_hud_disabled() {
         drain_stdin_nested(Duration::from_millis(150));
-        return 0;
-    }
-    if is_hud_disabled() {
         return 0;
     }
 
