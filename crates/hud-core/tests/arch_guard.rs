@@ -453,4 +453,121 @@ fn marketplace_manifest_skills_and_scripts_meet_strict_spec() {
             }
         }
     }
+
+    // 5. Bundled `scripts/bin/<plat>/agy-hud` binaries (when present) must embed exact HUD_VERSION banner
+    let bin_root = root.join("scripts/bin");
+    if bin_root.is_dir() {
+        let expected_banner = format!("agy-hud {} (rust-native)", hud_core::types::HUD_VERSION);
+        let needle = expected_banner.as_bytes();
+        for ent in fs::read_dir(&bin_root).unwrap().flatten() {
+            if ent.path().is_dir() {
+                let cand = ent.path().join("agy-hud");
+                if cand.is_file() {
+                    let bytes = fs::read(&cand).expect("read bundled binary bytes");
+                    assert!(
+                        bytes.windows(needle.len()).any(|w| w == needle),
+                        "Stale or mismatched bundled binary {} — expected embedded `{expected_banner}`",
+                        cand.display()
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn github_workflows_enforce_node24_actions_and_permissions() {
+    let root = workspace_root();
+    let wf_dir = root.join(".github/workflows");
+    let mut workflow_files: Vec<PathBuf> = fs::read_dir(&wf_dir)
+        .expect("read .github/workflows")
+        .filter_map(|e| e.ok().map(|d| d.path()))
+        .filter(|p| matches!(p.extension().and_then(|s| s.to_str()), Some("yml" | "yaml")))
+        .collect();
+    workflow_files.sort();
+    assert!(
+        workflow_files.len() >= 2,
+        "expected ci.yml and release.yml in .github/workflows"
+    );
+
+    let min_majors: BTreeMap<&str, u32> = BTreeMap::from([
+        ("actions/checkout", 7),
+        ("actions/upload-artifact", 7),
+        ("actions/download-artifact", 8),
+        ("softprops/action-gh-release", 3),
+        ("Swatinem/rust-cache", 2),
+    ]);
+
+    for path in workflow_files {
+        let content = fs::read_to_string(&path).expect("read workflow yaml");
+        assert!(
+            content.lines().any(|l| l.starts_with("permissions:")),
+            "Workflow {} must declare explicit top-level `permissions:`",
+            path.display()
+        );
+
+        let mut uses_count = 0usize;
+        for raw_line in content.lines() {
+            let trimmed = raw_line.trim();
+            if trimmed.starts_with('#') {
+                continue;
+            }
+            let spec = trimmed
+                .strip_prefix("- uses:")
+                .or_else(|| trimmed.strip_prefix("uses:"))
+                .map(|s| s.split('#').next().unwrap_or(s).trim());
+            let Some(action_ref) = spec else {
+                continue;
+            };
+            uses_count += 1;
+            let (repo, ver) = action_ref.split_once('@').unwrap_or_else(|| {
+                panic!(
+                    "Unpinned `uses: {action_ref}` in {} (expected `<owner>/<repo>@<ref>`)",
+                    path.display()
+                )
+            });
+
+            if repo == "dtolnay/rust-toolchain" {
+                assert_eq!(
+                    ver,
+                    "stable",
+                    "Unexpected toolchain ref `{action_ref}` in {}",
+                    path.display()
+                );
+                continue;
+            }
+
+            let min_major = min_majors.get(repo).copied().unwrap_or_else(|| {
+                panic!(
+                    "Unvetted GitHub Action `{action_ref}` in {}; register its Node.js 24+ minimum major in arch_guard.rs",
+                    path.display()
+                )
+            });
+            let major_str = ver
+                .strip_prefix('v')
+                .and_then(|rest| rest.split('.').next())
+                .unwrap_or_else(|| {
+                    panic!(
+                        "Expected `v<major>` tag on `{action_ref}` in {}",
+                        path.display()
+                    )
+                });
+            let major: u32 = major_str.parse().unwrap_or_else(|_| {
+                panic!(
+                    "Invalid major version `{ver}` on `{action_ref}` in {}",
+                    path.display()
+                )
+            });
+            assert!(
+                major >= min_major,
+                "Deprecated GitHub Action `{action_ref}` in {} — upgrade to `{repo}@v{min_major}` or newer (Node.js 24 native)",
+                path.display()
+            );
+        }
+        assert!(
+            uses_count > 0,
+            "Expected at least one `uses:` step in {}",
+            path.display()
+        );
+    }
 }

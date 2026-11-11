@@ -1,4 +1,4 @@
-# `agy-hud` v1.5.0 — 100% Pure Rust Single-Engine Architecture
+# `agy-hud` v1.5.1 — 100% Pure Rust Single-Engine Architecture
 
 `agy-hud` is a **100% Pure Rust** native statusLine HUD for the Google Antigravity CLI (`agy`). There is **zero Node.js / TypeScript runtime or wrapper code** in the repository.
 
@@ -24,6 +24,9 @@ Instead of spawning a second runtime VM per render, `agy-hud` enforces capabilit
    - Stores VCS probe caches in **per-workspace sharded files** (`<hudHome>/probe-cache/<fnv64>.json`), eliminating cross-window write contention while invalidating in `O(1)` on `.git/HEAD`, `.git/index`, `.jj/working_copy/checkout`, or `.hg/dirstate` `mtime`/`size` changes.
    - Supports optional official `/usage` quota cache reconciliation (`quota.backgroundRefresh = false` by default, or manual `agy-hud quota refresh`) executed in an empty isolated temp directory with `AGY_HUD_NESTED=1`, `AGY_CLI_DISABLE_AUTO_UPDATE=true`, exclusive lockfile ownership, and `60 s..600 s` exponential failure backoff.
    - Passes every rendered output line through `hud_core::ansi::terminal_filter_with_repo` before writing to `stdout`.
+3. **CI/CD & Marketplace Supply-Chain Guard (`crates/hud-core/tests/arch_guard.rs`)**
+   - Audits `.github/workflows/*.yml` for explicit least-privilege `permissions:` and enforces Node.js 24-native (or composite) GitHub Action major versions (`actions/checkout@v7+`, `actions/upload-artifact@v7+`, `actions/download-artifact@v8+`, `softprops/action-gh-release@v3+`, `Swatinem/rust-cache@v2+`, `dtolnay/rust-toolchain@stable`), preventing deprecated Node.js 20 runner warnings.
+   - Audits bundled Marketplace binaries (`scripts/bin/<platform>/agy-hud`) for `0755` executable permissions and exact embedded `agy-hud <version> (rust-native)` version parity with `Cargo.toml` and `plugin.json`.
 
 ---
 

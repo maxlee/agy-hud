@@ -30,6 +30,7 @@ use std::process::ExitCode;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+const VERSION_BANNER: &str = concat!("agy-hud ", env!("CARGO_PKG_VERSION"), " (rust-native)");
 
 const HELP_LINES: &[&str] = &[
     "agy-hud — 100% Pure Rust real-time statusLine HUD for Google Antigravity CLI (agy)",
@@ -272,7 +273,7 @@ fn run() -> u8 {
         return 0;
     }
     if matches!(sub, Some("version" | "--version" | "-V")) {
-        print_filtered(&[format!("agy-hud {VERSION} (rust-native)")]);
+        print_filtered(&[VERSION_BANNER]);
         return 0;
     }
 
