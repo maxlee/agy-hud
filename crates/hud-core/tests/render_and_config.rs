@@ -978,17 +978,64 @@ fn speed_badge_header_integration_range_hiding_glyph_modes_model_switch_and_narr
     .expect("writes model-switch barrier");
     assert_eq!(tx_barrier.resolved_tps_x10, None);
     assert_eq!(tx_barrier.completed_step_tps_x10, None);
+    assert!(tx_barrier.latest_planner_step.is_none());
     assert_eq!(tx_barrier.session_min_tps_x10, Some(576));
     assert_eq!(tx_barrier.session_max_tps_x10, Some(576));
+    let barrier_header = strip_ansi(
+        &render_hud_lines(RenderInput {
+            stdin: Some(&switched_stdin),
+            config: &HudConfig::default(),
+            transcript: &tx_barrier,
+            vcs: None,
+            memory: None,
+            cached_quota: None,
+            update_info: None,
+            columns: Some(140),
+            now_ms: base_ms + 20_000,
+        })[0],
+    );
     assert!(
-        hud_core::probes::resolve_output_speed_display(
-            Some(&switched_stdin),
-            &tx_barrier,
-            Some(&barrier_cache),
-            base_ms + 20_000,
-        )
-        .is_none(),
-        "Barrier cache must suppress stale model speed before new model produces output"
+        !barrier_header.contains("tok/s")
+            && !barrier_header.contains("🚲")
+            && !barrier_header.contains('('),
+        "Immediate barrier render must hide stale model speed/emoji/range: {barrier_header}"
+    );
+
+    // Subsequent idle render with a freshly parsed transcript + persisted `barrier_cache` also suppresses stale speed
+    let mut tx_barrier_reparse = parse_transcript_and_tasks(
+        single_step_jsonl.lines().next(),
+        Some(&single_step_jsonl),
+        None,
+        Some(&switched_stdin),
+    );
+    let reparse_write = apply_speed_cache(
+        Some(&switched_stdin),
+        &mut tx_barrier_reparse,
+        Some(&barrier_cache),
+        base_ms + 20_500,
+    );
+    assert!(reparse_write.is_none());
+    assert!(tx_barrier_reparse.latest_planner_step.is_none());
+    assert_eq!(tx_barrier_reparse.session_min_tps_x10, Some(576));
+    assert_eq!(tx_barrier_reparse.session_max_tps_x10, Some(576));
+    let reparse_barrier_header = strip_ansi(
+        &render_hud_lines(RenderInput {
+            stdin: Some(&switched_stdin),
+            config: &HudConfig::default(),
+            transcript: &tx_barrier_reparse,
+            vcs: None,
+            memory: None,
+            cached_quota: None,
+            update_info: None,
+            columns: Some(140),
+            now_ms: base_ms + 20_500,
+        })[0],
+    );
+    assert!(
+        !reparse_barrier_header.contains("tok/s")
+            && !reparse_barrier_header.contains("🚲")
+            && !reparse_barrier_header.contains('('),
+        "Subsequent barrier render must also hide stale model speed/emoji/range: {reparse_barrier_header}"
     );
 
     // New model completes a fast 150.0 tok/s step (120 tokens in 800ms -> 🚗 ~150 tok/s (58~150))
