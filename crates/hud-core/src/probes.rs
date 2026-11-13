@@ -1,7 +1,8 @@
 use crate::ansi::sanitize_text;
 use crate::transcript::{
-    adjust_coarse_dt_ms, blend_tps_ewma_x10, compute_tps_x10, estimate_ttft_overhead_ms,
-    parse_iso_ms, update_speed_anchors,
+    MAX_VALID_TPS_X10, MIN_VALID_TPS_X10, adjust_coarse_dt_ms, blend_tps_ewma_x10, compute_tps_x10,
+    estimate_ttft_overhead_ms, merge_min_max_pair_x10, parse_iso_ms, update_min_max_x10,
+    update_speed_anchors,
 };
 use crate::types::{
     ActiveSpeedSample, AgyStdinData, CachedQuotaSnapshot, CostLedgerSnapshot, CostTotals,
@@ -468,10 +469,29 @@ pub fn parse_speed_cache_info(answers: &ProbeAnswers) -> Option<SpeedCacheSnapsh
     let raw_json = answers.speed_cache.as_deref()?;
     let mut parsed = serde_json::from_str::<SpeedCacheSnapshot>(raw_json).ok()?;
     parsed.session_key = sanitize_text(&parsed.session_key);
-    if !(10..=5_000).contains(&parsed.tps_x10) {
-        return None;
+    parsed.model_key = sanitize_text(&parsed.model_key);
+
+    let mut norm_min = None;
+    let mut norm_max = None;
+    merge_min_max_pair_x10(
+        &mut norm_min,
+        &mut norm_max,
+        parsed.session_min_tps_x10,
+        parsed.session_max_tps_x10,
+    );
+    parsed.session_min_tps_x10 = norm_min;
+    parsed.session_max_tps_x10 = norm_max;
+
+    let has_valid_tps = (MIN_VALID_TPS_X10..=MAX_VALID_TPS_X10).contains(&parsed.tps_x10);
+    let has_session_range = norm_min.is_some() && norm_max.is_some();
+    let is_barrier = parsed.ended_at_ms == -1 && parsed.tps_x10 == 0;
+    let has_active = parsed.active.is_some() && parsed.tps_x10 == 0;
+
+    if has_valid_tps || (parsed.tps_x10 == 0 && (is_barrier || has_active || has_session_range)) {
+        Some(parsed)
+    } else {
+        None
     }
-    Some(parsed)
 }
 
 fn extract_native_stdin_tps(stdin: Option<&AgyStdinData>) -> Option<f64> {
@@ -509,17 +529,146 @@ fn extract_model_key(stdin: Option<&AgyStdinData>) -> String {
         .unwrap_or_default()
 }
 
-/// Resolves output generation throughput `(tokens_per_sec, is_estimated)` and returns an updated
-/// `SpeedCacheSnapshot` whenever live streaming milestones or completed `PLANNER_RESPONSE` steps
-/// should be persisted to disk.
-pub fn resolve_output_speed(
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct OutputSpeedDisplay {
+    pub current_tps: f64,
+    pub estimated: bool,
+    pub min_tps: Option<f64>,
+    pub max_tps: Option<f64>,
+}
+
+struct ResolvedSpeedOutput {
+    current: Option<(f64, bool)>,
+    session_min_x10: Option<u32>,
+    session_max_x10: Option<u32>,
+    next_cache: Option<SpeedCacheSnapshot>,
+}
+
+fn empty_speed_cache(
+    session_key: String,
+    model_key: String,
+    step_index: usize,
+    started_at_ms: i64,
+    ended_at_ms: i64,
+    session_min_tps_x10: Option<u32>,
+    session_max_tps_x10: Option<u32>,
+) -> SpeedCacheSnapshot {
+    SpeedCacheSnapshot {
+        session_key,
+        model_key,
+        step_index,
+        output_tokens: 0,
+        started_at_ms,
+        ended_at_ms,
+        tps_x10: 0,
+        ewma_tps_x10: None,
+        session_min_tps_x10,
+        session_max_tps_x10,
+        short_anchor: None,
+        long_anchor: None,
+        active: None,
+    }
+}
+
+fn clear_active_snapshot(
+    sc: &SpeedCacheSnapshot,
+    session_min_x10: Option<u32>,
+    session_max_x10: Option<u32>,
+) -> Option<SpeedCacheSnapshot> {
+    sc.active.is_some().then(|| SpeedCacheSnapshot {
+        active: None,
+        session_min_tps_x10: session_min_x10,
+        session_max_tps_x10: session_max_x10,
+        ..sc.clone()
+    })
+}
+
+fn resolve_output_speed_inner(
     stdin: Option<&AgyStdinData>,
     transcript: &TranscriptSummary,
     speed_cache: Option<&SpeedCacheSnapshot>,
     now_ms: i64,
-) -> (Option<(f64, bool)>, Option<SpeedCacheSnapshot>) {
+) -> ResolvedSpeedOutput {
+    let session_key = stdin
+        .and_then(|s| s.conversation_id.as_deref().or(s.session_id.as_deref()))
+        .map(sanitize_text)
+        .unwrap_or_default();
+    let model_key = extract_model_key(stdin);
+
+    let same_session_cache = (!session_key.is_empty())
+        .then_some(speed_cache)
+        .flatten()
+        .filter(|sc| sc.session_key == session_key);
+
+    let model_switched = same_session_cache.is_some_and(|sc| {
+        !sc.model_key.is_empty() && !model_key.is_empty() && sc.model_key != model_key
+    });
+
+    // Session min/max span model switches within the same session; only completed steps and
+    // native exact stdin tps update them.
+    let mut session_min_x10 = None;
+    let mut session_max_x10 = None;
+    merge_min_max_pair_x10(
+        &mut session_min_x10,
+        &mut session_max_x10,
+        transcript.session_min_tps_x10,
+        transcript.session_max_tps_x10,
+    );
+    if let Some(sc) = same_session_cache {
+        merge_min_max_pair_x10(
+            &mut session_min_x10,
+            &mut session_max_x10,
+            sc.session_min_tps_x10,
+            sc.session_max_tps_x10,
+        );
+    }
+
     if let Some(exact) = extract_native_stdin_tps(stdin) {
-        return (Some((exact, false)), None);
+        let exact_x10 = (exact * 10.0).round() as u32;
+        update_min_max_x10(&mut session_min_x10, &mut session_max_x10, exact_x10);
+        let next_cache = (!session_key.is_empty())
+            .then(|| {
+                let mut cand = match same_session_cache {
+                    Some(sc) if !model_switched => sc.clone(),
+                    Some(sc) => {
+                        let barrier_step = transcript
+                            .latest_planner_step
+                            .as_ref()
+                            .map_or(sc.step_index, |lp| lp.step_index.max(sc.step_index));
+                        empty_speed_cache(
+                            session_key.clone(),
+                            model_key.clone(),
+                            barrier_step,
+                            now_ms,
+                            -1,
+                            session_min_x10,
+                            session_max_x10,
+                        )
+                    }
+                    None => empty_speed_cache(
+                        session_key.clone(),
+                        model_key.clone(),
+                        0,
+                        0,
+                        0,
+                        session_min_x10,
+                        session_max_x10,
+                    ),
+                };
+                if !model_key.is_empty() {
+                    cand.model_key = model_key.clone();
+                }
+                cand.session_min_tps_x10 = session_min_x10;
+                cand.session_max_tps_x10 = session_max_x10;
+                cand
+            })
+            .filter(|cand| speed_cache != Some(cand));
+        return ResolvedSpeedOutput {
+            current: Some((exact, false)),
+            session_min_x10,
+            session_max_x10,
+            next_cache,
+        };
     }
 
     if speed_cache.is_none()
@@ -527,14 +676,13 @@ pub fn resolve_output_speed(
             .resolved_tps_x10
             .filter(|&v| (10..=5_000).contains(&v))
     {
-        return (Some((x10 as f64 / 10.0, true)), None);
+        return ResolvedSpeedOutput {
+            current: Some((x10 as f64 / 10.0, true)),
+            session_min_x10,
+            session_max_x10,
+            next_cache: None,
+        };
     }
-
-    let session_key = stdin
-        .and_then(|s| s.conversation_id.as_deref().or(s.session_id.as_deref()))
-        .map(sanitize_text)
-        .unwrap_or_default();
-    let model_key = extract_model_key(stdin);
 
     let agent_state = stdin
         .and_then(|s| s.agent_state.as_deref())
@@ -549,15 +697,6 @@ pub fn resolve_output_speed(
         .and_then(|s| s.tool_confirmation_pending)
         .unwrap_or(false);
 
-    let same_session_cache = (!session_key.is_empty())
-        .then_some(speed_cache)
-        .flatten()
-        .filter(|sc| sc.session_key == session_key);
-
-    let model_switched = same_session_cache.is_some_and(|sc| {
-        !sc.model_key.is_empty() && !model_key.is_empty() && sc.model_key != model_key
-    });
-
     if model_switched && let Some(old_sc) = same_session_cache {
         let lp_needs_fresh_eval = transcript
             .latest_planner_step
@@ -568,20 +707,21 @@ pub fn resolve_output_speed(
                 .latest_planner_step
                 .as_ref()
                 .map_or(old_sc.step_index, |lp| lp.step_index.max(old_sc.step_index));
-            let reset = SpeedCacheSnapshot {
+            let reset = empty_speed_cache(
                 session_key,
                 model_key,
-                step_index: barrier_step,
-                output_tokens: 0,
-                started_at_ms: now_ms,
-                ended_at_ms: -1,
-                tps_x10: 0,
-                ewma_tps_x10: None,
-                short_anchor: None,
-                long_anchor: None,
-                active: None,
+                barrier_step,
+                now_ms,
+                -1,
+                session_min_x10,
+                session_max_x10,
+            );
+            return ResolvedSpeedOutput {
+                current: None,
+                session_min_x10,
+                session_max_x10,
+                next_cache: Some(reset),
             };
-            return (None, Some(reset));
         }
     }
 
@@ -675,24 +815,20 @@ pub fn resolve_output_speed(
         let display_x10 = active.live_tps_x10.or(prev_ewma);
         let to_persist = (!session_key.is_empty())
             .then(|| {
-                let base = matching_cache
-                    .cloned()
-                    .unwrap_or_else(|| SpeedCacheSnapshot {
-                        session_key: session_key.clone(),
-                        model_key: model_key.clone(),
-                        step_index: model_switched
+                let base = matching_cache.cloned().unwrap_or_else(|| {
+                    empty_speed_cache(
+                        session_key.clone(),
+                        model_key.clone(),
+                        model_switched
                             .then(|| same_session_cache.map(|s| s.step_index))
                             .flatten()
                             .unwrap_or(0),
-                        output_tokens: 0,
-                        started_at_ms: 0,
-                        ended_at_ms: if model_switched { -1 } else { 0 },
-                        tps_x10: 0,
-                        ewma_tps_x10: None,
-                        short_anchor: None,
-                        long_anchor: None,
-                        active: None,
-                    });
+                        0,
+                        if model_switched { -1 } else { 0 },
+                        session_min_x10,
+                        session_max_x10,
+                    )
+                });
                 SpeedCacheSnapshot {
                     session_key: session_key.clone(),
                     model_key: if model_key.is_empty() {
@@ -700,13 +836,20 @@ pub fn resolve_output_speed(
                     } else {
                         model_key.clone()
                     },
+                    session_min_tps_x10: session_min_x10,
+                    session_max_tps_x10: session_max_x10,
                     active: Some(active),
                     ..base
                 }
             })
             .filter(|cand| speed_cache != Some(cand));
 
-        return (display_x10.map(|x| (x as f64 / 10.0, true)), to_persist);
+        return ResolvedSpeedOutput {
+            current: display_x10.map(|x| (x as f64 / 10.0, true)),
+            session_min_x10,
+            session_max_x10,
+            next_cache: to_persist,
+        };
     }
 
     // 2. Completed planner step resolution & locking
@@ -715,11 +858,12 @@ pub fn resolve_output_speed(
     {
         if let Some(sc) = matching_cache {
             if sc.ended_at_ms == -1 && lp.step_index <= sc.step_index {
-                let clear_active = sc.active.is_some().then(|| SpeedCacheSnapshot {
-                    active: None,
-                    ..sc.clone()
-                });
-                return (None, clear_active);
+                return ResolvedSpeedOutput {
+                    current: None,
+                    session_min_x10,
+                    session_max_x10,
+                    next_cache: clear_active_snapshot(sc, session_min_x10, session_max_x10),
+                };
             }
             if sc.ended_at_ms > 0
                 && sc.step_index == lp.step_index
@@ -729,11 +873,12 @@ pub fn resolve_output_speed(
                     .ewma_tps_x10
                     .filter(|&v| (10..=5_000).contains(&v))
                     .unwrap_or(sc.tps_x10);
-                let clear_active = sc.active.is_some().then(|| SpeedCacheSnapshot {
-                    active: None,
-                    ..sc.clone()
-                });
-                return (Some((shown as f64 / 10.0, true)), clear_active);
+                return ResolvedSpeedOutput {
+                    current: Some((shown as f64 / 10.0, true)),
+                    session_min_x10,
+                    session_max_x10,
+                    next_cache: clear_active_snapshot(sc, session_min_x10, session_max_x10),
+                };
             }
         }
 
@@ -817,6 +962,7 @@ pub fn resolve_output_speed(
             });
 
             if let Some((sample_x10, end_ms, ttft_stripped)) = resolved_sample {
+                update_min_max_x10(&mut session_min_x10, &mut session_max_x10, sample_x10);
                 let ewma_x10 = if matching_cache.is_none()
                     && !ttft_stripped
                     && lp.output_tokens >= 1_500
@@ -836,28 +982,72 @@ pub fn resolve_output_speed(
                     ended_at_ms: end_ms,
                     tps_x10: sample_x10,
                     ewma_tps_x10: Some(ewma_x10),
+                    session_min_tps_x10: session_min_x10,
+                    session_max_tps_x10: session_max_x10,
                     short_anchor,
                     long_anchor,
                     active: None,
                 });
                 let to_persist = candidate.filter(|cand| speed_cache != Some(cand));
-                return (Some((ewma_x10 as f64 / 10.0, true)), to_persist);
+                return ResolvedSpeedOutput {
+                    current: Some((ewma_x10 as f64 / 10.0, true)),
+                    session_min_x10,
+                    session_max_x10,
+                    next_cache: to_persist,
+                };
             }
         }
     }
 
     if let Some(x10) = prev_ewma {
-        let clear_active =
-            matching_cache
-                .filter(|sc| sc.active.is_some())
-                .map(|sc| SpeedCacheSnapshot {
-                    active: None,
-                    ..sc.clone()
-                });
-        return (Some((x10 as f64 / 10.0, true)), clear_active);
+        let clear_active = matching_cache
+            .and_then(|sc| clear_active_snapshot(sc, session_min_x10, session_max_x10));
+        return ResolvedSpeedOutput {
+            current: Some((x10 as f64 / 10.0, true)),
+            session_min_x10,
+            session_max_x10,
+            next_cache: clear_active,
+        };
     }
 
-    (None, None)
+    ResolvedSpeedOutput {
+        current: None,
+        session_min_x10,
+        session_max_x10,
+        next_cache: None,
+    }
+}
+
+/// Resolves output generation throughput `(tokens_per_sec, is_estimated)` and returns an updated
+/// `SpeedCacheSnapshot` whenever live streaming milestones or completed `PLANNER_RESPONSE` steps
+/// should be persisted to disk.
+pub fn resolve_output_speed(
+    stdin: Option<&AgyStdinData>,
+    transcript: &TranscriptSummary,
+    speed_cache: Option<&SpeedCacheSnapshot>,
+    now_ms: i64,
+) -> (Option<(f64, bool)>, Option<SpeedCacheSnapshot>) {
+    let resolved = resolve_output_speed_inner(stdin, transcript, speed_cache, now_ms);
+    (resolved.current, resolved.next_cache)
+}
+
+/// Resolves output generation throughput together with session-wide min/max bounds derived from
+/// completed `PLANNER_RESPONSE` steps and native exact `stdin` telemetry.
+pub fn resolve_output_speed_display(
+    stdin: Option<&AgyStdinData>,
+    transcript: &TranscriptSummary,
+    speed_cache: Option<&SpeedCacheSnapshot>,
+    now_ms: i64,
+) -> Option<OutputSpeedDisplay> {
+    let resolved = resolve_output_speed_inner(stdin, transcript, speed_cache, now_ms);
+    resolved
+        .current
+        .map(|(current_tps, estimated)| OutputSpeedDisplay {
+            current_tps,
+            estimated,
+            min_tps: resolved.session_min_x10.map(|x| x as f64 / 10.0),
+            max_tps: resolved.session_max_x10.map(|x| x as f64 / 10.0),
+        })
 }
 
 pub fn apply_speed_cache(
@@ -866,8 +1056,10 @@ pub fn apply_speed_cache(
     speed_cache: Option<&SpeedCacheSnapshot>,
     now_ms: i64,
 ) -> Option<SpeedCacheSnapshot> {
-    let (resolved, next_cache) = resolve_output_speed(stdin, transcript, speed_cache, now_ms);
-    match resolved {
+    let resolved = resolve_output_speed_inner(stdin, transcript, speed_cache, now_ms);
+    transcript.session_min_tps_x10 = resolved.session_min_x10;
+    transcript.session_max_tps_x10 = resolved.session_max_x10;
+    match resolved.current {
         Some((tps, true)) => {
             let x10 = (tps * 10.0).round() as u32;
             if (10..=5_000).contains(&x10) {
@@ -877,7 +1069,10 @@ pub fn apply_speed_cache(
         }
         None => {
             transcript.resolved_tps_x10 = None;
-            if next_cache.as_ref().is_some_and(|c| c.ended_at_ms == -1)
+            if resolved
+                .next_cache
+                .as_ref()
+                .is_some_and(|c| c.ended_at_ms == -1)
                 || speed_cache.is_some_and(|c| c.ended_at_ms == -1)
             {
                 transcript.completed_step_tps_x10 = None;
@@ -885,7 +1080,7 @@ pub fn apply_speed_cache(
         }
         Some((_, false)) => {}
     }
-    next_cache
+    resolved.next_cache
 }
 
 const COST_LEDGER_VERSION: u8 = 1;
@@ -1147,5 +1342,364 @@ mod tests {
         assert_eq!(hg.deleted, 2);
         assert_eq!(hg.untracked, 1);
         assert!(parse_hg_probe_output("", Some("")).is_none());
+    }
+
+    fn base_speed_stdin(conv_id: &str, model_id: &str, state: &str) -> AgyStdinData {
+        AgyStdinData {
+            conversation_id: Some(conv_id.to_string()),
+            agent_state: Some(state.to_string()),
+            model: Some(crate::types::ModelStdin {
+                id: Some(model_id.to_string()),
+                display_name: Some(model_id.to_string()),
+                effort: None,
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn planner_timing(
+        step_index: usize,
+        output_tokens: u64,
+        estimated_tokens: u64,
+        started_at_ms: i64,
+        is_done: bool,
+    ) -> crate::types::PlannerStepTiming {
+        crate::types::PlannerStepTiming {
+            step_index,
+            output_tokens,
+            estimated_tokens,
+            started_at_ms,
+            ended_at_ms: None,
+            has_trailing_user_input: false,
+            is_done,
+        }
+    }
+
+    #[test]
+    fn live_streaming_ticks_do_not_pollute_session_min_max() {
+        let base_ms = 1_794_200_000_000i64;
+        let mut stdin = base_speed_stdin("conv-live", "Gemini 4 Argon", "streaming");
+
+        // Step 1 streaming at ~200 tok/s live must not record min/max before completion
+        let mut tx1_stream = TranscriptSummary {
+            latest_planner_step: Some(planner_timing(1, 0, 3, base_ms, false)),
+            ..Default::default()
+        };
+        let c0 = apply_speed_cache(Some(&stdin), &mut tx1_stream, None, base_ms + 500)
+            .expect("records active decode start");
+        assert_eq!(tx1_stream.session_min_tps_x10, None);
+        assert_eq!(tx1_stream.session_max_tps_x10, None);
+
+        tx1_stream.latest_planner_step = Some(planner_timing(1, 0, 203, base_ms, false));
+        let c1 = apply_speed_cache(Some(&stdin), &mut tx1_stream, Some(&c0), base_ms + 1_500)
+            .expect("records live tps");
+        assert_eq!(c1.session_min_tps_x10, None);
+        assert_eq!(c1.session_max_tps_x10, None);
+        let disp_live1 =
+            resolve_output_speed_display(Some(&stdin), &tx1_stream, Some(&c1), base_ms + 1_500)
+                .expect("live speed available");
+        assert!(disp_live1.estimated);
+        assert!(disp_live1.current_tps >= 190.0);
+        assert_eq!(disp_live1.min_tps, None);
+        assert_eq!(disp_live1.max_tps, None);
+
+        // Step 1 completes at 100.0 tok/s (200 tokens over 2000 ms decode window)
+        stdin.agent_state = Some("idle".to_string());
+        let mut tx1_done = TranscriptSummary {
+            latest_planner_step: Some(planner_timing(1, 200, 200, base_ms, true)),
+            ..Default::default()
+        };
+        let locked1 = apply_speed_cache(Some(&stdin), &mut tx1_done, Some(&c1), base_ms + 2_500)
+            .expect("locks step 1");
+        assert_eq!(locked1.tps_x10, 1000);
+        assert_eq!(locked1.session_min_tps_x10, Some(1000));
+        assert_eq!(locked1.session_max_tps_x10, Some(1000));
+        assert_eq!(tx1_done.session_min_tps_x10, Some(1000));
+        assert_eq!(tx1_done.session_max_tps_x10, Some(1000));
+
+        // Step 2 streams with a huge live spike (~300 tok/s): min/max must remain locked at 100.0
+        stdin.agent_state = Some("streaming".to_string());
+        let mut tx2_stream = TranscriptSummary {
+            latest_planner_step: Some(planner_timing(2, 0, 3, base_ms + 10_000, false)),
+            ..Default::default()
+        };
+        let c2 = apply_speed_cache(
+            Some(&stdin),
+            &mut tx2_stream,
+            Some(&locked1),
+            base_ms + 10_200,
+        )
+        .expect("starts step 2 active sample");
+        tx2_stream.latest_planner_step = Some(planner_timing(2, 0, 303, base_ms + 10_000, false));
+        let c3 = apply_speed_cache(Some(&stdin), &mut tx2_stream, Some(&c2), base_ms + 11_200)
+            .expect("updates step 2 live tps");
+        assert_eq!(c3.session_min_tps_x10, Some(1000));
+        assert_eq!(c3.session_max_tps_x10, Some(1000));
+        let disp_live2 =
+            resolve_output_speed_display(Some(&stdin), &tx2_stream, None, base_ms + 11_200)
+                .expect("uses synced transcript state");
+        assert!(disp_live2.current_tps >= 250.0);
+        assert_eq!(disp_live2.min_tps, Some(100.0));
+        assert_eq!(disp_live2.max_tps, Some(100.0));
+
+        // Step 2 completes at 50.0 tok/s (150 tokens over 3000 ms decode): raw sample updates min to 50.0,
+        // even though EWMA stays above 50.0
+        stdin.agent_state = Some("idle".to_string());
+        let mut tx2_done = TranscriptSummary {
+            latest_planner_step: Some(planner_timing(2, 150, 150, base_ms + 10_000, true)),
+            ..Default::default()
+        };
+        let locked2 = apply_speed_cache(Some(&stdin), &mut tx2_done, Some(&c3), base_ms + 13_200)
+            .expect("locks step 2");
+        assert_eq!(locked2.tps_x10, 500);
+        assert!(locked2.ewma_tps_x10.unwrap() > 500);
+        assert_eq!(locked2.session_min_tps_x10, Some(500));
+        assert_eq!(locked2.session_max_tps_x10, Some(1000));
+
+        let disp_done2 =
+            resolve_output_speed_display(Some(&stdin), &tx2_done, None, base_ms + 13_200)
+                .expect("resolved display");
+        assert!(!disp_done2.current_tps.is_nan());
+        assert_eq!(disp_done2.min_tps, Some(50.0));
+        assert_eq!(disp_done2.max_tps, Some(100.0));
+    }
+
+    #[test]
+    fn native_stdin_exact_tps_updates_and_persists_session_min_max() {
+        let base_ms = 1_794_200_100_000i64;
+        let mut stdin = base_speed_stdin("conv-native", "Gemini 4 Argon", "idle");
+        stdin
+            .extra
+            .insert("output_tokens_per_sec".to_string(), serde_json::json!(45.0));
+
+        let mut tx = TranscriptSummary::default();
+        let sc1 = apply_speed_cache(Some(&stdin), &mut tx, None, base_ms)
+            .expect("persists native exact min/max");
+        assert_eq!(tx.session_min_tps_x10, Some(450));
+        assert_eq!(tx.session_max_tps_x10, Some(450));
+
+        // Same native reading does not rewrite cache
+        assert!(apply_speed_cache(Some(&stdin), &mut tx, Some(&sc1), base_ms + 300).is_none());
+
+        // Persisted native-only snapshot survives `parse_speed_cache_info`
+        let parsed1 = parse_speed_cache_info(&ProbeAnswers {
+            speed_cache: Some(serde_json::to_string(&sc1).unwrap()),
+            ..Default::default()
+        })
+        .expect("native cache survives deserialization");
+        assert_eq!(parsed1, sc1);
+
+        // Higher native speed via nested telemetry updates max (even > 500 tok/s)
+        stdin.extra.clear();
+        stdin.extra.insert(
+            "telemetry".to_string(),
+            serde_json::json!({ "outputTokensPerSec": 820.0 }),
+        );
+        let mut tx2 = TranscriptSummary::default();
+        let sc2 = apply_speed_cache(Some(&stdin), &mut tx2, Some(&parsed1), base_ms + 1_000)
+            .expect("updates max from native telemetry");
+        assert_eq!(tx2.session_min_tps_x10, Some(450));
+        assert_eq!(tx2.session_max_tps_x10, Some(8_200));
+
+        let disp = resolve_output_speed_display(Some(&stdin), &tx2, None, base_ms + 1_000)
+            .expect("native exact display");
+        assert_eq!(
+            disp,
+            OutputSpeedDisplay {
+                current_tps: 820.0,
+                estimated: false,
+                min_tps: Some(45.0),
+                max_tps: Some(820.0),
+            }
+        );
+
+        let parsed2 = parse_speed_cache_info(&ProbeAnswers {
+            speed_cache: Some(serde_json::to_string(&sc2).unwrap()),
+            ..Default::default()
+        })
+        .expect("high-rate native cache survives deserialization");
+        assert_eq!(parsed2.session_min_tps_x10, Some(450));
+        assert_eq!(parsed2.session_max_tps_x10, Some(8_200));
+
+        // Different session must not inherit `conv-native` bounds
+        let mut other_stdin = base_speed_stdin("conv-other", "Gemini 4 Argon", "idle");
+        other_stdin
+            .extra
+            .insert("output_tokens_per_sec".to_string(), serde_json::json!(60.0));
+        let mut other_tx = TranscriptSummary::default();
+        let _ = apply_speed_cache(
+            Some(&other_stdin),
+            &mut other_tx,
+            Some(&parsed2),
+            base_ms + 2_000,
+        );
+        assert_eq!(other_tx.session_min_tps_x10, Some(600));
+        assert_eq!(other_tx.session_max_tps_x10, Some(600));
+    }
+
+    #[test]
+    fn model_switch_preserves_session_min_max_while_resetting_ewma() {
+        let base_ms = 1_794_200_200_000i64;
+        let argon_stdin = base_speed_stdin("conv-switch", "Gemini 4 Argon", "idle");
+
+        // Turn 1 on Argon: 42.0 tok/s (from prior transcript step) and 112.0 tok/s (latest step)
+        let mut tx_argon = TranscriptSummary {
+            completed_step_tps_x10: Some(420),
+            session_min_tps_x10: Some(420),
+            session_max_tps_x10: Some(420),
+            latest_planner_step: Some(planner_timing(2, 1120, 1120, base_ms, true)),
+            ..Default::default()
+        };
+        let locked_argon =
+            apply_speed_cache(Some(&argon_stdin), &mut tx_argon, None, base_ms + 10_000)
+                .expect("locks Argon step 2 at 112.0 tok/s");
+        assert_eq!(locked_argon.tps_x10, 1120);
+        assert_eq!(locked_argon.session_min_tps_x10, Some(420));
+        assert_eq!(locked_argon.session_max_tps_x10, Some(1120));
+
+        // Mid-session switch to Flash while idle emits a barrier, clears EWMA/current speed,
+        // and preserves session min/max
+        let mut flash_stdin = base_speed_stdin("conv-switch", "Gemini 3 Flash", "idle");
+        let mut tx_switch = tx_argon.clone();
+        let barrier = apply_speed_cache(
+            Some(&flash_stdin),
+            &mut tx_switch,
+            Some(&locked_argon),
+            base_ms + 12_000,
+        )
+        .expect("writes model-switch barrier");
+        assert_eq!(barrier.ended_at_ms, -1);
+        assert_eq!(barrier.tps_x10, 0);
+        assert_eq!(barrier.ewma_tps_x10, None);
+        assert_eq!(barrier.session_min_tps_x10, Some(420));
+        assert_eq!(barrier.session_max_tps_x10, Some(1120));
+        assert_eq!(tx_switch.resolved_tps_x10, None);
+        assert_eq!(tx_switch.completed_step_tps_x10, None);
+        assert_eq!(tx_switch.session_min_tps_x10, Some(420));
+        assert_eq!(tx_switch.session_max_tps_x10, Some(1120));
+        assert!(
+            resolve_output_speed_display(
+                Some(&flash_stdin),
+                &tx_switch,
+                Some(&barrier),
+                base_ms + 12_000,
+            )
+            .is_none()
+        );
+
+        // Model-switch barrier survives `parse_speed_cache_info`
+        let parsed_barrier = parse_speed_cache_info(&ProbeAnswers {
+            speed_cache: Some(serde_json::to_string(&barrier).unwrap()),
+            ..Default::default()
+        })
+        .expect("model-switch barrier survives deserialization");
+        assert_eq!(parsed_barrier, barrier);
+
+        // Flash starts streaming with a fast live tick (~250 tok/s): live tick does not update max
+        flash_stdin.agent_state = Some("streaming".to_string());
+        let mut tx_flash_stream = TranscriptSummary {
+            latest_planner_step: Some(planner_timing(3, 0, 3, base_ms + 13_000, false)),
+            ..Default::default()
+        };
+        let flash_c0 = apply_speed_cache(
+            Some(&flash_stdin),
+            &mut tx_flash_stream,
+            Some(&parsed_barrier),
+            base_ms + 13_100,
+        )
+        .expect("records Flash decode start");
+        tx_flash_stream.latest_planner_step =
+            Some(planner_timing(3, 0, 253, base_ms + 13_000, false));
+        let flash_c1 = apply_speed_cache(
+            Some(&flash_stdin),
+            &mut tx_flash_stream,
+            Some(&flash_c0),
+            base_ms + 14_100,
+        )
+        .expect("records Flash live tick");
+        let disp_flash_live = resolve_output_speed_display(
+            Some(&flash_stdin),
+            &tx_flash_stream,
+            None,
+            base_ms + 14_100,
+        )
+        .expect("Flash live display");
+        assert!(disp_flash_live.current_tps >= 240.0);
+        assert_eq!(disp_flash_live.min_tps, Some(42.0));
+        assert_eq!(disp_flash_live.max_tps, Some(112.0));
+
+        // Flash step 3 finishes at 180.0 tok/s -> EWMA starts fresh at 180.0 and max expands to 180.0
+        flash_stdin.agent_state = Some("idle".to_string());
+        let mut tx_flash_done = TranscriptSummary {
+            latest_planner_step: Some(planner_timing(3, 180, 180, base_ms + 13_000, true)),
+            ..Default::default()
+        };
+        let locked_flash = apply_speed_cache(
+            Some(&flash_stdin),
+            &mut tx_flash_done,
+            Some(&flash_c1),
+            base_ms + 14_100,
+        )
+        .expect("locks Flash step 3");
+        assert_eq!(locked_flash.tps_x10, 1800);
+        assert_eq!(locked_flash.ewma_tps_x10, Some(1800));
+        assert_eq!(locked_flash.session_min_tps_x10, Some(420));
+        assert_eq!(locked_flash.session_max_tps_x10, Some(1800));
+
+        let disp_flash_done = resolve_output_speed_display(
+            Some(&flash_stdin),
+            &tx_flash_done,
+            None,
+            base_ms + 14_100,
+        )
+        .expect("Flash completed display");
+        assert_eq!(
+            disp_flash_done,
+            OutputSpeedDisplay {
+                current_tps: 180.0,
+                estimated: true,
+                min_tps: Some(42.0),
+                max_tps: Some(180.0),
+            }
+        );
+    }
+
+    #[test]
+    fn legacy_speed_cache_json_backward_compatibility() {
+        let legacy_json = r#"{
+            "sessionKey": "conv-legacy",
+            "modelKey": "Gemini 4 Argon",
+            "stepIndex": 4,
+            "outputTokens": 500,
+            "startedAtMs": 1000,
+            "endedAtMs": 6000,
+            "tpsX10": 1000,
+            "ewmaTpsX10": 950
+        }"#;
+        let parsed = parse_speed_cache_info(&ProbeAnswers {
+            speed_cache: Some(legacy_json.to_string()),
+            ..Default::default()
+        })
+        .expect("legacy cache parses cleanly");
+        assert_eq!(parsed.session_min_tps_x10, None);
+        assert_eq!(parsed.session_max_tps_x10, None);
+
+        // Empty/zero non-barrier snapshot without active or range must still be rejected
+        let empty_zero = r#"{
+            "sessionKey": "conv-legacy",
+            "modelKey": "",
+            "stepIndex": 0,
+            "outputTokens": 0,
+            "startedAtMs": 0,
+            "endedAtMs": 0,
+            "tpsX10": 0
+        }"#;
+        assert!(
+            parse_speed_cache_info(&ProbeAnswers {
+                speed_cache: Some(empty_zero.to_string()),
+                ..Default::default()
+            })
+            .is_none()
+        );
     }
 }

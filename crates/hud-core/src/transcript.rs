@@ -395,6 +395,35 @@ fn has_nonzero_exit_code(content: &str) -> bool {
     false
 }
 
+pub(crate) const MIN_VALID_TPS_X10: u32 = 1;
+pub(crate) const MAX_VALID_TPS_X10: u32 = 20_000;
+
+pub(crate) fn update_min_max_x10(
+    min_slot: &mut Option<u32>,
+    max_slot: &mut Option<u32>,
+    sample_x10: u32,
+) {
+    if !(MIN_VALID_TPS_X10..=MAX_VALID_TPS_X10).contains(&sample_x10) {
+        return;
+    }
+    *min_slot = Some(min_slot.map_or(sample_x10, |m| m.min(sample_x10)));
+    *max_slot = Some(max_slot.map_or(sample_x10, |m| m.max(sample_x10)));
+}
+
+pub(crate) fn merge_min_max_pair_x10(
+    min_slot: &mut Option<u32>,
+    max_slot: &mut Option<u32>,
+    other_min: Option<u32>,
+    other_max: Option<u32>,
+) {
+    if let Some(v) = other_min {
+        update_min_max_x10(min_slot, max_slot, v);
+    }
+    if let Some(v) = other_max {
+        update_min_max_x10(min_slot, max_slot, v);
+    }
+}
+
 pub fn compute_tps_x10(output_tokens: u64, dt_ms: i64) -> Option<u32> {
     if output_tokens < 20 || !(400..=180_000).contains(&dt_ms) {
         return None;
@@ -584,6 +613,8 @@ struct StepAccumulator {
     subagents: Vec<SubagentEntry>,
     active_slash_mode: Option<String>,
     completed_step_tps_x10: Option<u32>,
+    session_min_tps_x10: Option<u32>,
+    session_max_tps_x10: Option<u32>,
     short_anchor: Option<SpeedAnchorPoint>,
     long_anchor: Option<SpeedAnchorPoint>,
     latest_planner_step: Option<PlannerStepTiming>,
@@ -608,6 +639,8 @@ impl StepAccumulator {
                 subagents: Vec::new(),
                 active_slash_mode: None,
                 completed_step_tps_x10: None,
+                session_min_tps_x10: None,
+                session_max_tps_x10: None,
                 short_anchor: None,
                 long_anchor: None,
                 latest_planner_step: None,
@@ -632,6 +665,15 @@ impl StepAccumulator {
             mcp_last_status.insert(srv.clone(), st);
         }
 
+        let mut session_min_tps_x10 = None;
+        let mut session_max_tps_x10 = None;
+        merge_min_max_pair_x10(
+            &mut session_min_tps_x10,
+            &mut session_max_tps_x10,
+            c.session_min_tps_x10,
+            c.session_max_tps_x10,
+        );
+
         Self {
             session_started_at: c.session_started_at.or(head_started_at),
             skills_vec: c.skills.clone(),
@@ -643,6 +685,8 @@ impl StepAccumulator {
             subagents: c.subagents.clone(),
             active_slash_mode: c.active_slash_mode.clone(),
             completed_step_tps_x10: c.completed_step_tps_x10,
+            session_min_tps_x10,
+            session_max_tps_x10,
             short_anchor: c.short_anchor,
             long_anchor: c.long_anchor,
             latest_planner_step: c.latest_planner_step.clone(),
@@ -758,6 +802,11 @@ impl StepAccumulator {
                             out_tok,
                             false,
                         ));
+                        update_min_max_x10(
+                            &mut self.session_min_tps_x10,
+                            &mut self.session_max_tps_x10,
+                            sample_x10,
+                        );
                     }
                 }
 
@@ -916,6 +965,8 @@ impl StepAccumulator {
             mcp_last_error,
             active_slash_mode: self.active_slash_mode.clone(),
             completed_step_tps_x10: self.completed_step_tps_x10,
+            session_min_tps_x10: self.session_min_tps_x10,
+            session_max_tps_x10: self.session_max_tps_x10,
             short_anchor: self.short_anchor,
             long_anchor: self.long_anchor,
             latest_planner_step: self.latest_planner_step.clone(),
@@ -999,6 +1050,8 @@ impl StepAccumulator {
             active_slash_mode: self.active_slash_mode,
             completed_step_tps_x10: self.completed_step_tps_x10,
             resolved_tps_x10: None,
+            session_min_tps_x10: self.session_min_tps_x10,
+            session_max_tps_x10: self.session_max_tps_x10,
             short_anchor: self.short_anchor,
             long_anchor: self.long_anchor,
             latest_planner_step: self.latest_planner_step,
@@ -1427,5 +1480,153 @@ mod tests {
         let (summary_stale, _) =
             parse_transcript_with_cursor(Some(&stale_v1), head, Some(&full), 0, None, None);
         assert_eq!(summary_stale.compaction_count, 2);
+    }
+
+    #[test]
+    fn completed_steps_track_session_min_max_and_cursor_roundtrip() {
+        let part1_steps = [
+            json!({
+                "step_index": 0,
+                "source": "USER_EXPLICIT",
+                "type": "USER_INPUT",
+                "status": "DONE",
+                "created_at": "2026-11-09T04:00:00Z",
+                "content": "Measure step speed bounds"
+            }),
+            json!({
+                "step_index": 1,
+                "source": "MODEL",
+                "type": "PLANNER_RESPONSE",
+                "status": "DONE",
+                "created_at": "2026-11-09T04:00:01Z",
+                "output_tokens": 420
+            }),
+            json!({
+                "step_index": 2,
+                "source": "MODEL",
+                "type": "GENERIC",
+                "status": "DONE",
+                "created_at": "2026-11-09T04:00:11Z",
+                "content": "ok"
+            }),
+            json!({
+                "step_index": 3,
+                "source": "MODEL",
+                "type": "PLANNER_RESPONSE",
+                "status": "DONE",
+                "created_at": "2026-11-09T04:00:12Z",
+                "output_tokens": 1120
+            }),
+            json!({
+                "step_index": 4,
+                "source": "MODEL",
+                "type": "GENERIC",
+                "status": "DONE",
+                "created_at": "2026-11-09T04:00:22Z",
+                "content": "ok"
+            }),
+            json!({
+                "step_index": 5,
+                "source": "MODEL",
+                "type": "PLANNER_RESPONSE",
+                "status": "RUNNING",
+                "created_at": "2026-11-09T04:00:23Z",
+                "content": "Streaming response in progress"
+            }),
+        ];
+        let part1 = part1_steps
+            .iter()
+            .map(serde_json::to_string)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+            .join("\n")
+            + "\n";
+        let head = part1.lines().next();
+
+        let (summary1, cursor1) =
+            parse_transcript_with_cursor(None, head, Some(&part1), 0, None, None);
+        assert_eq!(summary1.session_min_tps_x10, Some(420));
+        assert_eq!(summary1.session_max_tps_x10, Some(1120));
+
+        let cur1 = cursor1.expect("cursor emitted before in-flight step 5");
+        assert_eq!(cur1.session_min_tps_x10, Some(420));
+        assert_eq!(cur1.session_max_tps_x10, Some(1120));
+
+        let cursor_json = serde_json::to_string(&cur1).unwrap();
+        let decoded_cur1: TranscriptCursor = serde_json::from_str(&cursor_json).unwrap();
+        assert_eq!(decoded_cur1, cur1);
+
+        // Legacy cursor JSON without sessionMinTpsX10/sessionMaxTpsX10 deserializes cleanly
+        let legacy_json = r#"{"version":2,"offset":0}"#;
+        let legacy_cur: TranscriptCursor = serde_json::from_str(legacy_json).unwrap();
+        assert_eq!(legacy_cur.session_min_tps_x10, None);
+        assert_eq!(legacy_cur.session_max_tps_x10, None);
+
+        // Resume incrementally from `decoded_cur1.offset` with a middle-speed step (80 tok/s)
+        // and a faster step (150 tok/s), plus an in-flight step that must not affect min/max.
+        let committed_prefix = &part1[..decoded_cur1.offset as usize];
+        let tail_steps = [
+            json!({
+                "step_index": 5,
+                "source": "MODEL",
+                "type": "PLANNER_RESPONSE",
+                "status": "DONE",
+                "created_at": "2026-11-09T04:00:23Z",
+                "output_tokens": 800
+            }),
+            json!({
+                "step_index": 6,
+                "source": "MODEL",
+                "type": "GENERIC",
+                "status": "DONE",
+                "created_at": "2026-11-09T04:00:33Z",
+                "content": "ok"
+            }),
+            json!({
+                "step_index": 7,
+                "source": "MODEL",
+                "type": "PLANNER_RESPONSE",
+                "status": "DONE",
+                "created_at": "2026-11-09T04:00:34Z",
+                "output_tokens": 1500
+            }),
+            json!({
+                "step_index": 8,
+                "source": "MODEL",
+                "type": "GENERIC",
+                "status": "DONE",
+                "created_at": "2026-11-09T04:00:44Z",
+                "content": "ok"
+            }),
+            json!({
+                "step_index": 9,
+                "source": "MODEL",
+                "type": "PLANNER_RESPONSE",
+                "status": "RUNNING",
+                "created_at": "2026-11-09T04:00:45Z",
+                "content": "Still streaming"
+            }),
+        ];
+        let delta = tail_steps
+            .iter()
+            .map(serde_json::to_string)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+            .join("\n")
+            + "\n";
+        let full = format!("{committed_prefix}{delta}");
+        let (summary2, cursor2) = parse_transcript_with_cursor(
+            Some(&decoded_cur1),
+            head,
+            Some(&full[decoded_cur1.offset as usize..]),
+            decoded_cur1.offset,
+            None,
+            None,
+        );
+        assert_eq!(summary2.session_min_tps_x10, Some(420));
+        assert_eq!(summary2.session_max_tps_x10, Some(1500));
+        let cur2 = cursor2.expect("cursor advances past completed steps 5..=8");
+        assert_eq!(cur2.session_min_tps_x10, Some(420));
+        assert_eq!(cur2.session_max_tps_x10, Some(1500));
     }
 }

@@ -685,6 +685,8 @@ fn sample_presets(now_ms: i64) -> HashMap<&'static str, SamplePreset> {
         active_slash_mode: None,
         completed_step_tps_x10: Some(640),
         resolved_tps_x10: None,
+        session_min_tps_x10: None,
+        session_max_tps_x10: None,
         short_anchor: None,
         long_anchor: None,
         latest_planner_step: None,

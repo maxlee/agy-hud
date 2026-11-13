@@ -418,6 +418,10 @@ pub struct TranscriptSummary {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub resolved_tps_x10: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub session_min_tps_x10: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub session_max_tps_x10: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
     pub short_anchor: Option<SpeedAnchorPoint>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub long_anchor: Option<SpeedAnchorPoint>,
@@ -562,6 +566,10 @@ pub struct TranscriptCursor {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub completed_step_tps_x10: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub session_min_tps_x10: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub session_max_tps_x10: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
     pub short_anchor: Option<SpeedAnchorPoint>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub long_anchor: Option<SpeedAnchorPoint>,
@@ -614,6 +622,10 @@ pub struct SpeedCacheSnapshot {
     pub tps_x10: u32,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub ewma_tps_x10: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub session_min_tps_x10: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub session_max_tps_x10: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub short_anchor: Option<SpeedAnchorPoint>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
