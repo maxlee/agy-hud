@@ -615,12 +615,20 @@ fn resolve_output_speed_inner(
         transcript.session_max_tps_x10,
     );
     if let Some(sc) = same_session_cache {
-        merge_min_max_pair_x10(
-            &mut session_min_x10,
-            &mut session_max_x10,
-            sc.session_min_tps_x10,
-            sc.session_max_tps_x10,
-        );
+        if sc.session_min_tps_x10.is_none()
+            && sc.session_max_tps_x10.is_none()
+            && sc.ended_at_ms > 0
+            && (MIN_VALID_TPS_X10..=MAX_VALID_TPS_X10).contains(&sc.tps_x10)
+        {
+            update_min_max_x10(&mut session_min_x10, &mut session_max_x10, sc.tps_x10);
+        } else {
+            merge_min_max_pair_x10(
+                &mut session_min_x10,
+                &mut session_max_x10,
+                sc.session_min_tps_x10,
+                sc.session_max_tps_x10,
+            );
+        }
     }
 
     if let Some(exact) = extract_native_stdin_tps(stdin) {
@@ -1683,6 +1691,65 @@ mod tests {
         .expect("legacy cache parses cleanly");
         assert_eq!(parsed.session_min_tps_x10, None);
         assert_eq!(parsed.session_max_tps_x10, None);
+
+        // Upgrading mid-session with legacy cache (`session_min/max == None`, `ended_at_ms > 0`)
+        // seeds session min/max from `sc.tps_x10` (100.0), not `ewma_tps_x10` (95.0).
+        let base_ms = 1_794_200_300_000i64;
+        let legacy_stdin = base_speed_stdin("conv-legacy", "Gemini 4 Argon", "idle");
+        let mut legacy_tx = TranscriptSummary {
+            latest_planner_step: Some(planner_timing(4, 500, 500, 1_000, true)),
+            ..Default::default()
+        };
+        let disp_upgraded =
+            resolve_output_speed_display(Some(&legacy_stdin), &legacy_tx, Some(&parsed), base_ms)
+                .expect("resolved display from legacy cache");
+        assert_eq!(
+            disp_upgraded,
+            OutputSpeedDisplay {
+                current_tps: 95.0,
+                estimated: true,
+                min_tps: Some(100.0),
+                max_tps: Some(100.0),
+            }
+        );
+        assert!(
+            apply_speed_cache(Some(&legacy_stdin), &mut legacy_tx, Some(&parsed), base_ms)
+                .is_none(),
+            "idle legacy locked step does not trigger spurious cache rewrite"
+        );
+        assert_eq!(legacy_tx.session_min_tps_x10, Some(1000));
+        assert_eq!(legacy_tx.session_max_tps_x10, Some(1000));
+
+        // Subsequent step (50.0 tok/s) merges with the seeded legacy step to persist (50.0~100.0)
+        let mut next_tx = TranscriptSummary {
+            latest_planner_step: Some(planner_timing(5, 50, 50, base_ms - 1_000, true)),
+            ..Default::default()
+        };
+        let upgraded_next =
+            apply_speed_cache(Some(&legacy_stdin), &mut next_tx, Some(&parsed), base_ms)
+                .expect("locks step 5 with seeded legacy min/max");
+        assert_eq!(upgraded_next.tps_x10, 500);
+        assert_eq!(upgraded_next.session_min_tps_x10, Some(500));
+        assert_eq!(upgraded_next.session_max_tps_x10, Some(1000));
+        assert_eq!(next_tx.session_min_tps_x10, Some(500));
+        assert_eq!(next_tx.session_max_tps_x10, Some(1000));
+
+        // Mid-session model switch straight after upgrade preserves seeded `sc.tps_x10` in barrier
+        let switch_stdin = base_speed_stdin("conv-legacy", "Gemini 3 Flash", "idle");
+        let mut switch_tx = TranscriptSummary {
+            latest_planner_step: Some(planner_timing(4, 500, 500, 1_000, true)),
+            ..Default::default()
+        };
+        let barrier = apply_speed_cache(
+            Some(&switch_stdin),
+            &mut switch_tx,
+            Some(&parsed),
+            base_ms + 1_000,
+        )
+        .expect("emits barrier preserving seeded legacy min/max");
+        assert_eq!(barrier.ended_at_ms, -1);
+        assert_eq!(barrier.session_min_tps_x10, Some(1000));
+        assert_eq!(barrier.session_max_tps_x10, Some(1000));
 
         // Empty/zero non-barrier snapshot without active or range must still be rejected
         let empty_zero = r#"{
