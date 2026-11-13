@@ -832,4 +832,43 @@ mod tests {
             "Gemini 4 Argon"
         );
     }
+
+    #[test]
+    fn speed_tier_emojis_have_exact_two_column_width_and_safe_truncation() {
+        for emoji in ["🐢", "🚲", "🏍", "🏍️", "🚗", "🚄", "✈️", "🚀"] {
+            assert_eq!(
+                graphemes(emoji).count(),
+                1,
+                "Expected 1 grapheme cluster for {emoji:?}"
+            );
+            assert_eq!(
+                grapheme_width(emoji),
+                2,
+                "Expected grapheme_width == 2 for {emoji:?}"
+            );
+            assert_eq!(
+                text_width(emoji),
+                2,
+                "Expected text_width == 2 for {emoji:?}"
+            );
+            assert_eq!(
+                text_width(&format!("{emoji} ~68 tok/s (42~112)")),
+                21,
+                "Expected full badge width == 21 for {emoji:?}"
+            );
+        }
+
+        // Truncating around variation-selector emojis must never split base char from U+FE0F
+        for sample in ["✈️ ~260 tok/s", "🏍️ ~120 tok/s"] {
+            for max_w in 1..=6 {
+                let clipped = truncate_ansi(sample, max_w);
+                let plain = strip_ansi(&clipped);
+                assert!(text_width(&clipped) <= max_w);
+                assert!(!plain.starts_with('\u{fe0f}'));
+                if plain.contains('\u{fe0f}') {
+                    assert!(plain.contains('\u{2708}') || plain.contains('\u{1f3cd}'));
+                }
+            }
+        }
+    }
 }
