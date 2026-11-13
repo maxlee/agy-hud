@@ -1084,6 +1084,7 @@ pub fn apply_speed_cache(
                 || speed_cache.is_some_and(|c| c.ended_at_ms == -1)
             {
                 transcript.completed_step_tps_x10 = None;
+                transcript.latest_planner_step = None;
             }
         }
         Some((_, false)) => {}
@@ -1583,8 +1584,13 @@ mod tests {
         assert_eq!(barrier.session_max_tps_x10, Some(1120));
         assert_eq!(tx_switch.resolved_tps_x10, None);
         assert_eq!(tx_switch.completed_step_tps_x10, None);
+        assert_eq!(tx_switch.latest_planner_step, None);
         assert_eq!(tx_switch.session_min_tps_x10, Some(420));
         assert_eq!(tx_switch.session_max_tps_x10, Some(1120));
+        assert!(
+            resolve_output_speed_display(Some(&flash_stdin), &tx_switch, None, base_ms + 12_000)
+                .is_none()
+        );
         assert!(
             resolve_output_speed_display(
                 Some(&flash_stdin),
@@ -1602,6 +1608,39 @@ mod tests {
         })
         .expect("model-switch barrier survives deserialization");
         assert_eq!(parsed_barrier, barrier);
+
+        // Subsequent idle render with freshly parsed transcript + persisted barrier cache
+        // suppresses the old Argon step even when `render` passes `speed_cache = None`
+        let mut tx_switch_idle = TranscriptSummary {
+            completed_step_tps_x10: Some(420),
+            session_min_tps_x10: Some(420),
+            session_max_tps_x10: Some(420),
+            latest_planner_step: Some(planner_timing(2, 1120, 1120, base_ms, true)),
+            ..Default::default()
+        };
+        assert!(
+            apply_speed_cache(
+                Some(&flash_stdin),
+                &mut tx_switch_idle,
+                Some(&parsed_barrier),
+                base_ms + 12_500,
+            )
+            .is_none()
+        );
+        assert_eq!(tx_switch_idle.resolved_tps_x10, None);
+        assert_eq!(tx_switch_idle.completed_step_tps_x10, None);
+        assert_eq!(tx_switch_idle.latest_planner_step, None);
+        assert_eq!(tx_switch_idle.session_min_tps_x10, Some(420));
+        assert_eq!(tx_switch_idle.session_max_tps_x10, Some(1120));
+        assert!(
+            resolve_output_speed_display(
+                Some(&flash_stdin),
+                &tx_switch_idle,
+                None,
+                base_ms + 12_500,
+            )
+            .is_none()
+        );
 
         // Flash starts streaming with a fast live tick (~250 tok/s): live tick does not update max
         flash_stdin.agent_state = Some("streaming".to_string());
