@@ -29,7 +29,7 @@
 ### Standard Multi-Row Expanded Layout (`76–179` cols)
 
 ```text
-╭─ 🔧 TOOL │ [AUTO] │ [Gemini 4 Argon · med] Pro · ~118 tok/s │ agy-hud git:(feat/rust-hud* ↑2) │ ⏱ 12m
+╭─ 🔧 TOOL │ [AUTO] │ [Gemini 4 Argon · med] Pro · 🏍 ~118 tok/s (64~142) │ agy-hud git:(feat/rust-hud* ↑2) │ ⏱ 12m
 ├─ Ctx ████▓··· 59.3% (152k/256k · ↻2) · ⚡ 75% Cache │ ~$0.38 · agents 1/2 · tasks 1 · art 2 · 🛡 Sandbox ON
 ├─ Quota(weekly) ▓···· 16% (4d 18h)
 ├─ ◐ run_command: Cargo test execution · ✓ edit_file ×2: render.rs · ✓ read_file ×5: SKILL.md
@@ -42,7 +42,7 @@
 
 ```text
 # Ultra-wide terminal (>= 180 cols, idle) — collapses cleanly into one crisp line:
-✓ IDLE │ [AUTO] │ [Gemini 4 Argon · med] Pro · ~118 tok/s │ agy-hud git:(main) │ ⏱ 5m │ Ctx ███████····· 59.3% (152k/256k) · ⚡ 75% Cache │ Quota(weekly) ▓···· 16% (4d 18h)
+✓ IDLE │ [AUTO] │ [Gemini 4 Argon · med] Pro · 🏍 ~118 tok/s (64~142) │ agy-hud git:(main) │ ⏱ 5m │ Ctx ███████····· 59.3% (152k/256k) · ⚡ 75% Cache │ Quota(weekly) ▓···· 16% (4d 18h)
 
 # Narrow split pane (< 76 cols, high context) — progressive degradation without wrapping:
 ⚡ WORK │ [AUTO] │ [Argon · M] │ agy-hud git:(main*)
@@ -55,7 +55,7 @@ Ctx ███████░ 89.6% !200k │ Quota(weekly) 92% (1h 30m)
 | Row / Segment | What It Shows | Key Config Toggle |
 | :--- | :--- | :--- |
 | **State & Mode** | Live `IDLE` / `WORK` / `TOOL` / `CONFIRM` state, `[PLAN]` / `[AUTO]` / `[ACCEPT]` cycle mode (plus `/plan` detection & `VIM` mode badge) | `display.showState`, `display.showMode` |
-| **Model, Tier & Speed** | Compact model name, reasoning effort (`low`/`med`/`high`), normalized plan tier (`Pro`/`Ultra`), and TTFT-stripped `~tok/s` decode rate | `display.showModel`, `display.showPlanTier`, `display.showSpeed` |
+| **Model, Tier & Speed** | Compact model name, reasoning effort (`low`/`med`/`high`), normalized plan tier (`Pro`/`Ultra`), and TTFT-stripped `~tok/s` decode rate with speed-tier emoji (`🐢`/`🚲`/`🏍`/`🚗`/`🚄`/`✈️`/`🚀`, hidden in `ascii` mode) and session `(min~max)` range | `display.showModel`, `display.showPlanTier`, `display.showSpeed`, `display.glyphMode` |
 | **Workspace & VCS** | Clickable `file://` OSC 8 project path (plus optional `project › subdir` breadcrumb), clickable GitHub branch OSC 8 links, `git` (worktrees, dirty, unpushed `↑N` thresholds, file stats), `jj` (bookmarks, `@change_id`, conflicts), or `hg` | `display.showProject`, `display.showLaunchDir`, `vcs.pushWarningThreshold`, `vcs.showFileStats` |
 | **Context & Meta** | Compaction-watermark-scaled (`256k`) 8th-block Unicode context bar + `↻N` auto-compaction counter badge, `200k+` alert, prompt `Cache` hit %, session/daily/weekly cost (`Today` / `Week`), subagent/task/artifact counts, Sandbox badge | `display.contextScale`, `display.showContextBar`, `display.showDailyCost`, `display.showWeeklyCost` |
 | **Quota Pace** | Model-routed quota buckets (`5h` / `weekly`), burn-rate projection (`▲` pace alert when projected > 90% / > 100% before reset), optional low-usage threshold hiding, and reset countdown | `display.showQuota`, `display.quotaPace`, `display.quotaThreshold`, `quota.backgroundRefresh` |
@@ -66,7 +66,7 @@ Ctx ███████░ 89.6% !200k │ Quota(weekly) 92% (1h 30m)
 ## ✨ Highlights
 
 - **⚡ Native ~1–3 ms Warm Execution + Incremental `O(Δ)` Cursor**: Single LTO-optimized binary (`~930 KB`), zero VM startup overhead, `std::thread::scope` parallel probes, and an incremental `transcript.jsonl` byte-offset cursor (`transcript-cursors/<fnv64>.json`) that preserves early skills/MCP/tool counts even in multi-megabyte sessions.
-- **🎯 Hybrid TTFT-Stripped `~tok/s` & Quota Burn-Rate (`▲`)**: Separates `thinking`/prefill latency (`TTFT`) and tool wait time from pure streaming decode throughput, while `display.quotaPace` projects `5h`/`weekly` quota burn velocity (`▲` amber/red warning before you hit 0%) and `display.showDailyCost` / `showWeeklyCost` tracks cross-session spend without double counting.
+- **🎯 Hybrid TTFT-Stripped `~tok/s` & Quota Burn-Rate (`▲`)**: Separates `thinking`/prefill latency (`TTFT`) and tool wait time from pure streaming decode throughput, displaying a speed-tier emoji (`🐢` `<50`, `🚲` `50–99`, `🏍` `100–149`, `🚗` `150–199`, `🚄` `200–249`, `✈️` `250–299`, `🚀` `300+`; hidden when `display.glyphMode=ascii`) and session `(min~max)` range from completed steps / native `stdin` rates (preserved across model switches, shown once two distinct rounded speeds exist; toggled via `display.showSpeed`). Meanwhile `display.quotaPace` projects `5h`/`weekly` quota burn velocity (`▲` amber/red warning before you hit 0%) and `display.showDailyCost` / `showWeeklyCost` tracks cross-session spend without double counting.
 - **🎨 Theme-Safe, Grapheme-Cluster-Accurate & Composable Layout**: Zero hardcoded white (`37m`/`97m`) or gray (`90m`) foreground codes. Full Unicode extended grapheme cluster width engine (ZWJ emoji sequences, skin-tone modifiers, regional flag pairs, CJK 2-col alignment), `display.mergeGroups` + `display.rightAlign` row composition, and 3 glyph sets (`unicode`, `nerd`, `ascii`).
 - **🌿 Hardened `git`, `jj` & `hg` Support**: Windows `CreateProcessW` `PATH`-hijack protection, scope-aware Git `[include]` filter neutralization (preserving global `git-lfs` while disarming untrusted repo filters, with zero-subprocess `.git/HEAD` fallback), clickable GitHub branch OSC 8 links, unpushed `↑N` thresholds, and FNV-1a sharded `mtime` caches.
 - **🔄 Built-in Verified Self-Update**: Non-blocking 6-hour release check surfaces a subtle header badge (`↑ vX.Y.Z · /agy-hud:hud-update`) and upgrades in one SHA-256-verified step while preserving `--stack` and user `config.json`.
@@ -180,7 +180,7 @@ Invoke via `~/.gemini/antigravity-cli/agy-hud/bin/agy-hud` (or `./scripts/agy-hu
 # Switch glyph mode: unicode (default) | nerd (Nerd Fonts) | ascii (strict 7-bit)
 ~/.gemini/antigravity-cli/agy-hud/bin/agy-hud set display.glyphMode=nerd
 
-# Customize header badges (conversation title, plan tier, ~tok/s throughput, project folder)
+# Customize header badges (conversation title, plan tier, ~tok/s speed tier & min~max range, project folder)
 ~/.gemini/antigravity-cli/agy-hud/bin/agy-hud set display.showTitle=true display.showSpeed=true
 ~/.gemini/antigravity-cli/agy-hud/bin/agy-hud set display.showProject=false vcs.enabled=true
 

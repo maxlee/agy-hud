@@ -29,7 +29,7 @@
 ### 标准多行展开布局（`76–179` 列）
 
 ```text
-╭─ 🔧 调用工具 │ [自动] │ [Gemini 4 Argon · med] Pro · ~118 tok/s │ agy-hud git:(feat/rust-hud* ↑2) │ ⏱ 12m
+╭─ 🔧 调用工具 │ [自动] │ [Gemini 4 Argon · med] Pro · 🏍 ~118 tok/s (64~142) │ agy-hud git:(feat/rust-hud* ↑2) │ ⏱ 12m
 ├─ 上下文 ████▓··· 59.3% (152k/256k · ↻2) · ⚡ 75% 缓存 │ ~$0.38 · 子代理 1/2 · 后台 1 · 产物 2 · 🛡 沙箱开启
 ├─ 配额(weekly) ▓···· 16% (4d 18h)
 ├─ ◐ run_command: Cargo test execution · ✓ edit_file ×2: render.rs · ✓ read_file ×5: SKILL.md
@@ -42,7 +42,7 @@
 
 ```text
 # 超宽屏（>= 180 列，空闲状态）—— 自动折叠为清爽单行：
-✓ 空闲 │ [自动] │ [Gemini 4 Argon · med] Pro · ~118 tok/s │ agy-hud git:(main) │ ⏱ 5m │ 上下文 ███████····· 59.3% (152k/256k) · ⚡ 75% 缓存 │ 配额(weekly) ▓···· 16% (4d 18h)
+✓ 空闲 │ [自动] │ [Gemini 4 Argon · med] Pro · 🏍 ~118 tok/s (64~142) │ agy-hud git:(main) │ ⏱ 5m │ 上下文 ███████····· 59.3% (152k/256k) · ⚡ 75% 缓存 │ 配额(weekly) ▓···· 16% (4d 18h)
 
 # 窄终端分屏（< 76 列，高上下文预警）—— 渐进式优雅降级，绝不折行错乱：
 ⚡ 思考中 │ [自动] │ [Argon · M] │ agy-hud git:(main*)
@@ -55,7 +55,7 @@
 | 模块区域 | 展示内容 | 常用配置开关 |
 | :--- | :--- | :--- |
 | **运行状态与模式** | 实时 `空闲` / `思考中` / `调用工具` / `等待确认` 状态，`[计划]` / `[自动]` / `[接受]` 模式（自动识别 `/plan` 与 `VIM` 模式徽章） | `display.showState`, `display.showMode` |
-| **模型、档位与速率** | 模型简称、推理强度（`low`/`med`/`high`）、订阅档位（`Pro`/`Ultra`）以及剥离 `TTFT` 的真实生成速率 `~tok/s` | `display.showModel`, `display.showPlanTier`, `display.showSpeed` |
+| **模型、档位与速率** | 模型简称、推理强度（`low`/`med`/`high`）、订阅档位（`Pro`/`Ultra`），以及剥离 `TTFT` 的真实生成速率 `~tok/s`、速度分档图标（`🐢`/`🚲`/`🏍`/`🚗`/`🚄`/`✈️`/`🚀`，`ascii` 模式下自动隐藏）与会话 `(min~max)` 速率区间 | `display.showModel`, `display.showPlanTier`, `display.showSpeed`, `display.glyphMode` |
 | **项目路径与 VCS** | 支持点击跳转的 `file://` OSC 8 目录链接（含可选 `项目根 › 子目录` 面包屑）、GitHub 分支点击跳转、`git`（含 Worktree、脏标记、`↑N` 未推送阈值变色、文件增删）、`jj` 与 `hg` | `display.showProject`, `display.showLaunchDir`, `vcs.pushWarningThreshold`, `vcs.showFileStats` |
 | **上下文与跨会话账本** | 对齐 `256k` 自动会话压缩水位线的 1/8 精细进度条 + `↻N` 会话压缩计数徽章、`200k+` 阈值告警、Prompt `Cache` 命中率、当前/今日/本周累计花费（`今日` / `本周`）、子代理/后台任务/产物计数、沙箱徽章 | `display.contextScale`, `display.showContextBar`, `display.showDailyCost`, `display.showWeeklyCost` |
 | **配额消耗速率（Pace）** | 按当前模型智能路由配额桶（`5h` / `weekly`），实时预测重置前耗尽风险（`▲` 增速预警）、低占用自动隐藏阈值及重置倒计时 | `display.showQuota`, `display.quotaPace`, `display.quotaThreshold`, `quota.backgroundRefresh` |
@@ -66,7 +66,7 @@
 ## ✨ 核心特性
 
 - **⚡ 原生 ~1–3 ms 极致性能 + `O(Δ)` 增量游标**：LTO 裁剪后单二进制体积仅 `~930 KB`，无任何虚拟机冷启动开销；`std::thread::scope` 多线程并行采集，`transcript.jsonl` 支持增量字节偏移游标（`transcript-cursors/<fnv64>.json`），超长多 MB 会话依然完整保留早期激活的技能、MCP 与工具累计计数。
-- **🎯 混合毫秒级 `~tok/s` 测速与配额增速预警（`▲`）**：精确剥离 `thinking`/Prefill 首字延迟（`TTFT`）与工具等待时间；同时 `display.quotaPace` 根据时间窗口剩余比例智能预测配额耗尽速度（提前亮起琥珀/红色 `▲`），`display.showDailyCost` / `showWeeklyCost` 跨会话幂等汇总今日/本周开销。
+- **🎯 混合毫秒级 `~tok/s` 测速与配额增速预警（`▲`）**：精确剥离 `thinking`/Prefill 首字延迟（`TTFT`）与工具等待时间，并受 `display.showSpeed` 控制展示速度分档图标（`🐢` `<50`、`🚲` `50–99`、`🏍` `100–149`、`🚗` `150–199`、`🚄` `200–249`、`✈️` `250–299`、`🚀` `300+`；`display.glyphMode=ascii` 时隐藏）与会话 `(min~max)` 速率区间（由已完成步骤或原生 `stdin` 速率累积、跨模型切换保留、出现两个不同取整速率后展示）；同时 `display.quotaPace` 根据时间窗口剩余比例智能预测配额耗尽速度（提前亮起琥珀/红色 `▲`），`display.showDailyCost` / `showWeeklyCost` 跨会话幂等汇总今日/本周开销。
 - **🎨 完整字素簇宽度引擎与可组合布局**：零硬编码黑白灰前景色，深浅色主题通吃；纯 Rust 完整支持 Unicode Extended Grapheme Clusters（ZWJ 组合 Emoji、肤色修饰符、国旗双区域指示符、CJK 双列对齐），支持 `display.mergeGroups` 多行自由合并（窄屏自动堆叠并对齐中文进度条起始列）与 `display.rightAlign` 右对齐。
 - **🌿 纵深安全加固的 `git` / `jj` / `hg` 探针**：内置 Windows `CreateProcessW` 工作目录可执行劫持防御、作用域感知的 Git `[include]` 过滤器精准拆弹（保留全局 `git-lfs`，仅清空不可信仓库过滤器，异常过滤器名自动降级至零子进程 `.git/HEAD`）、GitHub 分支点击跳转与 `↑N` 未推送阈值变色提醒。
 - **🔄 内置 SHA-256 校验自更新**：每 6 小时后台静默检查新版本并在顶栏温和提示（`↑ vX.Y.Z · /agy-hud:hud-update`），一键校验升级并完整保留 `--stack` 与个性化配置。
@@ -179,9 +179,9 @@ agy plugin install .
 # 切换图标字符集：unicode（默认）| nerd（Nerd Fonts）| ascii（纯 7-bit 安全字符）
 ~/.gemini/antigravity-cli/agy-hud/bin/agy-hud set display.glyphMode=nerd
 
-# 独立隐藏目录名但保留 Git 分支显示，或开启会话标题显示
+# 独立隐藏目录名但保留 Git 分支显示，或自定义顶栏标题与 ~tok/s 速率徽章（分档图标 + min~max 区间）
 ~/.gemini/antigravity-cli/agy-hud/bin/agy-hud set display.showProject=false vcs.enabled=true
-~/.gemini/antigravity-cli/agy-hud/bin/agy-hud set display.showTitle=true
+~/.gemini/antigravity-cli/agy-hud/bin/agy-hud set display.showTitle=true display.showSpeed=true
 
 # 一键撤销上一次配置变更
 ~/.gemini/antigravity-cli/agy-hud/bin/agy-hud set --undo

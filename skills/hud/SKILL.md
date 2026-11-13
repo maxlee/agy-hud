@@ -60,12 +60,13 @@ Use `sh scripts/hud-cli.sh` (relative to this skill directory) to inspect, previ
      ```bash
      sh scripts/hud-cli.sh set language=zh-Hans vcs.showFileStats=true
      sh scripts/hud-cli.sh set display.contextScale=compaction
-     sh scripts/hud-cli.sh set display.glyphMode=ascii display.showTitle=true
+     sh scripts/hud-cli.sh set display.glyphMode=ascii display.showTitle=true display.showSpeed=true
      sh scripts/hud-cli.sh set display.showDailyCost=true display.showWeeklyCost=true display.showLaunchDir=true
      sh scripts/hud-cli.sh set display.quotaPace=true display.quotaThreshold=25 vcs.pushWarningThreshold=5
      sh scripts/hud-cli.sh set 'display.mergeGroups=[["context","quota"]]' 'display.rightAlign=["quota"]'
      sh scripts/hud-cli.sh set quota.backgroundRefresh=true
      ```
+   - Speed badge (`display.showSpeed`): shows speed-tier emoji + `~tok/s` + session `(min~max)` range (`display.glyphMode=ascii` omits the emoji).
    - Manually refresh the official `/usage` quota cache on demand:
      ```bash
      sh scripts/hud-cli.sh quota refresh
