@@ -824,7 +824,7 @@ fn output_speed_estimation_idle_cache_locking_and_header_badge() {
     });
     let header_plain = strip_ansi(&lines[0]);
     assert!(
-        header_plain.contains("[Gemini 4 Argon · med] Ultra · ~68 tok/s"),
+        header_plain.contains("[Gemini 4 Argon · med] Ultra · 🚲 ~68 tok/s (58~68)"),
         "Unexpected header: {header_plain}"
     );
 
@@ -850,7 +850,9 @@ fn output_speed_estimation_idle_cache_locking_and_header_badge() {
         columns: Some(140),
         now_ms: ten_min_later,
     });
-    assert!(strip_ansi(&lines_later[0]).contains("[Gemini 4 Argon · med] Ultra · ~68 tok/s"));
+    assert!(
+        strip_ansi(&lines_later[0]).contains("[Gemini 4 Argon · med] Ultra · 🚲 ~68 tok/s (58~68)")
+    );
 
     // 3. `display.showSpeed = false` hides the throughput badge cleanly
     let mut hidden_cfg = HudConfig::default();
@@ -866,7 +868,246 @@ fn output_speed_estimation_idle_cache_locking_and_header_badge() {
         columns: Some(140),
         now_ms: ten_min_later,
     });
-    assert!(!strip_ansi(&hidden_lines[0]).contains("tok/s"));
+    let hidden_header = strip_ansi(&hidden_lines[0]);
+    assert!(!hidden_header.contains("tok/s"));
+    assert!(!hidden_header.contains("🚲"));
+    assert!(!hidden_header.contains("(58~68)"));
+}
+
+#[test]
+fn speed_badge_header_integration_range_hiding_glyph_modes_model_switch_and_narrow_drop() {
+    let base_ms = 1_794_195_600_000i64; // 2026-11-09T03:40:00Z
+    let mut stdin = sample_stdin(140);
+    stdin.conversation_id = Some("conv-speed-header-int".to_string());
+    stdin.plan_tier = Some("Google AI Ultra".to_string());
+    stdin.agent_state = Some("idle".to_string());
+
+    // 1. Single completed sample (`min == max`) hides `(min~max)` in the rendered header
+    let single_step_jsonl = [
+        json!({
+            "step_index": 1,
+            "source": "MODEL",
+            "type": "PLANNER_RESPONSE",
+            "status": "DONE",
+            "created_at": "2026-11-09T03:40:00Z",
+            "output_tokens": 806
+        }),
+        json!({
+            "step_index": 2,
+            "source": "MODEL",
+            "type": "GENERIC",
+            "status": "DONE",
+            "created_at": "2026-11-09T03:40:14Z",
+            "content": "ok"
+        }),
+    ]
+    .iter()
+    .map(serde_json::to_string)
+    .collect::<Result<Vec<_>, _>>()
+    .unwrap()
+    .join("\n");
+    let mut tx_single = parse_transcript_and_tasks(
+        single_step_jsonl.lines().next(),
+        Some(&single_step_jsonl),
+        None,
+        Some(&stdin),
+    );
+    assert_eq!(tx_single.session_min_tps_x10, Some(576));
+    assert_eq!(tx_single.session_max_tps_x10, Some(576));
+    let single_cache = apply_speed_cache(Some(&stdin), &mut tx_single, None, base_ms + 15_000)
+        .expect("locks single step");
+    let single_lines = render_hud_lines(RenderInput {
+        stdin: Some(&stdin),
+        config: &HudConfig::default(),
+        transcript: &tx_single,
+        vcs: None,
+        memory: None,
+        cached_quota: None,
+        update_info: None,
+        columns: Some(140),
+        now_ms: base_ms + 15_000,
+    });
+    let single_header = strip_ansi(&single_lines[0]);
+    assert!(
+        single_header.contains("[Gemini 4 Argon · med] Ultra · 🚲 ~58 tok/s"),
+        "Unexpected single-sample header: {single_header}"
+    );
+    assert!(
+        !single_header.contains('(') && !single_header.contains("58~58"),
+        "Single-sample range must stay hidden: {single_header}"
+    );
+
+    // Distinct x10 bounds that round to the same integer (68.1 vs 68.4 -> 68) also hide `(min~max)`
+    let mut tx_same_rounded = tx_single.clone();
+    tx_same_rounded.resolved_tps_x10 = Some(683);
+    tx_same_rounded.session_min_tps_x10 = Some(681);
+    tx_same_rounded.session_max_tps_x10 = Some(684);
+    let same_rounded_header = strip_ansi(
+        &render_hud_lines(RenderInput {
+            stdin: Some(&stdin),
+            config: &HudConfig::default(),
+            transcript: &tx_same_rounded,
+            vcs: None,
+            memory: None,
+            cached_quota: None,
+            update_info: None,
+            columns: Some(140),
+            now_ms: base_ms + 15_000,
+        })[0],
+    );
+    assert!(
+        same_rounded_header.contains("[Gemini 4 Argon · med] Ultra · 🚲 ~68 tok/s"),
+        "Unexpected same-rounded header: {same_rounded_header}"
+    );
+    assert!(!same_rounded_header.contains("68~68"));
+
+    // 2. Mid-session model switch preserves `(min~max)` across models in the rendered header
+    let mut switched_stdin = stdin.clone();
+    switched_stdin.model = Some(ModelStdin {
+        id: Some("Gemini 3 Flash".to_string()),
+        display_name: Some("Gemini 3 Flash".to_string()),
+        effort: None,
+    });
+    let mut tx_barrier = tx_single.clone();
+    let barrier_cache = apply_speed_cache(
+        Some(&switched_stdin),
+        &mut tx_barrier,
+        Some(&single_cache),
+        base_ms + 20_000,
+    )
+    .expect("writes model-switch barrier");
+    assert_eq!(tx_barrier.resolved_tps_x10, None);
+    assert_eq!(tx_barrier.completed_step_tps_x10, None);
+    assert_eq!(tx_barrier.session_min_tps_x10, Some(576));
+    assert_eq!(tx_barrier.session_max_tps_x10, Some(576));
+    assert!(
+        hud_core::probes::resolve_output_speed_display(
+            Some(&switched_stdin),
+            &tx_barrier,
+            Some(&barrier_cache),
+            base_ms + 20_000,
+        )
+        .is_none(),
+        "Barrier cache must suppress stale model speed before new model produces output"
+    );
+
+    // New model completes a fast 150.0 tok/s step (120 tokens in 800ms -> 🚗 ~150 tok/s (58~150))
+    let flash_jsonl = format!(
+        "{single_step_jsonl}\n{}",
+        json!({
+            "step_index": 3,
+            "source": "MODEL",
+            "type": "PLANNER_RESPONSE",
+            "status": "DONE",
+            "created_at": "2026-11-09T03:40:21Z",
+            "output_tokens": 120,
+            "content": "Fast flash answer"
+        })
+    );
+    let mut tx_flash = parse_transcript_and_tasks(
+        flash_jsonl.lines().next(),
+        Some(&flash_jsonl),
+        None,
+        Some(&switched_stdin),
+    );
+    let _flash_locked = apply_speed_cache(
+        Some(&switched_stdin),
+        &mut tx_flash,
+        Some(&barrier_cache),
+        base_ms + 21_800,
+    )
+    .expect("locks Flash burst");
+    let flash_lines = render_hud_lines(RenderInput {
+        stdin: Some(&switched_stdin),
+        config: &HudConfig::default(),
+        transcript: &tx_flash,
+        vcs: None,
+        memory: None,
+        cached_quota: None,
+        update_info: None,
+        columns: Some(140),
+        now_ms: base_ms + 21_800,
+    });
+    let flash_header = strip_ansi(&flash_lines[0]);
+    assert!(
+        flash_header.contains("[Gemini 3 Flash] Ultra · 🚗 ~150 tok/s (58~150)"),
+        "Expected cross-model min~max preserved in header: {flash_header}"
+    );
+
+    // 3. `GlyphMode::Ascii` omits emoji while preserving `(min~max)`, and `Nerd` keeps emoji
+    let mut ascii_cfg = HudConfig::default();
+    ascii_cfg.display.glyph_mode = GlyphMode::Ascii;
+    let ascii_header = strip_ansi(
+        &render_hud_lines(RenderInput {
+            stdin: Some(&switched_stdin),
+            config: &ascii_cfg,
+            transcript: &tx_flash,
+            vcs: None,
+            memory: None,
+            cached_quota: None,
+            update_info: None,
+            columns: Some(140),
+            now_ms: base_ms + 21_800,
+        })[0],
+    );
+    assert!(
+        ascii_header.contains("[Gemini 3 Flash] Ultra . ~150 tok/s (58~150)"),
+        "Expected ASCII speed badge without emoji: {ascii_header}"
+    );
+    assert!(!ascii_header.contains("🚗"));
+
+    let mut nerd_cfg = HudConfig::default();
+    nerd_cfg.display.glyph_mode = GlyphMode::Nerd;
+    let nerd_header = strip_ansi(
+        &render_hud_lines(RenderInput {
+            stdin: Some(&switched_stdin),
+            config: &nerd_cfg,
+            transcript: &tx_flash,
+            vcs: None,
+            memory: None,
+            cached_quota: None,
+            update_info: None,
+            columns: Some(140),
+            now_ms: base_ms + 21_800,
+        })[0],
+    );
+    assert!(
+        nerd_header.contains("[Gemini 3 Flash] Ultra · 🚗 ~150 tok/s (58~150)"),
+        "Expected Nerd mode speed badge with emoji: {nerd_header}"
+    );
+
+    // 4. Narrow-terminal fallback drops `show_speed` cleanly without dangling fragments
+    let narrow_cfg = HudConfig {
+        line_layout: hud_core::types::LineLayout::Expanded,
+        ..Default::default()
+    };
+    let narrow_lines = render_hud_lines(RenderInput {
+        stdin: Some(&switched_stdin),
+        config: &narrow_cfg,
+        transcript: &tx_flash,
+        vcs: None,
+        memory: None,
+        cached_quota: None,
+        update_info: None,
+        columns: Some(68),
+        now_ms: base_ms + 21_800,
+    });
+    let narrow_header = strip_ansi(&narrow_lines[0]);
+    assert!(
+        text_width(&narrow_lines[0]) <= 68,
+        "Narrow header exceeded 68 cols: {narrow_header}"
+    );
+    assert!(
+        narrow_header.contains("[Gemini 3 Flash]"),
+        "Narrow header should preserve model badge: {narrow_header}"
+    );
+    assert!(
+        !narrow_header.contains("tok/s")
+            && !narrow_header.contains("🚗")
+            && !narrow_header.contains("(58~150)")
+            && !narrow_header.contains("· │"),
+        "Narrow header must drop speed badge cleanly without dangling fragments: {narrow_header}"
+    );
 }
 
 #[test]

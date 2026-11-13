@@ -4,7 +4,7 @@ use crate::ansi::{
 };
 use crate::config::HudConfig;
 use crate::i18n::{Labels, get_labels};
-use crate::probes::{is_newer_semver, normalize_semver_tag, resolve_output_speed};
+use crate::probes::{is_newer_semver, normalize_semver_tag, resolve_output_speed_display};
 use crate::stdin::{
     compute_quota_pace, extract_context_metrics_scaled, extract_quota_buckets_reconciled,
     format_compact_tokens, format_duration_seconds, format_model_name_with_glyphs,
@@ -1313,16 +1313,12 @@ fn build_header_line(
                 _ => String::new(),
             };
             let speed_suffix = if opts.show_speed {
-                match resolve_output_speed(stdin, transcript, None, now_ms).0 {
-                    Some((tps, estimated)) => {
-                        let prefix = if estimated { "~" } else { "" };
-                        format!(
-                            "{}{} {}",
-                            dot(gm),
-                            paint(&format!("{prefix}{tps:.0}"), &[colors::CYAN, BOLD]),
-                            paint("tok/s", &[DIM]),
-                        )
-                    }
+                match resolve_output_speed_display(stdin, transcript, None, now_ms) {
+                    Some(d) => format!(
+                        "{}{}",
+                        dot(gm),
+                        format_speed_badge(d.current_tps, d.estimated, d.min_tps, d.max_tps, gm),
+                    ),
                     None => String::new(),
                 }
             } else {
