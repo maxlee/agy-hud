@@ -835,7 +835,7 @@ mod tests {
 
     #[test]
     fn speed_tier_emojis_have_exact_two_column_width_and_safe_truncation() {
-        for emoji in ["🐢", "🚲", "🏍", "🏍️", "🚗", "🚄", "✈️", "🚀"] {
+        for emoji in ["🐢", "🚲", "🚜", "🚗", "🚄", "✈️", "🚀"] {
             assert_eq!(
                 graphemes(emoji).count(),
                 1,
