@@ -824,7 +824,7 @@ fn output_speed_estimation_idle_cache_locking_and_header_badge() {
     });
     let header_plain = strip_ansi(&lines[0]);
     assert!(
-        header_plain.contains("[Gemini 4 Argon · med] Ultra · 🚲 ~68 tok/s (58~68)"),
+        header_plain.contains("[Gemini 4 Argon · med] Ultra · 🛵 ~68 tok/s (58~68)"),
         "Unexpected header: {header_plain}"
     );
 
@@ -851,7 +851,7 @@ fn output_speed_estimation_idle_cache_locking_and_header_badge() {
         now_ms: ten_min_later,
     });
     assert!(
-        strip_ansi(&lines_later[0]).contains("[Gemini 4 Argon · med] Ultra · 🚲 ~68 tok/s (58~68)")
+        strip_ansi(&lines_later[0]).contains("[Gemini 4 Argon · med] Ultra · 🛵 ~68 tok/s (58~68)")
     );
 
     // 3. `display.showSpeed = false` hides the throughput badge cleanly
@@ -870,7 +870,7 @@ fn output_speed_estimation_idle_cache_locking_and_header_badge() {
     });
     let hidden_header = strip_ansi(&hidden_lines[0]);
     assert!(!hidden_header.contains("tok/s"));
-    assert!(!hidden_header.contains("🚲"));
+    assert!(!hidden_header.contains("🛵"));
     assert!(!hidden_header.contains("(58~68)"));
 }
 
@@ -929,7 +929,7 @@ fn speed_badge_header_integration_range_hiding_glyph_modes_model_switch_and_narr
     });
     let single_header = strip_ansi(&single_lines[0]);
     assert!(
-        single_header.contains("[Gemini 4 Argon · med] Ultra · 🚲 ~58 tok/s"),
+        single_header.contains("[Gemini 4 Argon · med] Ultra · 🛵 ~58 tok/s"),
         "Unexpected single-sample header: {single_header}"
     );
     assert!(
@@ -956,7 +956,7 @@ fn speed_badge_header_integration_range_hiding_glyph_modes_model_switch_and_narr
         })[0],
     );
     assert!(
-        same_rounded_header.contains("[Gemini 4 Argon · med] Ultra · 🚲 ~68 tok/s"),
+        same_rounded_header.contains("[Gemini 4 Argon · med] Ultra · 🛵 ~68 tok/s"),
         "Unexpected same-rounded header: {same_rounded_header}"
     );
     assert!(!same_rounded_header.contains("68~68"));
@@ -996,7 +996,7 @@ fn speed_badge_header_integration_range_hiding_glyph_modes_model_switch_and_narr
     );
     assert!(
         !barrier_header.contains("tok/s")
-            && !barrier_header.contains("🚲")
+            && !barrier_header.contains("🛵")
             && !barrier_header.contains('('),
         "Immediate barrier render must hide stale model speed/emoji/range: {barrier_header}"
     );
@@ -1033,12 +1033,12 @@ fn speed_badge_header_integration_range_hiding_glyph_modes_model_switch_and_narr
     );
     assert!(
         !reparse_barrier_header.contains("tok/s")
-            && !reparse_barrier_header.contains("🚲")
+            && !reparse_barrier_header.contains("🛵")
             && !reparse_barrier_header.contains('('),
         "Subsequent barrier render must also hide stale model speed/emoji/range: {reparse_barrier_header}"
     );
 
-    // New model completes a fast 150.0 tok/s step (120 tokens in 800ms -> 🚗 ~150 tok/s (58~150))
+    // New model completes a fast 150.0 tok/s step (120 tokens in 800ms -> 🚅 ~150 tok/s (58~150))
     let flash_jsonl = format!(
         "{single_step_jsonl}\n{}",
         json!({
@@ -1077,7 +1077,7 @@ fn speed_badge_header_integration_range_hiding_glyph_modes_model_switch_and_narr
     });
     let flash_header = strip_ansi(&flash_lines[0]);
     assert!(
-        flash_header.contains("[Gemini 3 Flash] Ultra · 🚗 ~150 tok/s (58~150)"),
+        flash_header.contains("[Gemini 3 Flash] Ultra · 🚅 ~150 tok/s (58~150)"),
         "Expected cross-model min~max preserved in header: {flash_header}"
     );
 
@@ -1101,7 +1101,7 @@ fn speed_badge_header_integration_range_hiding_glyph_modes_model_switch_and_narr
         ascii_header.contains("[Gemini 3 Flash] Ultra . ~150 tok/s (58~150)"),
         "Expected ASCII speed badge without emoji: {ascii_header}"
     );
-    assert!(!ascii_header.contains("🚗"));
+    assert!(!ascii_header.contains("🚅"));
 
     let mut nerd_cfg = HudConfig::default();
     nerd_cfg.display.glyph_mode = GlyphMode::Nerd;
@@ -1119,7 +1119,7 @@ fn speed_badge_header_integration_range_hiding_glyph_modes_model_switch_and_narr
         })[0],
     );
     assert!(
-        nerd_header.contains("[Gemini 3 Flash] Ultra · 🚗 ~150 tok/s (58~150)"),
+        nerd_header.contains("[Gemini 3 Flash] Ultra · 🚅 ~150 tok/s (58~150)"),
         "Expected Nerd mode speed badge with emoji: {nerd_header}"
     );
 
@@ -1150,7 +1150,7 @@ fn speed_badge_header_integration_range_hiding_glyph_modes_model_switch_and_narr
     );
     assert!(
         !narrow_header.contains("tok/s")
-            && !narrow_header.contains("🚗")
+            && !narrow_header.contains("🚅")
             && !narrow_header.contains("(58~150)")
             && !narrow_header.contains("· │"),
         "Narrow header must drop speed badge cleanly without dangling fragments: {narrow_header}"

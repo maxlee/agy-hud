@@ -835,7 +835,7 @@ mod tests {
 
     #[test]
     fn speed_tier_emojis_have_exact_two_column_width_and_safe_truncation() {
-        for emoji in ["🐢", "🚲", "🚜", "🚗", "🚄", "✈️", "🚀"] {
+        for emoji in ["🐢", "🛵", "🚗", "🚅", "✈️", "🚀", "🛰️", "🛸", "👽"] {
             assert_eq!(
                 graphemes(emoji).count(),
                 1,
@@ -859,14 +859,18 @@ mod tests {
         }
 
         // Truncating around variation-selector emojis must never split base char from U+FE0F
-        for sample in ["✈️ ~260 tok/s", "🏍️ ~120 tok/s"] {
+        for sample in ["✈️ ~260 tok/s", "🛰️ ~350 tok/s", "🏍️ ~120 tok/s"] {
             for max_w in 1..=6 {
                 let clipped = truncate_ansi(sample, max_w);
                 let plain = strip_ansi(&clipped);
                 assert!(text_width(&clipped) <= max_w);
                 assert!(!plain.starts_with('\u{fe0f}'));
                 if plain.contains('\u{fe0f}') {
-                    assert!(plain.contains('\u{2708}') || plain.contains('\u{1f3cd}'));
+                    assert!(
+                        plain.contains('\u{2708}')
+                            || plain.contains('\u{1f6f0}')
+                            || plain.contains('\u{1f3cd}')
+                    );
                 }
             }
         }

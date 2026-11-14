@@ -1216,16 +1216,18 @@ fn round_tps(tps: f64) -> u64 {
 pub fn speed_tier_emoji(tps: f64) -> &'static str {
     match round_tps(tps) {
         0..=49 => "🐢",
-        50..=99 => "🚲",
-        100..=149 => "🚜",
-        150..=199 => "🚗",
-        200..=249 => "🚄",
-        250..=299 => "✈️",
-        _ => "🚀",
+        50..=99 => "🛵",
+        100..=149 => "🚗",
+        150..=199 => "🚅",
+        200..=249 => "✈️",
+        250..=299 => "🚀",
+        300..=399 => "🛰️",
+        400..=499 => "🛸",
+        _ => "👽",
     }
 }
 
-/// Formats the header throughput badge (e.g. `🚲 ~68 tok/s (42~112)`), omitting the emoji in
+/// Formats the header throughput badge (e.g. `🛵 ~68 tok/s (42~112)`), omitting the emoji in
 /// `GlyphMode::Ascii` and hiding `(min~max)` until two distinct rounded integers exist.
 pub fn format_speed_badge(
     current_tps: f64,
@@ -2088,32 +2090,46 @@ mod tests {
     use crate::ansi::strip_ansi;
 
     #[test]
-    fn speed_tier_emoji_covers_all_seven_tiers_and_rounding_boundaries() {
+    fn speed_tier_emoji_covers_all_nine_tiers_and_rounding_boundaries() {
         let cases = [
             (-5.0, "🐢"),
             (0.0, "🐢"),
             (0.4, "🐢"),
             (0.8, "🐢"),
             (49.4, "🐢"),
-            (49.5, "🚲"),
-            (49.6, "🚲"),
-            (50.0, "🚲"),
-            (99.4, "🚲"),
-            (99.6, "🚜"),
-            (100.0, "🚜"),
-            (149.4, "🚜"),
-            (149.6, "🚗"),
-            (150.0, "🚗"),
-            (199.4, "🚗"),
-            (199.6, "🚄"),
-            (200.0, "🚄"),
-            (249.4, "🚄"),
-            (249.6, "✈️"),
-            (250.0, "✈️"),
-            (299.4, "✈️"),
-            (299.6, "🚀"),
-            (300.0, "🚀"),
-            (450.0, "🚀"),
+            (49.5, "🛵"),
+            (49.6, "🛵"),
+            (50.0, "🛵"),
+            (99.4, "🛵"),
+            (99.5, "🚗"),
+            (99.6, "🚗"),
+            (100.0, "🚗"),
+            (149.4, "🚗"),
+            (149.5, "🚅"),
+            (149.6, "🚅"),
+            (150.0, "🚅"),
+            (199.4, "🚅"),
+            (199.5, "✈️"),
+            (199.6, "✈️"),
+            (200.0, "✈️"),
+            (249.4, "✈️"),
+            (249.5, "🚀"),
+            (249.6, "🚀"),
+            (250.0, "🚀"),
+            (299.4, "🚀"),
+            (299.5, "🛰️"),
+            (299.6, "🛰️"),
+            (300.0, "🛰️"),
+            (399.4, "🛰️"),
+            (399.5, "🛸"),
+            (399.6, "🛸"),
+            (400.0, "🛸"),
+            (450.0, "🛸"),
+            (499.4, "🛸"),
+            (499.5, "👽"),
+            (499.6, "👽"),
+            (500.0, "👽"),
+            (750.0, "👽"),
         ];
         for (tps, expected) in cases {
             assert_eq!(
@@ -2129,7 +2145,7 @@ mod tests {
     #[test]
     fn format_speed_badge_handles_range_hiding_glyph_modes_and_ansi_styling() {
         let styled = format_speed_badge(68.3, true, Some(42.1), Some(112.4), GlyphMode::Unicode);
-        assert_eq!(strip_ansi(&styled), "🚲 ~68 tok/s (42~112)");
+        assert_eq!(strip_ansi(&styled), "🛵 ~68 tok/s (42~112)");
         assert_eq!(text_width(&styled), 21);
         assert!(styled.contains(&paint("~68", &[colors::CYAN, BOLD])));
         assert!(styled.contains(&paint("tok/s", &[DIM])));
@@ -2143,7 +2159,7 @@ mod tests {
         assert_eq!(text_width(&ascii), 18);
 
         let exact = format_speed_badge(68.3, false, Some(42.1), Some(112.4), GlyphMode::Unicode);
-        assert_eq!(strip_ansi(&exact), "🚲 68 tok/s (42~112)");
+        assert_eq!(strip_ansi(&exact), "🛵 68 tok/s (42~112)");
         assert!(exact.contains(&paint("68", &[colors::CYAN, BOLD])));
 
         // Hide `(min~max)` when missing, equal after rounding, or inverted
@@ -2160,7 +2176,7 @@ mod tests {
             let hidden = format_speed_badge(68.3, true, min_tps, max_tps, GlyphMode::Unicode);
             assert_eq!(
                 strip_ansi(&hidden),
-                "🚲 ~68 tok/s",
+                "🛵 ~68 tok/s",
                 "Expected hidden range for min={min_tps:?} max={max_tps:?}"
             );
         }
@@ -2168,7 +2184,7 @@ mod tests {
         // Show `(min~max)` as soon as rounded integers differ
         let narrow_diff =
             format_speed_badge(68.4, true, Some(68.4), Some(68.6), GlyphMode::Unicode);
-        assert_eq!(strip_ansi(&narrow_diff), "🚲 ~68 tok/s (68~69)");
+        assert_eq!(strip_ansi(&narrow_diff), "🛵 ~68 tok/s (68~69)");
 
         // Verify rounding boundary consistency between number and emoji
         assert_eq!(
@@ -2189,7 +2205,7 @@ mod tests {
                 None,
                 GlyphMode::Unicode
             )),
-            "🚲 ~50 tok/s"
+            "🛵 ~50 tok/s"
         );
         assert_eq!(
             strip_ansi(&format_speed_badge(
@@ -2199,7 +2215,7 @@ mod tests {
                 None,
                 GlyphMode::Unicode
             )),
-            "🚀 ~300 tok/s"
+            "🛰️ ~300 tok/s"
         );
         assert_eq!(
             strip_ansi(&format_speed_badge(
@@ -2209,7 +2225,27 @@ mod tests {
                 None,
                 GlyphMode::Unicode
             )),
-            "🚀 300 tok/s"
+            "🛰️ 300 tok/s"
+        );
+        assert_eq!(
+            strip_ansi(&format_speed_badge(
+                399.6,
+                true,
+                None,
+                None,
+                GlyphMode::Unicode
+            )),
+            "🛸 ~400 tok/s"
+        );
+        assert_eq!(
+            strip_ansi(&format_speed_badge(
+                499.6,
+                true,
+                None,
+                None,
+                GlyphMode::Unicode
+            )),
+            "👽 ~500 tok/s"
         );
     }
 }
