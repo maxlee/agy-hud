@@ -78,20 +78,11 @@
 ### 环境要求
 
 - **Antigravity CLI (`agy`)** `v1.4.5+`（已完整对齐 `v1.5.4+` 最新内部接口）
-- **零 Rust / Node.js / npm 依赖**（使用预编译包或一键脚本安装时无需编译环境；仅从源码构建时需 `rustc 1.85+`）
+- **零 Rust / Node.js / npm 依赖**（使用一键脚本、GitHub 插件或预编译包安装时无需编译环境；仅从源码构建时需 `rustc 1.85+`）
 
-### 方式一：Antigravity Marketplace 或 `agy plugin install`（推荐）
+> **Marketplace 上架状态**：已提交至 Antigravity Marketplace 官方审核队列，审核通过后即可在 Antigravity 桌面端 **Customizations → Marketplace** 中搜索 **AGY HUD** 一键添加，并点击 **"Set up the HUD status line in Antigravity CLI"** 快捷引导胶囊启用。
 
-1. **Antigravity 桌面端**：打开 **Customizations → Marketplace**，搜索 **AGY HUD** 点击 **Add**，然后点击插件卡片上的 **"Set up the HUD status line in Antigravity CLI"** 快捷引导胶囊即可启用。
-2. **或通过 `agy` 命令行安装**：
-   ```bash
-   agy plugin install agy-hud
-   # 或直接从 GitHub 仓库安装最新版：
-   agy plugin install https://github.com/maxlee/agy-hud
-   ```
-   启动 `agy` 后输入 `/agy-hud:hud` 即可自动完成 `settings.json` 挂载*（若安装前 `agy` 已处于运行状态，请先执行 `/skills reload` 刷新技能菜单）*。
-
-### 方式二：一行脚本 SHA-256 校验安装（macOS & Linux）
+### 方式一：一行脚本 SHA-256 校验安装（推荐，macOS & Linux）
 
 自动识别平台架构（`darwin-arm64`、`darwin-x64`、`linux-x64`、`linux-arm64`），下载发行包并比对 `SHA256SUMS` 校验和，注册 `/agy-hud:hud` 与 `/agy-hud:hud-update` 技能，部署原生二进制至 `~/.gemini/antigravity-cli/agy-hud/bin/agy-hud` 并原子更新 `settings.json`：
 
@@ -104,6 +95,16 @@ curl -fsSL https://raw.githubusercontent.com/maxlee/agy-hud/main/install.sh | sh
 ```bash
 curl -fsSL https://raw.githubusercontent.com/maxlee/agy-hud/main/install.sh | sh -s -- --stack
 ```
+
+### 方式二：通过 `agy` CLI 从 GitHub 仓库安装（macOS & Linux）
+
+无需等待 Marketplace 收录，可直接从 GitHub 仓库安装插件：
+
+```bash
+agy plugin install https://github.com/maxlee/agy-hud
+```
+
+安装后启动 `agy` 并输入 `/agy-hud:hud`（若通过桌面端插件卡片安装，也可直接点击 **"Set up the HUD status line in Antigravity CLI"** 快捷引导胶囊）即可自动完成 `settings.json` 挂载*（若安装前 `agy` 已处于运行状态，请先执行 `/skills reload` 刷新技能菜单）*。
 
 ### 方式三：手动下载预编译发行包（macOS / Linux / Windows）
 

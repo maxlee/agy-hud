@@ -79,20 +79,11 @@ Ctx ███████░ 89.6% !200k │ Quota(weekly) 92% (1h 30m)
 ### Requirements
 
 - **Antigravity CLI (`agy`)** `v1.4.5+` (fully aligned with `v1.5.4+` schemas)
-- **Zero Rust / Node.js / npm required** for Marketplace or prebuilt installations (`rustc 1.85+` only if compiling from source)
+- **Zero Rust / Node.js / npm required** for the one-line installer, GitHub plugin, or prebuilt installations (`rustc 1.85+` only if compiling from source)
 
-### Method 1: Antigravity Marketplace or `agy plugin install` (Recommended)
+> **Marketplace status**: Submitted to the Antigravity Marketplace and currently under review. Once approved, you'll also be able to add **AGY HUD** directly from **Customizations → Marketplace** in Antigravity Desktop and click the **"Set up the HUD status line in Antigravity CLI"** starter prompt chip.
 
-1. **In Antigravity Desktop**: Open **Customizations → Marketplace**, search for **AGY HUD**, click **Add**, then click the **"Set up the HUD status line in Antigravity CLI"** starter prompt chip.
-2. **Or via `agy` CLI**:
-   ```bash
-   agy plugin install agy-hud
-   # Or install directly from GitHub:
-   agy plugin install https://github.com/maxlee/agy-hud
-   ```
-   Launch `agy` and run `/agy-hud:hud` to activate the status line in `~/.gemini/antigravity-cli/settings.json` *(if `agy` was already open, run `/skills reload` first)*.
-
-### Method 2: One-Line SHA-256 Verified Installer (macOS & Linux)
+### Method 1: One-Line SHA-256 Verified Installer (Recommended — macOS & Linux)
 
 Detects your OS/CPU (`darwin-arm64`, `darwin-x64`, `linux-x64`, `linux-arm64`), verifies the archive against `SHA256SUMS`, registers `/agy-hud:hud` & `/agy-hud:hud-update`, deploys `~/.gemini/antigravity-cli/agy-hud/bin/agy-hud`, and atomically updates `settings.json`:
 
@@ -105,6 +96,16 @@ Want to stack **below** Antigravity's built-in status bar instead of replacing i
 ```bash
 curl -fsSL https://raw.githubusercontent.com/maxlee/agy-hud/main/install.sh | sh -s -- --stack
 ```
+
+### Method 2: Install via `agy` CLI from GitHub (macOS & Linux)
+
+Install the plugin directly from the GitHub repository (no Marketplace listing required):
+
+```bash
+agy plugin install https://github.com/maxlee/agy-hud
+```
+
+Then launch `agy` and run `/agy-hud:hud` (or click the **"Set up the HUD status line in Antigravity CLI"** starter prompt chip if installed via Antigravity Desktop) to activate the status line in `~/.gemini/antigravity-cli/settings.json` *(if `agy` was already open, run `/skills reload` first)*.
 
 ### Method 3: Prebuilt Release Archives (macOS / Linux / Windows)
 
