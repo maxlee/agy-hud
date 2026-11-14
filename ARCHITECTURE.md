@@ -1,4 +1,4 @@
-# `agy-hud` v1.7.0 — 100% Pure Rust Single-Engine Architecture
+# `agy-hud` v1.7.1 — 100% Pure Rust Single-Engine Architecture
 
 `agy-hud` is a **100% Pure Rust** native statusLine HUD for the Google Antigravity CLI (`agy`). There is **zero Node.js / TypeScript runtime or wrapper code** in the repository.
 
