@@ -2229,8 +2229,9 @@ fn unprefixed_skills_install_standalone_exec_embedded_fallback_and_clean_uninsta
     let (ok_pretty, pretty_out) = run_bin(&["doctor", "--pretty"], &env_vars, None);
     assert!(ok_pretty);
     let pretty_plain = strip_ansi(&pretty_out);
+    let pretty_norm = pretty_plain.replace('\\', "/");
     assert!(
-        pretty_plain.contains(
+        pretty_norm.contains(
             "Unprefixed Skills: /hud=installed · /hud-update=installed (~/.gemini/config/skills)"
         ),
         "unexpected pretty line: {pretty_plain}"
