@@ -70,7 +70,7 @@ Ctx ███████░ 89.6% │ Quota(weekly) 92% (1h 30m)
 - **🎨 Theme-Safe, Grapheme-Cluster-Accurate & Composable Layout**: Zero hardcoded white (`37m`/`97m`) or gray (`90m`) foreground codes. Full Unicode extended grapheme cluster width engine (ZWJ emoji sequences, skin-tone modifiers, regional flag pairs, CJK 2-col alignment), `display.mergeGroups` + `display.rightAlign` row composition, and 3 glyph sets (`unicode`, `nerd`, `ascii`).
 - **🌿 Hardened `git`, `jj` & `hg` Support**: Windows `CreateProcessW` `PATH`-hijack protection, scope-aware Git `[include]` filter neutralization (preserving global `git-lfs` while disarming untrusted repo filters, with zero-subprocess `.git/HEAD` fallback), clickable GitHub branch OSC 8 links, unpushed `↑N` thresholds, and FNV-1a sharded `mtime` caches.
 - **🔄 Built-in Verified Self-Update**: Non-blocking 6-hour release check surfaces a subtle header badge (`↑ vX.Y.Z · /agy-hud:hud-update`) and upgrades in one SHA-256-verified step while preserving `--stack` and user `config.json`.
-- **🌏 Native Bilingual UI**: Switch effortlessly between English (`en`) and Simplified Chinese (`zh-Hans`).
+- **🌏 Native Multilingual UI**: Auto-detects system language or switch between English (`en`), Simplified Chinese (`zh-Hans`), and Japanese (`ja`).
 
 ---
 

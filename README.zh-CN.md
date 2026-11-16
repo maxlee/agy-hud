@@ -70,6 +70,7 @@
 - **🎨 完整字素簇宽度引擎与可组合布局**：零硬编码黑白灰前景色，深浅色主题通吃；纯 Rust 完整支持 Unicode Extended Grapheme Clusters（ZWJ 组合 Emoji、肤色修饰符、国旗双区域指示符、CJK 双列对齐），支持 `display.mergeGroups` 多行自由合并（窄屏自动堆叠并对齐中文进度条起始列）与 `display.rightAlign` 右对齐。
 - **🌿 纵深安全加固的 `git` / `jj` / `hg` 探针**：内置 Windows `CreateProcessW` 工作目录可执行劫持防御、作用域感知的 Git `[include]` 过滤器精准拆弹（保留全局 `git-lfs`，仅清空不可信仓库过滤器，异常过滤器名自动降级至零子进程 `.git/HEAD`）、GitHub 分支点击跳转与 `↑N` 未推送阈值变色提醒。
 - **🔄 内置 SHA-256 校验自更新**：每 6 小时后台静默检查新版本并在顶栏温和提示（`↑ vX.Y.Z · /agy-hud:hud-update`），一键校验升级并完整保留 `--stack` 与个性化配置。
+- **🌏 原生多语言界面**：根据系统语言自动选择，亦可手动切换英文（`en`）、简体中文（`zh-Hans`）与日语（`ja`）。
 
 ---
 

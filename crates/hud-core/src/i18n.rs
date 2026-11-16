@@ -133,9 +133,148 @@ pub const ZH_HANS: Labels = Labels {
     },
 };
 
+pub const JA: Labels = Labels {
+    state: StateLabels {
+        idle: "待機中",
+        thinking: "思考中",
+        working: "実行中",
+        tool_use: "ツール実行",
+        reviewing: "レビュー中",
+        authenticating: "認証中",
+        initializing: "初期化中",
+        error: "エラー",
+        confirm: "確認待ち!",
+    },
+    mode: ModeLabels {
+        plan: "計画",
+        auto: "自動",
+        accept_edits: "編集承認",
+    },
+    metrics: MetricLabels {
+        context: "コンテキスト",
+        quota: "利用枠",
+        cache: "キャッシュ",
+        cost: "費用",
+        today: "本日",
+        week: "今週",
+        sandbox_on: "サンドボックスON",
+        sandbox_off: "サンドボックスOFF",
+        artifacts: "成果物",
+        subagents: "サブエージェント",
+        tasks: "タスク",
+        queued: "待機",
+        memory: "メモリ",
+        resets_in: "リセット",
+        remaining: "残り",
+        tools: "ツール",
+        agents: "エージェント",
+        todos: "進捗",
+        skills: "スキル",
+        mcp: "MCP",
+    },
+};
+
 pub fn get_labels(lang: Language) -> &'static Labels {
     match lang {
         Language::ZhHans => &ZH_HANS,
-        Language::En => &EN,
+        Language::Ja => &JA,
+        Language::En | Language::Auto => &EN,
+    }
+}
+
+/// Pure string matching for POSIX/Windows locale strings (zero `std::env`).
+pub fn detect_locale_language(loc: &str) -> Language {
+    let lower = loc.to_ascii_lowercase();
+    let norm = lower.replace('_', "-");
+    if norm.starts_with("zh") {
+        Language::ZhHans
+    } else if norm.starts_with("ja") {
+        Language::Ja
+    } else {
+        Language::En
+    }
+}
+
+/// Resolves `Language::Auto` against an optional system locale string, preserving explicit choices.
+pub fn resolve_language(lang: Language, system_locale: Option<&str>) -> Language {
+    match lang {
+        Language::Auto => match system_locale {
+            Some(loc) => detect_locale_language(loc),
+            None => Language::En,
+        },
+        explicit => explicit,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn locale_detection_maps_posix_and_windows_locale_strings() {
+        assert_eq!(detect_locale_language("ja_JP.UTF-8"), Language::Ja);
+        assert_eq!(detect_locale_language("ja_JP"), Language::Ja);
+        assert_eq!(detect_locale_language("ja"), Language::Ja);
+        assert_eq!(detect_locale_language("JA-JP"), Language::Ja);
+
+        assert_eq!(detect_locale_language("zh_CN.UTF-8"), Language::ZhHans);
+        assert_eq!(detect_locale_language("zh_TW"), Language::ZhHans);
+        assert_eq!(detect_locale_language("zh-Hans"), Language::ZhHans);
+        assert_eq!(detect_locale_language("zh"), Language::ZhHans);
+
+        assert_eq!(detect_locale_language("en_US.UTF-8"), Language::En);
+        assert_eq!(detect_locale_language("en_GB"), Language::En);
+        assert_eq!(detect_locale_language("C"), Language::En);
+        assert_eq!(detect_locale_language("POSIX"), Language::En);
+        assert_eq!(detect_locale_language(""), Language::En);
+    }
+
+    #[test]
+    fn resolve_language_respects_explicit_override_and_falls_back_cleanly() {
+        assert_eq!(
+            resolve_language(Language::ZhHans, Some("ja_JP.UTF-8")),
+            Language::ZhHans
+        );
+        assert_eq!(
+            resolve_language(Language::Ja, Some("en_US.UTF-8")),
+            Language::Ja
+        );
+        assert_eq!(
+            resolve_language(Language::En, Some("zh_CN.UTF-8")),
+            Language::En
+        );
+
+        assert_eq!(
+            resolve_language(Language::Auto, Some("ja_JP.UTF-8")),
+            Language::Ja
+        );
+        assert_eq!(
+            resolve_language(Language::Auto, Some("zh_CN.UTF-8")),
+            Language::ZhHans
+        );
+        assert_eq!(
+            resolve_language(Language::Auto, Some("en_US.UTF-8")),
+            Language::En
+        );
+        assert_eq!(resolve_language(Language::Auto, None), Language::En);
+    }
+
+    #[test]
+    fn labels_return_distinct_localized_strings() {
+        let ja = get_labels(Language::Ja);
+        assert_eq!(ja.state.idle, "待機中");
+        assert_eq!(ja.metrics.context, "コンテキスト");
+        assert_eq!(ja.metrics.quota, "利用枠");
+        assert_eq!(ja.mode.plan, "計画");
+
+        let zh = get_labels(Language::ZhHans);
+        assert_eq!(zh.state.idle, "就绪");
+        assert_eq!(zh.metrics.context, "上下文");
+
+        let en = get_labels(Language::En);
+        assert_eq!(en.state.idle, "READY");
+
+        let auto = get_labels(Language::Auto);
+        assert_eq!(auto.state.idle, "READY");
     }
 }

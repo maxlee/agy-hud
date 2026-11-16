@@ -50,6 +50,8 @@ fn run_bin(
     let mut cmd = Command::new(bin);
     cmd.args(args)
         .env("AGY_HUD_DISABLE_BG_UPDATE", "1")
+        .env("LC_ALL", "en_US.UTF-8")
+        .env("LANG", "en_US.UTF-8")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     for (k, v) in env_overrides {
@@ -587,6 +589,8 @@ fn open_pipe_stdin_exits_early_without_eof_and_nested_mode_is_inert() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_agy-hud"))
         .env("AGY_CLI_DIR", &cli_dir)
         .env("AGY_HUD_HOME", &hud_home)
+        .env("LC_ALL", "en_US.UTF-8")
+        .env("LANG", "en_US.UTF-8")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1285,6 +1289,8 @@ fn doctor_detects_disabled_plugin_in_gemini_config_json() {
         .env("USERPROFILE", &fake_home)
         .env("AGY_CLI_DIR", &cli_dir)
         .env("AGY_HUD_HOME", &hud_home)
+        .env("LC_ALL", "en_US.UTF-8")
+        .env("LANG", "en_US.UTF-8")
         .env_remove("AGY_HUD_PLUGIN_LIST_JSON")
         .output()
         .unwrap();
@@ -1847,5 +1853,137 @@ fn live_binary_learns_model_compaction_ceiling_across_sessions_and_hides_200k_ba
     assert!(
         plain_post.contains("200k/1.0M"),
         "expected physical window after invalidation: {plain_post}"
+    );
+}
+
+#[test]
+fn japanese_localization_and_locale_autodetection_e2e() {
+    let tmp = TempDir::new("ja-i18n");
+    let cli_dir = tmp.path.join("cli");
+    let hud_home = cli_dir.join("agy-hud");
+    let env_vars: [(&str, &Path); 2] = [("AGY_CLI_DIR", &cli_dir), ("AGY_HUD_HOME", &hud_home)];
+
+    let payload = json!({
+        "cwd": tmp.path,
+        "conversation_id": "conv-ja-test",
+        "agent_state": "idle",
+        "terminal_width": 108,
+        "model": { "id": "Gemini 3 Flash", "display_name": "Gemini 3 Flash" },
+        "context_window": {
+            "context_window_size": 1_048_576,
+            "current_usage": { "input_tokens": 50_000, "output_tokens": 0 }
+        }
+    })
+    .to_string();
+
+    // 1. Explicit set language=ja produces Japanese labels
+    let (ok_set_ja, set_out) = run_bin(&["set", "language=ja"], &env_vars, None);
+    assert!(ok_set_ja, "set language=ja failed: {set_out}");
+    assert!(set_out.contains("language = \"ja\""));
+
+    let (ok_run_ja, run_ja_out) = run_bin(&[], &env_vars, Some(&payload));
+    assert!(ok_run_ja);
+    let plain_ja = strip_ansi(&run_ja_out);
+    assert!(
+        plain_ja.contains("待機中"),
+        "expected Japanese idle status '待機中', got: {plain_ja}"
+    );
+    assert!(
+        plain_ja.contains("コンテキスト"),
+        "expected Japanese context metric 'コンテキスト', got: {plain_ja}"
+    );
+
+    // 2. Preview with --set language=ja also renders Japanese
+    let (ok_prev, prev_out) = run_bin(
+        &["preview", "--state", "tool_use", "--set", "language=ja"],
+        &env_vars,
+        None,
+    );
+    assert!(ok_prev);
+    let plain_prev = strip_ansi(&prev_out);
+    assert!(
+        plain_prev.contains("ツール実行"),
+        "expected Japanese 'ツール実行', got: {plain_prev}"
+    );
+
+    // 3. Reset to language=auto and test auto-detection via LANG env var
+    let (ok_set_auto, _) = run_bin(&["set", "language=auto"], &env_vars, None);
+    assert!(ok_set_auto);
+
+    // Subprocess with LANG=ja_JP.UTF-8 auto-detects Japanese
+    let mut cmd_ja = Command::new(env!("CARGO_BIN_EXE_agy-hud"));
+    cmd_ja
+        .env("AGY_HUD_DISABLE_BG_UPDATE", "1")
+        .env("AGY_CLI_DIR", &cli_dir)
+        .env("AGY_HUD_HOME", &hud_home)
+        .env("LANG", "ja_JP.UTF-8")
+        .env_remove("LC_ALL")
+        .env_remove("LC_MESSAGES")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped());
+    let mut child_ja = cmd_ja.spawn().unwrap();
+    child_ja
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(payload.as_bytes())
+        .unwrap();
+    let out_ja = child_ja.wait_with_output().unwrap();
+    assert!(out_ja.status.success());
+    let ja_auto_str = strip_ansi(&String::from_utf8_lossy(&out_ja.stdout));
+    assert!(
+        ja_auto_str.contains("待機中"),
+        "expected auto-detected Japanese '待機中', got: {ja_auto_str}"
+    );
+
+    // Subprocess with LANG=zh_CN.UTF-8 auto-detects Chinese
+    let mut cmd_zh = Command::new(env!("CARGO_BIN_EXE_agy-hud"));
+    cmd_zh
+        .env("AGY_HUD_DISABLE_BG_UPDATE", "1")
+        .env("AGY_CLI_DIR", &cli_dir)
+        .env("AGY_HUD_HOME", &hud_home)
+        .env("LANG", "zh_CN.UTF-8")
+        .env_remove("LC_ALL")
+        .env_remove("LC_MESSAGES")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped());
+    let mut child_zh = cmd_zh.spawn().unwrap();
+    child_zh
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(payload.as_bytes())
+        .unwrap();
+    let out_zh = child_zh.wait_with_output().unwrap();
+    assert!(out_zh.status.success());
+    let zh_auto_str = strip_ansi(&String::from_utf8_lossy(&out_zh.stdout));
+    assert!(
+        zh_auto_str.contains("就绪"),
+        "expected auto-detected Chinese '就绪', got: {zh_auto_str}"
+    );
+
+    // Explicit override language=en ignores LANG=ja_JP.UTF-8
+    let _ = run_bin(&["set", "language=en"], &env_vars, None);
+    let mut cmd_override = Command::new(env!("CARGO_BIN_EXE_agy-hud"));
+    cmd_override
+        .env("AGY_HUD_DISABLE_BG_UPDATE", "1")
+        .env("AGY_CLI_DIR", &cli_dir)
+        .env("AGY_HUD_HOME", &hud_home)
+        .env("LANG", "ja_JP.UTF-8")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped());
+    let mut child_ovr = cmd_override.spawn().unwrap();
+    child_ovr
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(payload.as_bytes())
+        .unwrap();
+    let out_ovr = child_ovr.wait_with_output().unwrap();
+    assert!(out_ovr.status.success());
+    let en_override_str = strip_ansi(&String::from_utf8_lossy(&out_ovr.stdout));
+    assert!(
+        en_override_str.contains("READY"),
+        "expected explicit English 'READY', got: {en_override_str}"
     );
 }

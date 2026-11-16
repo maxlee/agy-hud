@@ -299,6 +299,7 @@ fn config_schema_matches_hud_config_leaf_keys_and_preview_showcase_renders_5_sce
         platform: "macos".to_string(),
         terminal: "Ghostty".to_string(),
         remote_session: false,
+        locale: None,
         runtime: RuntimeFacts {
             engine: "rust-native".to_string(),
             version: "1.0.1".to_string(),
@@ -689,6 +690,7 @@ fn update_semver_parsing_badge_rendering_and_doctor_findings() {
         platform: "macos".to_string(),
         terminal: "Ghostty".to_string(),
         remote_session: false,
+        locale: None,
         runtime: RuntimeFacts {
             engine: "rust-native".to_string(),
             version: "1.1.0".to_string(),
@@ -1258,6 +1260,7 @@ fn agy_1_5_4_schema_vcs_fallback_show_project_decoupling_and_subagent_statuses()
         platform: "darwin-arm64".to_string(),
         terminal: "xterm-256color".to_string(),
         remote_session: false,
+        locale: None,
         runtime: RuntimeFacts {
             engine: "rust-native".to_string(),
             version: "1.3.1".to_string(),
@@ -2054,6 +2057,7 @@ fn width_preserving_report_scrub_and_incremental_transcript_cursor_parity() {
         platform: "macos".to_string(),
         terminal: "Ghostty".to_string(),
         remote_session: false,
+        locale: None,
         runtime: RuntimeFacts {
             engine: "rust-native".to_string(),
             version: "1.4.0".to_string(),
@@ -2418,6 +2422,7 @@ fn compaction_scale_watermark_bar_colors_badge_modes_and_snapshot_report_fidelit
         platform: "macos".to_string(),
         terminal: "Ghostty".to_string(),
         remote_session: false,
+        locale: None,
         runtime: RuntimeFacts {
             engine: "rust-native".to_string(),
             version: "1.5.1".to_string(),
@@ -2819,6 +2824,7 @@ fn compaction_ceiling_reconciliation_learns_invalidates_recovers_and_scrubs_repo
         platform: "macos".to_string(),
         terminal: "Ghostty".to_string(),
         remote_session: false,
+        locale: None,
         runtime: RuntimeFacts {
             engine: "rust-native".to_string(),
             version: "1.7.1".to_string(),
@@ -3165,6 +3171,7 @@ fn artifact_count_visibility_defaults_i18n_compact_meta_and_config_overrides() {
         platform: "macos".to_string(),
         terminal: "Ghostty".to_string(),
         remote_session: false,
+        locale: None,
         runtime: RuntimeFacts {
             engine: "rust-native".to_string(),
             version: hud_core::types::HUD_VERSION.to_string(),
@@ -3271,4 +3278,89 @@ fn artifact_count_visibility_defaults_i18n_compact_meta_and_config_overrides() {
         !preview_overflow_108_plain.contains("art 2"),
         "expected preset width 108 budget overflow to trigger compact_meta and drop art 2: {preview_overflow_108_plain}"
     );
+}
+
+#[test]
+fn japanese_language_rendering_and_cjk_alignment() {
+    let stdin = AgyStdinData {
+        agent_state: Some("tool_use".to_string()),
+        cycle_mode: Some("plan".to_string()),
+        cwd: Some("/Users/dev/project".to_string()),
+        model: Some(ModelStdin {
+            id: Some("Gemini 4 Argon".to_string()),
+            display_name: Some("Gemini 4 Argon".to_string()),
+            effort: Some("high".to_string()),
+        }),
+        context_window: Some(ContextWindowStdin {
+            total_input_tokens: None,
+            total_output_tokens: None,
+            context_window_size: Some(1_048_576),
+            used_percentage: Some(42.5),
+            remaining_percentage: Some(57.5),
+            current_usage: Some(CurrentUsageStdin {
+                input_tokens: Some(445_644),
+                output_tokens: Some(1_200),
+                cache_creation_input_tokens: Some(0),
+                cache_read_input_tokens: Some(50_000),
+            }),
+        }),
+        cost: Some(CostStdin {
+            total_usd: Some(0.125),
+            subagent_usd: None,
+            estimated: Some(false),
+        }),
+        terminal_width: Some(110),
+        ..AgyStdinData::default()
+    };
+
+    let ja_cfg = HudConfig {
+        language: Language::Ja,
+        ..HudConfig::default()
+    };
+
+    let lines = render_hud_lines_full(
+        RenderInput {
+            stdin: Some(&stdin),
+            config: &ja_cfg,
+            transcript: &TranscriptSummary::default(),
+            vcs: None,
+            memory: None,
+            cached_quota: None,
+            update_info: None,
+            columns: Some(110),
+            now_ms: 1_700_000_000_000,
+        },
+        RenderExtras::default(),
+    );
+
+    let plain = lines
+        .iter()
+        .map(|l| strip_ansi(l))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        plain.contains("ツール実行"),
+        "expected Japanese 'ツール実行': {plain}"
+    );
+    assert!(
+        plain.contains("[計画]"),
+        "expected Japanese '[計画]': {plain}"
+    );
+    assert!(
+        plain.contains("コンテキスト"),
+        "expected Japanese 'コンテキスト': {plain}"
+    );
+    assert!(
+        plain.contains("キャッシュ"),
+        "expected Japanese 'キャッシュ': {plain}"
+    );
+
+    // Parse config test with language: "ja" and "auto"
+    let loaded_ja = parse_config_str(Some(r#"{"language":"ja"}"#));
+    assert_eq!(loaded_ja.config.language, Language::Ja);
+    assert!(loaded_ja.problems.is_empty());
+
+    let loaded_auto = parse_config_str(Some(r#"{"language":"auto"}"#));
+    assert_eq!(loaded_auto.config.language, Language::Auto);
+    assert!(loaded_auto.problems.is_empty());
 }

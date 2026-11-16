@@ -5,11 +5,15 @@ pub const HUD_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum Language {
-    #[serde(rename = "en")]
+    #[serde(rename = "auto")]
     #[default]
+    Auto,
+    #[serde(rename = "en")]
     En,
     #[serde(rename = "zh-Hans")]
     ZhHans,
+    #[serde(rename = "ja")]
+    Ja,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -747,6 +751,8 @@ pub struct DoctorFacts {
     pub terminal: String,
     #[serde(default)]
     pub remote_session: bool,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub locale: Option<String>,
     pub runtime: RuntimeFacts,
     pub plugin: PluginFacts,
     #[serde(default)]

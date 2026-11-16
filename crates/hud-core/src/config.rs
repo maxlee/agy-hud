@@ -183,7 +183,7 @@ pub struct HudConfig {
 impl Default for HudConfig {
     fn default() -> Self {
         Self {
-            language: Language::En,
+            language: Language::Auto,
             line_layout: LineLayout::Adaptive,
             path_levels: PathLevels::One,
             max_width: None,
@@ -255,8 +255,8 @@ pub struct SchemaEntry {
 pub const CONFIG_SCHEMA: &[SchemaEntry] = &[
     SchemaEntry {
         key: "language",
-        kind: SchemaValueKind::Enum(&["\"en\"", "\"zh-Hans\""]),
-        description: "HUD display language (\"en\" or \"zh-Hans\").",
+        kind: SchemaValueKind::Enum(&["\"auto\"", "\"en\"", "\"zh-Hans\"", "\"ja\""]),
+        description: "HUD display language (\"auto\", \"en\", \"zh-Hans\", or \"ja\").",
     },
     SchemaEntry {
         key: "lineLayout",
