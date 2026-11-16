@@ -2,7 +2,7 @@ use crate::ansi::{
     BOLD, DIM, ITALIC, RESET, colors, file_link, github_branch_link, paint, render_bar_with_mode,
     sanitize_text, sanitize_title_text, text_width, truncate_ansi_with_ellipsis,
 };
-use crate::config::HudConfig;
+use crate::config::{DisplayConfig, HudConfig};
 use crate::i18n::{Labels, get_labels};
 use crate::probes::{is_newer_semver, normalize_semver_tag, resolve_output_speed_display};
 use crate::stdin::{
@@ -643,6 +643,140 @@ fn render_quota_segment(
     rendered.join(&sep(gm))
 }
 
+fn format_labeled_count(label: &str, value: &str, val_styles: &[&str]) -> String {
+    format!("{} {}", paint(label, &[DIM]), paint(value, val_styles))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SubagentCounts {
+    running: usize,
+    total: usize,
+}
+
+impl SubagentCounts {
+    fn from_sources(transcript: &TranscriptSummary, stdin: Option<&AgyStdinData>) -> Option<Self> {
+        if !transcript.subagents.is_empty() {
+            let running = transcript
+                .subagents
+                .iter()
+                .filter(|s| s.status == SubagentStatus::Running)
+                .count();
+            return Some(Self {
+                running,
+                total: transcript.subagents.len(),
+            });
+        }
+        let subagents = stdin.and_then(|s| s.subagents.as_ref())?;
+        if subagents.is_empty() {
+            return None;
+        }
+        let running = subagents
+            .iter()
+            .filter(|s| s.status.as_deref() == Some("running"))
+            .count();
+        Some(Self {
+            running,
+            total: subagents.len(),
+        })
+    }
+
+    fn format_badge(self, label: &str) -> String {
+        let count_text = if self.running > 0 {
+            format!("{}/{}", self.running, self.total)
+        } else {
+            self.total.to_string()
+        };
+        let val_styles: &[&str] = if self.running > 0 {
+            &[colors::CYAN, BOLD]
+        } else {
+            &[BOLD]
+        };
+        format_labeled_count(label, &count_text, val_styles)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CountKind {
+    Subagents,
+    Tasks,
+    Artifacts,
+    Queued,
+}
+
+const COUNT_ORDER: [CountKind; 4] = [
+    CountKind::Subagents,
+    CountKind::Tasks,
+    CountKind::Artifacts,
+    CountKind::Queued,
+];
+
+impl CountKind {
+    fn is_enabled(self, display: &DisplayConfig, opts: &MetricsOpts) -> bool {
+        if !display.show_counts {
+            return false;
+        }
+        match self {
+            Self::Artifacts => display.show_artifacts && !opts.compact_meta,
+            Self::Subagents | Self::Tasks | Self::Queued => true,
+        }
+    }
+
+    fn render_badge(
+        self,
+        stdin: Option<&AgyStdinData>,
+        transcript: &TranscriptSummary,
+        labels: &Labels,
+    ) -> Option<String> {
+        match self {
+            Self::Subagents => SubagentCounts::from_sources(transcript, stdin)
+                .map(|c| c.format_badge(labels.metrics.subagents)),
+            Self::Tasks => stdin
+                .and_then(|s| s.task_count)
+                .filter(|&n| n > 0)
+                .map(|n| {
+                    format_labeled_count(
+                        labels.metrics.tasks,
+                        &n.to_string(),
+                        &[colors::CYAN, BOLD],
+                    )
+                }),
+            Self::Artifacts => stdin
+                .and_then(|s| s.artifact_count)
+                .filter(|&n| n > 0)
+                .map(|n| format_labeled_count(labels.metrics.artifacts, &n.to_string(), &[BOLD])),
+            Self::Queued => stdin
+                .and_then(|s| s.pending_input_count)
+                .filter(|&n| n > 0)
+                .map(|n| {
+                    paint(
+                        &format!("+{n} {}", labels.metrics.queued),
+                        &[colors::YELLOW, BOLD],
+                    )
+                }),
+        }
+    }
+}
+
+fn push_count_items(
+    items: &mut Vec<MetaTaggedItem>,
+    stdin: Option<&AgyStdinData>,
+    transcript: &TranscriptSummary,
+    display: &DisplayConfig,
+    labels: &Labels,
+    opts: &MetricsOpts,
+) {
+    for kind in COUNT_ORDER {
+        if kind.is_enabled(display, opts)
+            && let Some(rendered) = kind.render_badge(stdin, transcript, labels)
+        {
+            items.push(MetaTaggedItem {
+                tag: "counts",
+                rendered,
+            });
+        }
+    }
+}
+
 struct MetaTaggedItem {
     tag: &'static str,
     rendered: String,
@@ -729,99 +863,7 @@ fn collect_counts_and_meta_items(
         }
     }
 
-    if config.display.show_counts {
-        if !transcript.subagents.is_empty() {
-            let running = transcript
-                .subagents
-                .iter()
-                .filter(|s| s.status == SubagentStatus::Running)
-                .count();
-            let total = transcript.subagents.len();
-            let agent_label = if running > 0 {
-                format!("{running}/{total}")
-            } else {
-                total.to_string()
-            };
-            let val_styles: &[&str] = if running > 0 {
-                &[colors::CYAN, BOLD]
-            } else {
-                &[BOLD]
-            };
-            items.push(MetaTaggedItem {
-                tag: "counts",
-                rendered: format!(
-                    "{} {}",
-                    paint(labels.metrics.subagents, &[DIM]),
-                    paint(&agent_label, val_styles),
-                ),
-            });
-        } else if let Some(subagents) = stdin.and_then(|s| s.subagents.as_ref())
-            && !subagents.is_empty()
-        {
-            let running = subagents
-                .iter()
-                .filter(|s| s.status.as_deref() == Some("running"))
-                .count();
-            let total = subagents.len();
-            let agent_label = if running > 0 {
-                format!("{running}/{total}")
-            } else {
-                total.to_string()
-            };
-            let val_styles: &[&str] = if running > 0 {
-                &[colors::CYAN, BOLD]
-            } else {
-                &[BOLD]
-            };
-            items.push(MetaTaggedItem {
-                tag: "counts",
-                rendered: format!(
-                    "{} {}",
-                    paint(labels.metrics.subagents, &[DIM]),
-                    paint(&agent_label, val_styles),
-                ),
-            });
-        }
-
-        if let Some(tasks) = stdin.and_then(|s| s.task_count)
-            && tasks > 0
-        {
-            items.push(MetaTaggedItem {
-                tag: "counts",
-                rendered: format!(
-                    "{} {}",
-                    paint(labels.metrics.tasks, &[DIM]),
-                    paint(&tasks.to_string(), &[colors::CYAN, BOLD]),
-                ),
-            });
-        }
-
-        if !opts.compact_meta
-            && let Some(arts) = stdin.and_then(|s| s.artifact_count)
-            && arts > 0
-        {
-            items.push(MetaTaggedItem {
-                tag: "counts",
-                rendered: format!(
-                    "{} {}",
-                    paint(labels.metrics.artifacts, &[DIM]),
-                    paint(&arts.to_string(), &[BOLD]),
-                ),
-            });
-        }
-
-        if let Some(queued) = stdin.and_then(|s| s.pending_input_count)
-            && queued > 0
-        {
-            items.push(MetaTaggedItem {
-                tag: "counts",
-                rendered: paint(
-                    &format!("+{queued} {}", labels.metrics.queued),
-                    &[colors::YELLOW, BOLD],
-                ),
-            });
-        }
-    }
+    push_count_items(&mut items, stdin, transcript, &config.display, labels, opts);
 
     if config.display.show_memory
         && let Some(mem) = memory

@@ -97,6 +97,9 @@ pub struct DisplayConfig {
     pub show_weekly_cost: bool,
     pub show_sandbox: bool,
     pub show_counts: bool,
+    /// Off by default because upstream `agy` can emit `artifact_count: 1` before user Markdown artifacts exist.
+    #[serde(default)]
+    pub show_artifacts: bool,
     pub show_plan_tier: bool,
     #[serde(default = "default_true")]
     pub show_speed: bool,
@@ -144,6 +147,7 @@ impl Default for DisplayConfig {
             show_weekly_cost: false,
             show_sandbox: true,
             show_counts: true,
+            show_artifacts: false,
             show_plan_tier: true,
             show_speed: true,
             show_memory: false,
@@ -455,7 +459,12 @@ pub const CONFIG_SCHEMA: &[SchemaEntry] = &[
     SchemaEntry {
         key: "display.showCounts",
         kind: SchemaValueKind::Boolean,
-        description: "Show counts of artifacts, running subagents, background tasks, and queued inputs.",
+        description: "Master toggle for inline count badges (running subagents, background tasks, queued inputs, and optional artifacts).",
+    },
+    SchemaEntry {
+        key: "display.showArtifacts",
+        kind: SchemaValueKind::Boolean,
+        description: "Show upstream `stdin.artifact_count` (`art` / `产物`) inside counts when `display.showCounts` is enabled (off by default because `agy` can report 1 before user Markdown artifacts exist; hidden in compact or narrow overflow layouts).",
     },
     SchemaEntry {
         key: "display.showPlanTier",

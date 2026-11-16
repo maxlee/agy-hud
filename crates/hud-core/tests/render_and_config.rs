@@ -3,7 +3,9 @@ use hud_core::ansi::{
     terminal_filter_with_repo, text_width,
 };
 use hud_core::commands::{CommandContext, execute_subcommand};
-use hud_core::config::{CONFIG_SCHEMA, HudConfig, parse_config_str, parse_set_pairs};
+use hud_core::config::{
+    CONFIG_SCHEMA, HudConfig, get_dot_value, parse_config_str, parse_set_pairs, validate_setting,
+};
 use hud_core::probes::{
     apply_speed_cache, is_newer_semver, normalize_github_repo_url, parse_compaction_ceiling_info,
     parse_compaction_ceiling_record, parse_cost_ledger_info, parse_github_latest_release,
@@ -24,13 +26,13 @@ use hud_core::types::{
     AgyStdinData, COMPACTION_CEILING_VERSION, CachedQuotaSnapshot, CompactionCeilingRecord,
     CompactionCeilingState, ContextScaleMode, ContextValueMode, ContextWindowStdin, CostStdin,
     CurrentUsageStdin, DoctorFacts, EffortFormatMode, GlyphMode, InstalledPluginFacts, Language,
-    LearnedCompactionState, LogicPaths, ModelStdin, PathLevels, PluginFacts, ProbeAnswers,
-    QuotaBucketView, QuotaPace, RawQuotaBucket, RuntimeFacts, SandboxStdin, SubagentEntry,
-    SubagentStatus, TodoItem, TodoStatus, ToolEntry, ToolStatus, TranscriptCursor,
-    TranscriptSummary, UpdateCacheSnapshot, VimStdin, WorkspaceStdin,
+    LearnedCompactionState, LineLayout, LogicPaths, ModelStdin, PathLevels, PluginFacts,
+    ProbeAnswers, QuotaBucketView, QuotaPace, RawQuotaBucket, RuntimeFacts, SandboxStdin,
+    SubagentEntry, SubagentStatus, SubagentStdin, TodoItem, TodoStatus, ToolEntry, ToolStatus,
+    TranscriptCursor, TranscriptSummary, UpdateCacheSnapshot, VimStdin, WorkspaceStdin,
 };
-use serde_json::json;
-use std::collections::BTreeMap;
+use serde_json::{Value, json};
+use std::collections::{BTreeMap, BTreeSet};
 
 fn sample_stdin(width: usize) -> AgyStdinData {
     let mut quota = BTreeMap::new();
@@ -190,10 +192,53 @@ fn adaptive_layout_handles_ultrawide_standard_narrow_and_zh_hans() {
     assert!(zh_joined.contains("沙箱开启"));
 }
 
+fn collect_leaf_dot_keys(val: &Value, prefix: &str, out: &mut BTreeSet<String>) {
+    match val {
+        Value::Object(map) => {
+            for (k, v) in map {
+                let next = if prefix.is_empty() {
+                    k.clone()
+                } else {
+                    format!("{prefix}.{k}")
+                };
+                collect_leaf_dot_keys(v, &next, out);
+            }
+        }
+        _ => {
+            out.insert(prefix.to_string());
+        }
+    }
+}
+
 #[test]
-fn config_schema_validates_all_53_keys_and_preview_showcase_renders_5_scenarios() {
-    assert_eq!(CONFIG_SCHEMA.len(), 53);
+fn config_schema_matches_hud_config_leaf_keys_and_preview_showcase_renders_5_scenarios() {
     let default_cfg = HudConfig::default();
+    assert!(!default_cfg.display.show_artifacts);
+    let defaults_val = serde_json::to_value(&default_cfg).expect("serialize default HudConfig");
+    let mut expected_keys = BTreeSet::new();
+    collect_leaf_dot_keys(&defaults_val, "", &mut expected_keys);
+
+    let mut schema_keys = BTreeSet::new();
+    for entry in CONFIG_SCHEMA {
+        assert!(
+            schema_keys.insert(entry.key.to_string()),
+            "duplicate CONFIG_SCHEMA key: {}",
+            entry.key
+        );
+        let default_leaf = get_dot_value(&defaults_val, entry.key).unwrap_or_else(|| {
+            panic!("schema key {} missing from HudConfig::default()", entry.key)
+        });
+        validate_setting(entry.key, default_leaf).unwrap_or_else(|err| {
+            panic!(
+                "default value for {} failed validate_setting: {err}",
+                entry.key
+            )
+        });
+    }
+    assert_eq!(
+        schema_keys, expected_keys,
+        "CONFIG_SCHEMA keys must stay in 1-to-1 bijection with HudConfig leaf fields"
+    );
     assert_eq!(
         default_cfg.display.context_scale,
         ContextScaleMode::Compaction
@@ -2845,4 +2890,385 @@ fn compaction_ceiling_reconciliation_learns_invalidates_recovers_and_scrubs_repo
     );
     let rep_bad_json: serde_json::Value = serde_json::from_str(&rep_bad.lines.join("\n")).unwrap();
     assert!(rep_bad_json["case"]["probes"]["compaction_ceiling"].is_null());
+}
+
+#[test]
+fn artifact_count_visibility_defaults_i18n_compact_meta_and_config_overrides() {
+    let mut base_stdin = sample_stdin(120);
+    base_stdin.artifact_count = Some(1);
+    base_stdin.task_count = Some(1);
+    base_stdin.pending_input_count = Some(2);
+
+    let counts_transcript = TranscriptSummary {
+        subagents: vec![
+            SubagentEntry {
+                name: "research".to_string(),
+                role: Some("Reader".to_string()),
+                model: None,
+                status: SubagentStatus::Running,
+                started_at: Some(1_699_999_990_000),
+                ended_at: None,
+            },
+            SubagentEntry {
+                name: "self".to_string(),
+                role: Some("Auditor".to_string()),
+                model: None,
+                status: SubagentStatus::Completed,
+                started_at: Some(1_699_999_950_000),
+                ended_at: Some(1_699_999_980_000),
+            },
+        ],
+        ..TranscriptSummary::default()
+    };
+
+    let render_plain = |stdin: &AgyStdinData, cfg: &HudConfig, cols: usize| -> Vec<String> {
+        render_hud_lines(RenderInput {
+            stdin: Some(stdin),
+            config: cfg,
+            transcript: &counts_transcript,
+            vcs: None,
+            memory: None,
+            cached_quota: None,
+            update_info: None,
+            columns: Some(cols),
+            now_ms: 1_700_000_000_000,
+        })
+        .into_iter()
+        .map(|l| strip_ansi(&l))
+        .collect()
+    };
+
+    let default_cfg = HudConfig::default();
+    assert!(!default_cfg.display.show_artifacts);
+    let default_joined = render_plain(&base_stdin, &default_cfg, 120).join("\n");
+    assert!(!default_joined.contains("art"));
+    assert!(!default_joined.contains("产物"));
+    assert!(default_joined.contains("agents 1/2"));
+    assert!(default_joined.contains("tasks 1"));
+    assert!(default_joined.contains("+2 queued"));
+
+    let mut opt_in_en = HudConfig::default();
+    opt_in_en.display.show_artifacts = true;
+    let mut art2_stdin = base_stdin.clone();
+    art2_stdin.artifact_count = Some(2);
+    let en_joined = render_plain(&art2_stdin, &opt_in_en, 120).join("\n");
+    let agents_pos = en_joined.find("agents 1/2").expect("agents count");
+    let tasks_pos = en_joined.find("tasks 1").expect("tasks count");
+    let art_pos = en_joined.find("art 2").expect("opt-in art count");
+    let queued_pos = en_joined.find("+2 queued").expect("queued count");
+    assert!(agents_pos < tasks_pos && tasks_pos < art_pos && art_pos < queued_pos);
+
+    let mut right_align_cfg = opt_in_en.clone();
+    right_align_cfg.display.right_align = vec!["counts".to_string()];
+    right_align_cfg.display.show_sandbox = false;
+    let mut right_align_stdin = art2_stdin.clone();
+    right_align_stdin.pending_input_count = None;
+    let right_lines = render_hud_lines(RenderInput {
+        stdin: Some(&right_align_stdin),
+        config: &right_align_cfg,
+        transcript: &TranscriptSummary::default(),
+        vcs: None,
+        memory: None,
+        cached_quota: None,
+        update_info: None,
+        columns: Some(120),
+        now_ms: 1_700_000_000_000,
+    });
+    let ctx_row = right_lines
+        .iter()
+        .find(|l| strip_ansi(l).contains("Ctx"))
+        .expect("context row");
+    assert_eq!(text_width(ctx_row), 120);
+    assert!(strip_ansi(ctx_row).trim_end().ends_with("art 2"));
+
+    let mut stdin_subagents = art2_stdin.clone();
+    stdin_subagents.subagents = Some(vec![
+        SubagentStdin {
+            name: Some("research".to_string()),
+            role: Some("Reader".to_string()),
+            status: Some("running".to_string()),
+            model: None,
+        },
+        SubagentStdin {
+            name: Some("self".to_string()),
+            role: Some("Auditor".to_string()),
+            status: Some("completed".to_string()),
+            model: None,
+        },
+    ]);
+    let stdin_subagent_out = render_hud_lines(RenderInput {
+        stdin: Some(&stdin_subagents),
+        config: &opt_in_en,
+        transcript: &TranscriptSummary::default(),
+        vcs: None,
+        memory: None,
+        cached_quota: None,
+        update_info: None,
+        columns: Some(120),
+        now_ms: 1_700_000_000_000,
+    })
+    .into_iter()
+    .map(|l| strip_ansi(&l))
+    .collect::<Vec<_>>()
+    .join("\n");
+    assert!(stdin_subagent_out.contains("agents 1/2"));
+    assert!(stdin_subagent_out.contains("art 2"));
+
+    let mut opt_in_zh = opt_in_en.clone();
+    opt_in_zh.language = Language::ZhHans;
+    let zh_joined = render_plain(&art2_stdin, &opt_in_zh, 120).join("\n");
+    assert!(zh_joined.contains("产物 2"));
+    assert!(zh_joined.contains("子代理 1/2"));
+    assert!(zh_joined.contains("后台 1"));
+    assert!(!zh_joined.contains("art 2"));
+
+    for count in [Some(0), None] {
+        let mut hidden_stdin = base_stdin.clone();
+        hidden_stdin.artifact_count = count;
+        let out = render_plain(&hidden_stdin, &opt_in_en, 120).join("\n");
+        assert!(!out.contains("art"));
+        assert!(!out.contains("产物"));
+        assert!(out.contains("tasks 1"));
+    }
+
+    let mut compact_stdin = art2_stdin.clone();
+    compact_stdin.quota = None;
+    compact_stdin.sandbox = None;
+    compact_stdin.pending_input_count = None;
+    compact_stdin.cost = None;
+    if let Some(ref mut cw) = compact_stdin.context_window
+        && let Some(ref mut cu) = cw.current_usage
+    {
+        cu.cache_read_input_tokens = None;
+    }
+    let compact_lines = render_hud_lines(RenderInput {
+        stdin: Some(&compact_stdin),
+        config: &opt_in_en,
+        transcript: &TranscriptSummary::default(),
+        vcs: None,
+        memory: None,
+        cached_quota: None,
+        update_info: None,
+        columns: Some(68),
+        now_ms: 1_700_000_000_000,
+    });
+    let compact_out = compact_lines
+        .iter()
+        .map(|l| strip_ansi(l))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!compact_out.contains("art"), "{compact_out}");
+    assert!(compact_out.contains("tasks 1"), "{compact_out}");
+
+    let mut overflow_cfg = opt_in_en.clone();
+    overflow_cfg.line_layout = LineLayout::Expanded;
+    overflow_cfg.display.show_sandbox = false;
+    overflow_cfg.display.show_daily_cost = true;
+    let mut overflow_stdin = art2_stdin.clone();
+    overflow_stdin.pending_input_count = None;
+    let overflow_lines = render_hud_lines(RenderInput {
+        stdin: Some(&overflow_stdin),
+        config: &overflow_cfg,
+        transcript: &TranscriptSummary::default(),
+        vcs: None,
+        memory: None,
+        cached_quota: None,
+        update_info: None,
+        columns: Some(88),
+        now_ms: 1_700_000_000_000,
+    });
+    let overflow_ctx = overflow_lines
+        .iter()
+        .map(|l| strip_ansi(l))
+        .find(|l| l.contains("Ctx"))
+        .expect("expanded overflow context row");
+    assert!(
+        !overflow_ctx.contains("art"),
+        "expected ctx_steps[0] compact_meta to drop `art`: {overflow_ctx}"
+    );
+    assert!(overflow_ctx.contains("Cache"), "{overflow_ctx}");
+    assert!(overflow_ctx.contains("tasks 1"), "{overflow_ctx}");
+    assert!(overflow_ctx.contains("$1.25"), "{overflow_ctx}");
+
+    for json_cfg in [
+        r#"{"display":{"showCounts":false,"showArtifacts":true}}"#,
+        r#"{"display":{"showCounts":false}}"#,
+    ] {
+        let loaded = parse_config_str(Some(json_cfg));
+        assert!(loaded.problems.is_empty(), "{:?}", loaded.problems);
+        assert!(!loaded.config.display.show_counts);
+        let suppressed = render_plain(&art2_stdin, &loaded.config, 120).join("\n");
+        assert!(!suppressed.contains("agents"));
+        assert!(!suppressed.contains("tasks"));
+        assert!(!suppressed.contains("art"));
+        assert!(!suppressed.contains("queued"));
+    }
+
+    let mut merge_cfg = HudConfig::default();
+    merge_cfg.display.merge_groups = vec![vec!["context".to_string(), "meta".to_string()]];
+    merge_cfg.display.show_cost = false;
+    merge_cfg.display.show_sandbox = false;
+    merge_cfg.display.show_memory = false;
+    let mut only_art_stdin = sample_stdin(120);
+    only_art_stdin.artifact_count = Some(1);
+    only_art_stdin.task_count = None;
+    only_art_stdin.pending_input_count = None;
+    only_art_stdin.sandbox = None;
+    let mut no_art_stdin = only_art_stdin.clone();
+    no_art_stdin.artifact_count = None;
+    let render_minimal = |stdin: &AgyStdinData| -> Vec<String> {
+        render_hud_lines(RenderInput {
+            stdin: Some(stdin),
+            config: &merge_cfg,
+            transcript: &TranscriptSummary::default(),
+            vcs: None,
+            memory: None,
+            cached_quota: None,
+            update_info: None,
+            columns: Some(120),
+            now_ms: 1_700_000_000_000,
+        })
+        .into_iter()
+        .map(|l| strip_ansi(&l))
+        .collect()
+    };
+    let merged_with_art = render_minimal(&only_art_stdin);
+    let merged_without_art = render_minimal(&no_art_stdin);
+    assert_eq!(merged_with_art, merged_without_art);
+    let merged_ctx = merged_with_art
+        .iter()
+        .find(|l| l.contains("Ctx"))
+        .expect("merged context row");
+    assert!(!merged_ctx.trim_end().ends_with('│'));
+    assert!(!merged_ctx.trim_end().ends_with('·'));
+
+    let loaded_on = parse_config_str(Some(r#"{"display":{"showArtifacts":true}}"#));
+    assert!(loaded_on.problems.is_empty());
+    assert!(loaded_on.config.display.show_artifacts);
+
+    let set_on = parse_set_pairs(
+        &["display.showArtifacts=true".to_string()],
+        &HudConfig::default(),
+    );
+    assert!(set_on.problems.is_empty());
+    assert!(set_on.config.display.show_artifacts);
+
+    let set_bad = parse_set_pairs(
+        &["display.showArtifacts=\"yes\"".to_string()],
+        &HudConfig::default(),
+    );
+    assert_eq!(set_bad.problems.len(), 1);
+
+    let facts = DoctorFacts {
+        cwd: "/Users/alice/app".to_string(),
+        home_dir: "/Users/alice".to_string(),
+        platform: "macos".to_string(),
+        terminal: "Ghostty".to_string(),
+        remote_session: false,
+        runtime: RuntimeFacts {
+            engine: "rust-native".to_string(),
+            version: hud_core::types::HUD_VERSION.to_string(),
+            exec_path: "/Users/alice/.gemini/antigravity-cli/agy-hud/bin/agy-hud".to_string(),
+            supported: true,
+        },
+        plugin: PluginFacts {
+            root: "/Users/alice/.gemini/config/plugins/agy-hud".to_string(),
+            version: hud_core::types::HUD_VERSION.to_string(),
+        },
+        installed_plugin_status: "installed".to_string(),
+        installed_plugin: None,
+        config_path: "/Users/alice/.gemini/antigravity-cli/agy-hud/config.json".to_string(),
+        heartbeat: None,
+    };
+    let ctx = CommandContext {
+        facts: &facts,
+        paths: &LogicPaths::default(),
+        now_ms: 1_700_000_000_000,
+        config_text: None,
+        cli_settings_text: None,
+        last_snapshot_text: None,
+        update_cache_text: None,
+        transcript_head: None,
+        transcript_tail: None,
+        task_md_text: None,
+    };
+
+    let schema_out = execute_subcommand("schema", &["art".to_string()], &ctx);
+    assert!(!schema_out.failed);
+    let schema_plain = schema_out
+        .lines
+        .iter()
+        .map(|l| strip_ansi(l))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(schema_plain.contains("display.showArtifacts"));
+    assert!(schema_plain.contains("stdin.artifact_count"));
+    assert!(schema_plain.contains("产物"));
+
+    let preview_default = execute_subcommand(
+        "preview",
+        &[
+            "--state".to_string(),
+            "tool_use".to_string(),
+            "--width".to_string(),
+            "120".to_string(),
+        ],
+        &ctx,
+    );
+    assert!(!preview_default.failed);
+    let preview_default_plain = preview_default
+        .lines
+        .iter()
+        .map(|l| strip_ansi(l))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(preview_default_plain.contains("tasks 1"));
+    assert!(!preview_default_plain.contains("art 2"));
+
+    let preview_opt_in = execute_subcommand(
+        "preview",
+        &[
+            "--state".to_string(),
+            "tool_use".to_string(),
+            "--width".to_string(),
+            "120".to_string(),
+            "--set".to_string(),
+            "display.showArtifacts=true".to_string(),
+        ],
+        &ctx,
+    );
+    assert!(!preview_opt_in.failed);
+    let preview_opt_in_plain = preview_opt_in
+        .lines
+        .iter()
+        .map(|l| strip_ansi(l))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(preview_opt_in_plain.contains("tasks 1"));
+    assert!(preview_opt_in_plain.contains("art 2"));
+
+    let preview_overflow_108_opt_in = execute_subcommand(
+        "preview",
+        &[
+            "--state".to_string(),
+            "tool_use".to_string(),
+            "--width".to_string(),
+            "108".to_string(),
+            "--set".to_string(),
+            "display.showArtifacts=true".to_string(),
+        ],
+        &ctx,
+    );
+    assert!(!preview_overflow_108_opt_in.failed);
+    let preview_overflow_108_plain = preview_overflow_108_opt_in
+        .lines
+        .iter()
+        .map(|l| strip_ansi(l))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(preview_overflow_108_plain.contains("tasks 1"));
+    assert!(
+        !preview_overflow_108_plain.contains("art 2"),
+        "expected preset width 108 budget overflow to trigger compact_meta and drop art 2: {preview_overflow_108_plain}"
+    );
 }
