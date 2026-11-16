@@ -68,7 +68,7 @@ Use `sh scripts/hud-cli.sh` (relative to this skill directory) to inspect, previ
      sh scripts/hud-cli.sh set display.showArtifacts=true
      ```
    - Speed badge (`display.showSpeed`): shows speed-tier emoji + `~tok/s` + session `(min~max)` range (`display.glyphMode=ascii` omits the emoji).
-   - Artifact count (`display.showArtifacts`): shows upstream `agy` `stdin.artifact_count` (`art`, or `产物` in `zh-Hans`) inside inline counts when `display.showCounts` is `true`. Off by default because `agy` can report `1` on fresh sessions before any user Markdown artifact exists.
+   - Artifact count (`display.showArtifacts`): shows upstream `agy` `stdin.artifact_count` (`art`, or `产物` in `zh-Hans`, `成果物` in `ja`) inside inline counts when `display.showCounts` is `true`. Off by default because `agy` can report `1` on fresh sessions before any user Markdown artifact exists.
    - Manually refresh the official `/usage` quota cache on demand:
      ```bash
      sh scripts/hud-cli.sh quota refresh

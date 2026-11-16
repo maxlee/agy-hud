@@ -326,8 +326,9 @@ fn run_doctor(args: &[String], ctx: &CommandContext<'_>) -> CommandOutput {
             "  Runtime          : {}",
             abbreviate_home_path(&ctx.facts.runtime.exec_path, home)
         ));
+        let locale_str = ctx.facts.locale.as_deref().unwrap_or("default");
         out.push(format!(
-            "  Environment      : {platform} · terminal={terminal} · session={session_label}"
+            "  Environment      : {platform} · terminal={terminal} · locale={locale_str} · session={session_label}"
         ));
         out.push(format!(
             "  StatusLine       : kind={kind} · enabled={enabled} · command={cmd_disp}"
@@ -869,7 +870,11 @@ fn run_preview(args: &[String], ctx: &CommandContext<'_>) -> CommandOutput {
             config_to_write: None,
         };
     }
-    let config = overridden.config;
+    let mut config = overridden.config;
+    if config.language == Language::Auto {
+        config.language =
+            crate::i18n::resolve_language(Language::Auto, ctx.facts.locale.as_deref());
+    }
 
     let explicit_width = flags
         .get("--width")

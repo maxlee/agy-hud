@@ -201,6 +201,7 @@ fn scrubbed_report_case_roundtrips_directly_into_corpus_evaluator() {
         platform: "macos".to_string(),
         terminal: "Ghostty".to_string(),
         remote_session: false,
+        locale: None,
         runtime: RuntimeFacts {
             engine: "rust-native".to_string(),
             version: "1.4.0".to_string(),

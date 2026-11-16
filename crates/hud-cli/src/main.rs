@@ -115,6 +115,15 @@ fn detect_remote_session() -> bool {
         || std::env::var_os("SSH_CLIENT").is_some()
 }
 
+fn detect_system_locale() -> Option<String> {
+    std::env::var("AGY_HUD_LANG")
+        .or_else(|_| std::env::var("LC_ALL"))
+        .or_else(|_| std::env::var("LC_MESSAGES"))
+        .or_else(|_| std::env::var("LANG"))
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+}
+
 fn parse_plugin_list_json(raw: &str) -> Option<(String, Option<InstalledPluginFacts>)> {
     let val: Value = serde_json::from_str(raw.trim()).ok()?;
     let arr = val
@@ -433,6 +442,7 @@ fn run() -> u8 {
             platform: detect_platform(),
             terminal: detect_terminal(),
             remote_session: detect_remote_session(),
+            locale: detect_system_locale(),
             runtime: RuntimeFacts {
                 engine: "rust-native".to_string(),
                 version: VERSION.to_string(),
@@ -536,7 +546,14 @@ fn run() -> u8 {
     let data_real = prepare_data_dir(&paths);
     let logic_paths = build_logic_paths(&paths, Some(&stdin_payload), data_real.as_deref());
     let config_text = read_bounded_string(&paths.config_path, MAX_CONFIG_BYTES as u64);
-    let loaded_cfg = parse_config_str(config_text.as_deref());
+    let mut loaded_cfg = parse_config_str(config_text.as_deref());
+    if loaded_cfg.config.language == hud_core::types::Language::Auto {
+        let sys_locale = detect_system_locale();
+        loaded_cfg.config.language = hud_core::i18n::resolve_language(
+            hud_core::types::Language::Auto,
+            sys_locale.as_deref(),
+        );
+    }
 
     let mut collected = collect_render_inputs(
         &paths,
