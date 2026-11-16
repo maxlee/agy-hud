@@ -1,3 +1,4 @@
+use hud_core::stdin::CompactionScope;
 use hud_core::types::{AgyStdinData, LogicPaths};
 use serde_json::{Map, Value};
 use std::collections::HashMap;
@@ -19,6 +20,7 @@ pub struct AgyPaths {
     pub update_cache_path: PathBuf,
     pub cost_ledger_path: PathBuf,
     pub transcript_cursor_dir: PathBuf,
+    pub compaction_ceilings_dir: PathBuf,
     pub probe_cache_dir: PathBuf,
     pub config_path: PathBuf,
     pub undo_path: PathBuf,
@@ -89,6 +91,7 @@ impl AgyPaths {
             update_cache_path: data_dir.join("update-cache.json"),
             cost_ledger_path: data_dir.join("cost-ledger.json"),
             transcript_cursor_dir: data_dir.join("transcript-cursors"),
+            compaction_ceilings_dir: data_dir.join("compaction-ceilings"),
             data_dir,
             probe_cache_dir: hud_home.join("probe-cache"),
             config_path: hud_home.join("config.json"),
@@ -113,6 +116,11 @@ impl AgyPaths {
     pub fn transcript_cursor_file_for(&self, transcript_path: &Path) -> PathBuf {
         let key = fnv1a_64_hex(&transcript_path.to_string_lossy());
         self.transcript_cursor_dir.join(format!("{key}.json"))
+    }
+
+    pub fn compaction_ceiling_file_for(&self, scope: &CompactionScope) -> PathBuf {
+        let key = fnv1a_64_hex(&scope.storage_key());
+        self.compaction_ceilings_dir.join(format!("{key}.json"))
     }
 }
 
@@ -365,6 +373,18 @@ pub fn build_logic_paths(
             .map(|d| d.join("speed-cache.json").to_string_lossy().into_owned()),
         cost_ledger: data_real_dir
             .map(|d| d.join("cost-ledger.json").to_string_lossy().into_owned()),
+        compaction_ceiling: match (data_real_dir, CompactionScope::from_stdin(stdin)) {
+            (Some(d), Some(scope)) => {
+                let key = fnv1a_64_hex(&scope.storage_key());
+                Some(
+                    d.join("compaction-ceilings")
+                        .join(format!("{key}.json"))
+                        .to_string_lossy()
+                        .into_owned(),
+                )
+            }
+            _ => None,
+        },
         transcript_cursor: match (data_real_dir, transcript_buf.as_deref()) {
             (Some(d), Some(tp)) => {
                 let key = fnv1a_64_hex(&tp.to_string_lossy());

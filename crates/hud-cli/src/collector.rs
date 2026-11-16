@@ -1227,6 +1227,10 @@ pub fn collect_render_inputs(
             .cost_ledger
             .as_deref()
             .and_then(|p| read_bounded_string(Path::new(p), 64 * 1024));
+        let compaction_ceiling = logic_paths
+            .compaction_ceiling
+            .as_deref()
+            .and_then(|p| read_bounded_string(Path::new(p), 4 * 1024));
 
         CollectedRenderData {
             transcript: tx_handle.join().unwrap_or_default(),
@@ -1237,6 +1241,7 @@ pub fn collect_render_inputs(
                 update_cache,
                 speed_cache,
                 cost_ledger,
+                compaction_ceiling,
             },
         }
     })

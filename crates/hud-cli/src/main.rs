@@ -16,13 +16,18 @@ use hud_core::ansi::terminal_filter_with_repo;
 use hud_core::commands::{CommandContext, execute_subcommand};
 use hud_core::config::{MAX_CONFIG_BYTES, parse_config_str};
 use hud_core::probes::{
-    apply_speed_cache, parse_cached_quota_info, parse_cost_ledger_info, parse_memory_info,
-    parse_speed_cache_info, parse_update_cache_info, parse_vcs_info, reconcile_cost_ledger,
+    apply_speed_cache, parse_cached_quota_info, parse_compaction_ceiling_info,
+    parse_compaction_ceiling_record, parse_cost_ledger_info, parse_memory_info,
+    parse_speed_cache_info, parse_update_cache_info, parse_vcs_info, reconcile_compaction_ceiling,
+    reconcile_cost_ledger,
 };
-use hud_core::render::{RenderInput, format_config_problem_line, render_hud_lines_full};
+use hud_core::render::{
+    RenderExtras, RenderInput, format_config_problem_line, render_hud_lines_full,
+};
+use hud_core::stdin::CompactionScope;
 use hud_core::types::{
     AgyStdinData, CostLedgerSnapshot, DoctorFacts, HeartbeatInfo, InstalledPluginFacts,
-    PluginFacts, RuntimeFacts,
+    LearnedCompactionState, LogicPaths, PluginFacts, ProbeAnswers, RuntimeFacts, TranscriptSummary,
 };
 use serde_json::{Value, json};
 use std::io::{IsTerminal, Write};
@@ -261,6 +266,54 @@ fn write_heartbeat(heartbeat_path: &Path, info: &HeartbeatInfo) {
     if let Ok(bytes) = serde_json::to_vec(info) {
         let _ = atomic_write_bytes(heartbeat_path, &bytes, 0o600);
     }
+}
+
+fn sync_compaction_ceiling(
+    logic_paths: &LogicPaths,
+    stdin: &AgyStdinData,
+    transcript: &TranscriptSummary,
+    probes: &mut ProbeAnswers,
+    now_ms: i64,
+) -> Option<LearnedCompactionState> {
+    let scope = CompactionScope::from_stdin(Some(stdin))?;
+    let existing = parse_compaction_ceiling_info(probes, Some(&scope));
+    let (effective, maybe_write) =
+        reconcile_compaction_ceiling(existing.as_ref(), &scope, Some(stdin), transcript, now_ms);
+
+    if maybe_write.is_some()
+        && let Some(ref ceiling_str_path) = logic_paths.compaction_ceiling
+    {
+        let ceiling_path = Path::new(ceiling_str_path);
+        let lock_path = ceiling_path.with_extension("lock");
+        if let Some((locked_effective, fresh_raw)) =
+            with_exclusive_lock_file(&lock_path, 2_000, || {
+                let fresh_raw = read_bounded_string(ceiling_path, 4 * 1024);
+                let fresh_existing = fresh_raw
+                    .as_deref()
+                    .and_then(|raw| parse_compaction_ceiling_record(raw, Some(&scope)));
+                let (locked_eff, locked_write) = reconcile_compaction_ceiling(
+                    fresh_existing.as_ref(),
+                    &scope,
+                    Some(stdin),
+                    transcript,
+                    now_ms,
+                );
+                let mut next_raw = fresh_raw;
+                if let Some(updated) = locked_write
+                    && let Ok(serialized) = serde_json::to_string(&updated)
+                {
+                    let _ = atomic_write_bytes(ceiling_path, serialized.as_bytes(), 0o600);
+                    next_raw = Some(serialized);
+                }
+                (locked_eff, next_raw)
+            })
+        {
+            probes.compaction_ceiling = fresh_raw;
+            return locked_effective;
+        }
+    }
+
+    effective
 }
 
 fn run() -> u8 {
@@ -550,6 +603,14 @@ fn run() -> u8 {
         None
     };
 
+    let learned_ceiling = sync_compaction_ceiling(
+        &logic_paths,
+        &stdin_payload,
+        &collected.transcript,
+        &mut collected.probes,
+        started_ms,
+    );
+
     let vcs = parse_vcs_info(Some(&stdin_payload), &collected.probes);
     let memory = parse_memory_info(&collected.probes);
     let cached_quota = parse_cached_quota_info(&collected.probes);
@@ -568,7 +629,10 @@ fn run() -> u8 {
             columns,
             now_ms: started_ms,
         },
-        cost_totals.as_ref(),
+        RenderExtras {
+            cost_totals: cost_totals.as_ref(),
+            compaction_ceiling: learned_ceiling,
+        },
     );
     if let Some(problem_line) =
         format_config_problem_line(&loaded_cfg.problems, &loaded_cfg.config, columns)
@@ -584,6 +648,7 @@ fn run() -> u8 {
             "probes": &collected.probes,
             "compactionCount": collected.transcript.compaction_count,
             "lastCompactionTokens": collected.transcript.last_compaction_tokens,
+            "lastCompactionAtMs": collected.transcript.last_compaction_at_ms,
         });
         if let Ok(bytes) = serde_json::to_vec(&snap_json) {
             let _ = atomic_write_bytes(Path::new(snap_path), &bytes, 0o600);

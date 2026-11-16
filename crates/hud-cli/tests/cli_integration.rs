@@ -1636,3 +1636,216 @@ fn live_binary_cross_session_cost_ledger_and_invalid_config_warning_line() {
     assert!(plain3.contains("Week $1.25"), "plain3: {plain3}");
     assert!(hud_home.join("data/cost-ledger.json").is_file());
 }
+
+#[test]
+fn live_binary_learns_model_compaction_ceiling_across_sessions_and_hides_200k_badge() {
+    let tmp = TempDir::new("live-compaction-learning");
+    let cli_dir = tmp.path.join("cli");
+    let hud_home = cli_dir.join("agy-hud");
+    fs::create_dir_all(&hud_home).unwrap();
+
+    let env_vars: [(&str, &Path); 2] = [
+        ("AGY_CLI_DIR", cli_dir.as_path()),
+        ("AGY_HUD_HOME", hud_home.as_path()),
+    ];
+
+    let write_transcript = |conv_id: &str, ckpt_iso: &str, ckpt_cache_read: u64| {
+        let log_dir = cli_dir
+            .join("brain")
+            .join(conv_id)
+            .join(".system_generated/logs");
+        fs::create_dir_all(&log_dir).unwrap();
+        let lines = [
+            json!({
+                "step_index": 0,
+                "source": "USER_EXPLICIT",
+                "type": "USER_INPUT",
+                "status": "DONE",
+                "created_at": "2026-11-10T00:00:00Z",
+                "content": "Start session"
+            }),
+            json!({
+                "step_index": 1,
+                "source": "SYSTEM",
+                "type": "CHECKPOINT",
+                "status": "DONE",
+                "created_at": ckpt_iso,
+                "input_tokens": 5_000,
+                "cache_read_tokens": ckpt_cache_read,
+                "output_tokens": 2_000,
+                "content": "# Resuming from a compaction"
+            }),
+            json!({
+                "step_index": 2,
+                "source": "MODEL",
+                "type": "PLANNER_RESPONSE",
+                "status": "DONE",
+                "created_at": ckpt_iso,
+                "output_tokens": 120,
+                "content": "Done"
+            }),
+        ];
+        let body = lines
+            .iter()
+            .map(serde_json::to_string)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+            .join("\n")
+            + "\n";
+        let path = log_dir.join("transcript.jsonl");
+        fs::write(&path, body).unwrap();
+        path
+    };
+
+    let tx1 = write_transcript("conv-512k-learn", "2026-11-10T01:00:00Z", 510_000);
+    let payload_s1 = json!({
+        "cwd": tmp.path,
+        "conversation_id": "conv-512k-learn",
+        "transcript_path": tx1,
+        "agent_state": "idle",
+        "terminal_width": 140,
+        "exceeds_200k_tokens": true,
+        "model": { "id": "Gemini 5 Ultra (High)", "display_name": "Gemini 5 Ultra (High)", "effort": "high" },
+        "context_window": {
+            "context_window_size": 1_048_576,
+            "current_usage": { "input_tokens": 256_000, "output_tokens": 0 }
+        }
+    })
+    .to_string();
+    let (ok1, out1) = run_bin(&[], &env_vars, Some(&payload_s1));
+    assert!(ok1, "session 1 failed: {out1}");
+    let plain1 = strip_ansi(&out1);
+    assert!(
+        plain1.contains("50.0% (256k/512k · ↻1)"),
+        "plain1: {plain1}"
+    );
+    assert!(!plain1.contains("200k+"), "200k+ must not appear: {plain1}");
+
+    let ceilings_dir = hud_home.join("data/compaction-ceilings");
+    let shard_files: Vec<PathBuf> = fs::read_dir(&ceilings_dir)
+        .expect("compaction-ceilings dir created")
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("json"))
+        .collect();
+    assert_eq!(
+        shard_files.len(),
+        1,
+        "expected 1 shard file: {shard_files:?}"
+    );
+    let shard1: Value =
+        serde_json::from_str(&fs::read_to_string(&shard_files[0]).unwrap()).unwrap();
+    assert_eq!(shard1["kind"], "learned");
+    assert_eq!(shard1["ceiling_tokens"], 512_000);
+    assert_eq!(shard1["modelFamily"], "gemini 5 ultra");
+
+    let snap_raw = fs::read_to_string(hud_home.join("data/last-snapshot.json")).unwrap();
+    let snap_val: Value = serde_json::from_str(&snap_raw).unwrap();
+    assert!(snap_val["lastCompactionAtMs"].as_i64().is_some());
+
+    let (ok_prev, out_prev) = run_bin(&["preview", "--last"], &env_vars, None);
+    assert!(ok_prev, "preview --last failed: {out_prev}");
+    assert!(strip_ansi(&out_prev).contains("50.0% (256k/512k · ↻1)"));
+
+    let payload_s2_low = json!({
+        "cwd": tmp.path,
+        "conversation_id": "conv-512k-low-fresh",
+        "agent_state": "idle",
+        "terminal_width": 140,
+        "exceeds_200k_tokens": true,
+        "model": { "id": "Gemini 5 Ultra (Low)", "display_name": "Gemini 5 Ultra (Low)", "effort": "low" },
+        "context_window": {
+            "context_window_size": 1_048_576,
+            "current_usage": { "input_tokens": 256_000, "output_tokens": 0 }
+        }
+    })
+    .to_string();
+    let (ok2, out2) = run_bin(&[], &env_vars, Some(&payload_s2_low));
+    assert!(ok2, "session 2 failed: {out2}");
+    let plain2 = strip_ansi(&out2);
+    assert!(plain2.contains("50.0% (256k/512k)"), "plain2: {plain2}");
+    assert!(!plain2.contains("200k+"), "plain2: {plain2}");
+
+    let tx_stale = write_transcript("conv-older-256k", "2026-11-10T00:30:00Z", 251_500);
+    let payload_s3_stale = json!({
+        "cwd": tmp.path,
+        "conversation_id": "conv-older-256k",
+        "transcript_path": tx_stale,
+        "agent_state": "idle",
+        "terminal_width": 140,
+        "model": { "id": "Gemini 5 Ultra (Medium)", "display_name": "Gemini 5 Ultra (Medium)", "effort": "medium" },
+        "context_window": {
+            "context_window_size": 1_048_576,
+            "current_usage": { "input_tokens": 128_000, "output_tokens": 0 }
+        }
+    })
+    .to_string();
+    let (ok3, out3) = run_bin(&[], &env_vars, Some(&payload_s3_stale));
+    assert!(ok3, "session 3 failed: {out3}");
+    assert!(strip_ansi(&out3).contains("50.0% (128k/256k · ↻1)"));
+    let shard_after_stale: Value =
+        serde_json::from_str(&fs::read_to_string(&shard_files[0]).unwrap()).unwrap();
+    assert_eq!(shard_after_stale["kind"], "learned");
+    assert_eq!(shard_after_stale["ceiling_tokens"], 512_000);
+
+    let payload_524k = json!({
+        "cwd": tmp.path,
+        "conversation_id": "conv-524k-win",
+        "agent_state": "idle",
+        "terminal_width": 140,
+        "model": { "id": "Gemini 5 Ultra (Low)", "display_name": "Gemini 5 Ultra (Low)", "effort": "low" },
+        "context_window": {
+            "context_window_size": 524_288,
+            "current_usage": { "input_tokens": 256_000, "output_tokens": 0 }
+        }
+    })
+    .to_string();
+    let (ok_524, out_524) = run_bin(&[], &env_vars, Some(&payload_524k));
+    assert!(ok_524, "524k session failed: {out_524}");
+    let plain_524 = strip_ansi(&out_524);
+    assert!(
+        plain_524.contains("256k/524k"),
+        "expected isolated 524k window: {plain_524}"
+    );
+
+    let payload_bypass = json!({
+        "cwd": tmp.path,
+        "conversation_id": "conv-bypass-650k",
+        "agent_state": "idle",
+        "terminal_width": 140,
+        "model": { "id": "Gemini 5 Ultra (Low)", "display_name": "Gemini 5 Ultra (Low)", "effort": "low" },
+        "context_window": {
+            "context_window_size": 1_048_576,
+            "current_usage": { "input_tokens": 650_000, "output_tokens": 0 }
+        }
+    })
+    .to_string();
+    let (ok_byp, out_byp) = run_bin(&[], &env_vars, Some(&payload_bypass));
+    assert!(ok_byp, "bypass session failed: {out_byp}");
+    assert!(strip_ansi(&out_byp).contains("650k/1.0M"));
+    let shard_inv: Value =
+        serde_json::from_str(&fs::read_to_string(&shard_files[0]).unwrap()).unwrap();
+    assert_eq!(shard_inv["kind"], "invalidated");
+    assert_eq!(shard_inv["bypassed_tokens"], 650_000);
+    assert_eq!(shard_inv["previous_ceiling_tokens"], 512_000);
+
+    let payload_after_inv = json!({
+        "cwd": tmp.path,
+        "conversation_id": "conv-after-inv",
+        "agent_state": "idle",
+        "terminal_width": 140,
+        "model": { "id": "Gemini 5 Ultra (High)", "display_name": "Gemini 5 Ultra (High)", "effort": "high" },
+        "context_window": {
+            "context_window_size": 1_048_576,
+            "current_usage": { "input_tokens": 200_000, "output_tokens": 0 }
+        }
+    })
+    .to_string();
+    let (ok_post, out_post) = run_bin(&[], &env_vars, Some(&payload_after_inv));
+    assert!(ok_post, "post-invalidation session failed: {out_post}");
+    let plain_post = strip_ansi(&out_post);
+    assert!(
+        plain_post.contains("200k/1.0M"),
+        "expected physical window after invalidation: {plain_post}"
+    );
+}
