@@ -434,6 +434,8 @@ pub struct TranscriptSummary {
     pub compaction_count: u32,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub last_compaction_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub last_compaction_at_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -585,6 +587,8 @@ pub struct TranscriptCursor {
     pub compaction_count: u32,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub last_compaction_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub last_compaction_at_ms: Option<i64>,
     #[serde(default)]
     pub folded_tools: Vec<ToolEntry>,
     #[serde(default)]
@@ -648,6 +652,52 @@ pub struct ProbeAnswers {
     pub speed_cache: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub cost_ledger: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub compaction_ceiling: Option<String>,
+}
+
+pub const COMPACTION_CEILING_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LearnedCompactionState {
+    Ceiling(u64),
+    Invalidated,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CompactionCeilingState {
+    Learned {
+        ceiling_tokens: u64,
+        observed_tokens: u64,
+    },
+    Invalidated {
+        bypassed_tokens: u64,
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        previous_ceiling_tokens: Option<u64>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompactionCeilingRecord {
+    pub version: u32,
+    pub model_family: String,
+    pub phys_win: u64,
+    #[serde(flatten)]
+    pub state: CompactionCeilingState,
+    pub updated_at_ms: i64,
+}
+
+impl CompactionCeilingRecord {
+    pub fn as_learned_state(&self) -> LearnedCompactionState {
+        match self.state {
+            CompactionCeilingState::Learned { ceiling_tokens, .. } => {
+                LearnedCompactionState::Ceiling(ceiling_tokens)
+            }
+            CompactionCeilingState::Invalidated { .. } => LearnedCompactionState::Invalidated,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -723,6 +773,8 @@ pub struct LogicPaths {
     pub speed_cache: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub cost_ledger: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub compaction_ceiling: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub transcript_cursor: Option<String>,
     pub cli_settings: String,

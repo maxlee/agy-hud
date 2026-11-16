@@ -1,13 +1,18 @@
 use crate::ansi::sanitize_text;
+use crate::stdin::{
+    CompactionScope, MIN_COMPACTION_OBSERVATION_TOKENS, extract_context_metrics,
+    normalize_model_family_str, resolve_compaction_ceiling, snap_compaction_ceiling,
+};
 use crate::transcript::{
     MAX_VALID_TPS_X10, MIN_VALID_TPS_X10, adjust_coarse_dt_ms, blend_tps_ewma_x10, compute_tps_x10,
     estimate_ttft_overhead_ms, merge_min_max_pair_x10, parse_iso_ms, update_min_max_x10,
     update_speed_anchors,
 };
 use crate::types::{
-    ActiveSpeedSample, AgyStdinData, CachedQuotaSnapshot, CostLedgerSnapshot, CostTotals,
-    MemoryProbeInfo, ProbeAnswers, RawQuotaBucket, SessionCostEntry, SpeedCacheSnapshot,
-    TranscriptSummary, UpdateCacheSnapshot, VcsProbeInfo, VcsType,
+    ActiveSpeedSample, AgyStdinData, COMPACTION_CEILING_VERSION, CachedQuotaSnapshot,
+    CompactionCeilingRecord, CompactionCeilingState, CostLedgerSnapshot, CostTotals,
+    LearnedCompactionState, MemoryProbeInfo, ProbeAnswers, RawQuotaBucket, SessionCostEntry,
+    SpeedCacheSnapshot, TranscriptSummary, UpdateCacheSnapshot, VcsProbeInfo, VcsType,
 };
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -1316,6 +1321,184 @@ pub fn reconcile_cost_ledger(
     };
     let changed = existing != Some(&ledger);
     (Some(totals), changed.then_some(ledger))
+}
+
+pub fn parse_compaction_ceiling_record(
+    raw_json: &str,
+    expected_scope: Option<&CompactionScope>,
+) -> Option<CompactionCeilingRecord> {
+    let mut parsed = serde_json::from_str::<CompactionCeilingRecord>(raw_json).ok()?;
+    if parsed.version != COMPACTION_CEILING_VERSION || parsed.phys_win == 0 {
+        return None;
+    }
+    parsed.model_family = normalize_model_family_str(&parsed.model_family, None)?;
+
+    match parsed.state {
+        CompactionCeilingState::Learned {
+            ceiling_tokens,
+            observed_tokens,
+        } => {
+            if ceiling_tokens == 0
+                || ceiling_tokens >= parsed.phys_win
+                || observed_tokens < MIN_COMPACTION_OBSERVATION_TOKENS
+                || snap_compaction_ceiling(observed_tokens) != Some(ceiling_tokens)
+            {
+                return None;
+            }
+        }
+        CompactionCeilingState::Invalidated {
+            bypassed_tokens,
+            previous_ceiling_tokens,
+        } => {
+            if bypassed_tokens < MIN_COMPACTION_OBSERVATION_TOKENS {
+                return None;
+            }
+            if let Some(prev) = previous_ceiling_tokens
+                && (prev < MIN_COMPACTION_OBSERVATION_TOKENS
+                    || prev >= parsed.phys_win
+                    || snap_compaction_ceiling(prev) != Some(prev))
+            {
+                return None;
+            }
+        }
+    }
+
+    if let Some(scope) = expected_scope
+        && (parsed.model_family != scope.model_family() || parsed.phys_win != scope.phys_win())
+    {
+        return None;
+    }
+
+    Some(parsed)
+}
+
+pub fn parse_compaction_ceiling_info(
+    answers: &ProbeAnswers,
+    expected_scope: Option<&CompactionScope>,
+) -> Option<CompactionCeilingRecord> {
+    let raw_json = answers.compaction_ceiling.as_deref()?;
+    parse_compaction_ceiling_record(raw_json, expected_scope)
+}
+
+/// Emits an updated `CompactionCeilingRecord` only on semantic state transitions and rejects
+/// older `last_compaction_at_ms` events so idle sessions cannot overwrite newer invalidations.
+pub fn reconcile_compaction_ceiling(
+    existing: Option<&CompactionCeilingRecord>,
+    scope: &CompactionScope,
+    stdin: Option<&AgyStdinData>,
+    transcript: &TranscriptSummary,
+    now_ms: i64,
+) -> (
+    Option<LearnedCompactionState>,
+    Option<CompactionCeilingRecord>,
+) {
+    let scoped_existing = existing.filter(|r| {
+        r.version == COMPACTION_CEILING_VERSION
+            && r.model_family == scope.model_family()
+            && r.phys_win == scope.phys_win()
+    });
+
+    let mut next_write: Option<CompactionCeilingRecord> = None;
+
+    if transcript.compaction_count > 0
+        && let Some(raw_obs) = transcript.last_compaction_tokens
+        && let Some(snapped) = snap_compaction_ceiling(raw_obs).filter(|&c| c < scope.phys_win())
+    {
+        let event_ts = transcript.last_compaction_at_ms.unwrap_or(now_ms);
+        match scoped_existing {
+            None => {
+                if event_ts > 0 {
+                    next_write = Some(CompactionCeilingRecord {
+                        version: COMPACTION_CEILING_VERSION,
+                        model_family: scope.model_family().to_string(),
+                        phys_win: scope.phys_win(),
+                        state: CompactionCeilingState::Learned {
+                            ceiling_tokens: snapped,
+                            observed_tokens: raw_obs,
+                        },
+                        updated_at_ms: event_ts,
+                    });
+                }
+            }
+            Some(prev) => match prev.state {
+                CompactionCeilingState::Learned { ceiling_tokens, .. }
+                    if ceiling_tokens == snapped => {}
+                CompactionCeilingState::Invalidated {
+                    bypassed_tokens, ..
+                } => {
+                    let allow = transcript
+                        .last_compaction_at_ms
+                        .is_some_and(|ts| ts > prev.updated_at_ms)
+                        || snapped > bypassed_tokens;
+                    if allow && event_ts > 0 {
+                        next_write = Some(CompactionCeilingRecord {
+                            version: COMPACTION_CEILING_VERSION,
+                            model_family: scope.model_family().to_string(),
+                            phys_win: scope.phys_win(),
+                            state: CompactionCeilingState::Learned {
+                                ceiling_tokens: snapped,
+                                observed_tokens: raw_obs,
+                            },
+                            updated_at_ms: event_ts.max(prev.updated_at_ms),
+                        });
+                    }
+                }
+                CompactionCeilingState::Learned { .. } => {
+                    if let Some(ts) = transcript.last_compaction_at_ms
+                        && ts > 0
+                        && ts >= prev.updated_at_ms
+                    {
+                        next_write = Some(CompactionCeilingRecord {
+                            version: COMPACTION_CEILING_VERSION,
+                            model_family: scope.model_family().to_string(),
+                            phys_win: scope.phys_win(),
+                            state: CompactionCeilingState::Learned {
+                                ceiling_tokens: snapped,
+                                observed_tokens: raw_obs,
+                            },
+                            updated_at_ms: ts,
+                        });
+                    }
+                }
+            },
+        }
+    } else {
+        let raw = extract_context_metrics(stdin);
+        let res = resolve_compaction_ceiling(
+            scope.phys_win(),
+            transcript.compaction_count,
+            transcript.last_compaction_tokens,
+            scoped_existing.map(CompactionCeilingRecord::as_learned_state),
+            raw.used_tokens,
+            raw.current_usage_tokens,
+        );
+        if let Some((bypassed_tokens, prev_ceiling)) = res.stale_bypass
+            && now_ms > 0
+            && bypassed_tokens >= MIN_COMPACTION_OBSERVATION_TOKENS
+            && !matches!(
+                scoped_existing.map(|r| &r.state),
+                Some(CompactionCeilingState::Invalidated { .. })
+            )
+            && scoped_existing.is_none_or(|r| now_ms >= r.updated_at_ms)
+        {
+            next_write = Some(CompactionCeilingRecord {
+                version: COMPACTION_CEILING_VERSION,
+                model_family: scope.model_family().to_string(),
+                phys_win: scope.phys_win(),
+                state: CompactionCeilingState::Invalidated {
+                    bypassed_tokens,
+                    previous_ceiling_tokens: prev_ceiling,
+                },
+                updated_at_ms: now_ms,
+            });
+        }
+    }
+
+    let effective = next_write
+        .as_ref()
+        .or(scoped_existing)
+        .map(CompactionCeilingRecord::as_learned_state);
+    (effective, next_write)
 }
 
 #[cfg(test)]

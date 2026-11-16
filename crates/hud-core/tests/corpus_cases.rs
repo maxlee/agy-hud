@@ -2,10 +2,11 @@ use hud_core::ansi::{strip_ansi, text_width};
 use hud_core::commands::{CommandContext, execute_subcommand};
 use hud_core::config::parse_config_str;
 use hud_core::probes::{
-    parse_cached_quota_info, parse_cost_ledger_info, parse_memory_info, parse_vcs_info,
-    reconcile_cost_ledger,
+    parse_cached_quota_info, parse_compaction_ceiling_info, parse_cost_ledger_info,
+    parse_memory_info, parse_vcs_info, reconcile_compaction_ceiling, reconcile_cost_ledger,
 };
-use hud_core::render::{RenderInput, render_hud_lines_full};
+use hud_core::render::{RenderExtras, RenderInput, render_hud_lines_full};
+use hud_core::stdin::CompactionScope;
 use hud_core::types::{
     AgyStdinData, DoctorFacts, LogicPaths, PluginFacts, ProbeAnswers, RuntimeFacts,
     TranscriptSummary,
@@ -51,6 +52,17 @@ fn evaluate_corpus_case(case: &CorpusCase) -> Result<(), String> {
     let ledger_snap = parse_cost_ledger_info(&case.probes);
     let (cost_totals, _) =
         reconcile_cost_ledger(ledger_snap.as_ref(), case.stdin.as_ref(), case.now_ms);
+    let compaction_ceiling = CompactionScope::from_stdin(case.stdin.as_ref()).and_then(|scope| {
+        let existing = parse_compaction_ceiling_info(&case.probes, Some(&scope));
+        reconcile_compaction_ceiling(
+            existing.as_ref(),
+            &scope,
+            case.stdin.as_ref(),
+            &case.transcript,
+            case.now_ms,
+        )
+        .0
+    });
 
     let live_cols = case
         .columns
@@ -67,7 +79,10 @@ fn evaluate_corpus_case(case: &CorpusCase) -> Result<(), String> {
             columns: live_cols,
             now_ms: case.now_ms,
         },
-        cost_totals.as_ref(),
+        RenderExtras {
+            cost_totals: cost_totals.as_ref(),
+            compaction_ceiling,
+        },
     );
 
     let effective_width = match (loaded.config.max_width, live_cols) {

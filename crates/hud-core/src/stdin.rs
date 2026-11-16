@@ -2,7 +2,8 @@ use crate::ansi::sanitize_text;
 use crate::transcript::parse_iso_ms;
 use crate::types::{
     AgyStdinData, CachedQuotaSnapshot, ContextScaleMode, EffortFormatMode, GlyphMode,
-    ModelFormatMode, ModelStdin, PathLevels, QuotaBucketView, QuotaPace, RawQuotaBucket,
+    LearnedCompactionState, ModelFormatMode, ModelStdin, PathLevels, QuotaBucketView, QuotaPace,
+    RawQuotaBucket,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -20,8 +21,8 @@ pub struct ContextMetrics {
     pub used_percent: f64,
     pub remaining_percent: f64,
     pub used_tokens: Option<u64>,
+    pub current_usage_tokens: Option<u64>,
     pub window_size: Option<u64>,
-    pub exceeds_200k: bool,
     pub cache_hit_percent: Option<u64>,
 }
 
@@ -55,6 +56,13 @@ fn effort_short(effort_lower: &str) -> &str {
     }
 }
 
+pub(crate) fn is_effort_token(raw: &str) -> bool {
+    matches!(
+        raw.trim().to_ascii_lowercase().as_str(),
+        "low" | "med" | "medium" | "high" | "xhigh" | "x-high" | "max" | "thinking" | "minimal"
+    )
+}
+
 fn extract_trailing_paren_effort(raw_name: &str) -> Option<&str> {
     let trimmed = raw_name.trim_end();
     let open = trimmed.rfind('(')?;
@@ -62,13 +70,130 @@ fn extract_trailing_paren_effort(raw_name: &str) -> Option<&str> {
         return None;
     }
     let inside = &trimmed[open + 1..trimmed.len() - 1];
-    if matches!(
-        inside.to_ascii_lowercase().as_str(),
-        "low" | "medium" | "high" | "xhigh" | "max" | "thinking"
-    ) {
-        Some(inside)
-    } else {
-        None
+    is_effort_token(inside).then_some(inside.trim())
+}
+
+const MAX_MODEL_FAMILY_BYTES: usize = 160;
+
+pub(crate) fn normalize_model_family_str(
+    raw_name: &str,
+    explicit_effort: Option<&str>,
+) -> Option<String> {
+    let mut s = sanitize_text(raw_name).trim().to_string();
+    if s.is_empty() {
+        return None;
+    }
+    let effort_clean = explicit_effort
+        .map(sanitize_text)
+        .map(|e| e.trim().to_ascii_lowercase())
+        .filter(|e| !e.is_empty());
+
+    loop {
+        if s.ends_with(')')
+            && let Some(open) = s.rfind('(')
+        {
+            let inside = &s[open + 1..s.len() - 1];
+            let matches_effort = is_effort_token(inside)
+                || effort_clean
+                    .as_deref()
+                    .is_some_and(|eff| inside.trim().eq_ignore_ascii_case(eff));
+            if !inside.contains('(') && matches_effort {
+                s.truncate(open);
+                s = s.trim_end().to_string();
+                continue;
+            }
+        }
+
+        if let Some(ref eff) = effort_clean
+            && is_effort_token(eff)
+            && s.len() > eff.len()
+        {
+            let split_idx = s.len() - eff.len();
+            if s.is_char_boundary(split_idx) && s[split_idx..].eq_ignore_ascii_case(eff) {
+                let sep_b = s.as_bytes()[split_idx - 1];
+                if (sep_b == b'-' || sep_b.is_ascii_whitespace())
+                    && !s[..split_idx - 1].trim().is_empty()
+                {
+                    s.truncate(split_idx - 1);
+                    s = s.trim_end().to_string();
+                    continue;
+                }
+            }
+        }
+
+        break;
+    }
+
+    let mut normalized = s
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase();
+    if normalized.len() > MAX_MODEL_FAMILY_BYTES {
+        let mut cut = 0;
+        for (idx, ch) in normalized.char_indices() {
+            let next = idx + ch.len_utf8();
+            if next > MAX_MODEL_FAMILY_BYTES {
+                break;
+            }
+            cut = next;
+        }
+        normalized.truncate(cut);
+        let trimmed_len = normalized.trim_end().len();
+        normalized.truncate(trimmed_len);
+    }
+    (!normalized.is_empty()).then_some(normalized)
+}
+
+/// Normalizes a model payload into a canonical lowercase model-family key for compaction learning,
+/// stripping effort suffixes while preserving architectural qualifiers such as `(Carbon)` or `(1M)`.
+pub fn normalize_model_family(model: Option<&ModelStdin>) -> Option<String> {
+    let model = model?;
+    let raw_candidate = model
+        .id
+        .as_deref()
+        .filter(|s| !sanitize_text(s).trim().is_empty())
+        .or_else(|| {
+            model
+                .display_name
+                .as_deref()
+                .filter(|s| !sanitize_text(s).trim().is_empty())
+        })?;
+    normalize_model_family_str(raw_candidate, model.effort.as_deref())
+}
+
+/// Non-empty normalized `model_family` paired with `phys_win > 0`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompactionScope {
+    model_family: String,
+    phys_win: u64,
+}
+
+impl CompactionScope {
+    pub fn from_stdin(stdin: Option<&AgyStdinData>) -> Option<Self> {
+        let s = stdin?;
+        let model_family = normalize_model_family(s.model.as_ref())?;
+        let phys_win = s
+            .context_window
+            .as_ref()?
+            .context_window_size
+            .filter(|&w| w > 0)?;
+        Some(Self {
+            model_family,
+            phys_win,
+        })
+    }
+
+    pub fn model_family(&self) -> &str {
+        &self.model_family
+    }
+
+    pub fn phys_win(&self) -> u64 {
+        self.phys_win
+    }
+
+    pub fn storage_key(&self) -> String {
+        format!("{}\n{}", self.model_family, self.phys_win)
     }
 }
 
@@ -215,15 +340,14 @@ pub fn format_session_cost(usd: f64) -> Option<String> {
 }
 
 pub fn extract_context_metrics(stdin: Option<&AgyStdinData>) -> ContextMetrics {
-    let exceeds_flag = stdin.and_then(|s| s.exceeds_200k_tokens).unwrap_or(false);
     let Some(cw) = stdin.and_then(|s| s.context_window.as_ref()) else {
         return ContextMetrics {
             has_data: false,
             used_percent: 0.0,
             remaining_percent: 100.0,
             used_tokens: None,
+            current_usage_tokens: None,
             window_size: None,
-            exceeds_200k: exceeds_flag,
             cache_hit_percent: None,
         };
     };
@@ -279,29 +403,145 @@ pub fn extract_context_metrics(stdin: Option<&AgyStdinData>) -> ContextMetrics {
         .unwrap_or_else(|| (100.0 - used_percent).max(0.0));
 
     let has_data = cw.used_percentage.is_some() || used_tokens.is_some() || window_size.is_some();
-    let exceeds_200k = exceeds_flag || used_tokens.is_some_and(|u| u > 200_000);
 
     ContextMetrics {
         has_data,
         used_percent,
         remaining_percent,
         used_tokens,
+        current_usage_tokens: current_context_tokens,
         window_size,
-        exceeds_200k,
         cache_hit_percent,
     }
 }
 
 pub const DEFAULT_COMPACTION_CEILING_TOKENS: u64 = 256_000;
+pub const MIN_COMPACTION_OBSERVATION_TOKENS: u64 = 32_000;
+pub const COLD_START_LARGE_WINDOW_MIN_TOKENS: u64 = 900_000;
 
-/// Extracts context metrics scaled either to the session's active auto-compaction watermark
-/// (`ContextScaleMode::Compaction`, `256k` default on `>= 1M` models) or the raw model window
-/// (`ContextScaleMode::Window`).
+/// Snaps single-turn checkpoint overshoot (`200k..=320k` -> `256k`, `440k..=620k` -> `512k`)
+/// and drops `< 32k` noise so minor turn overshoot does not jitter the denominator across ticks.
+pub fn snap_compaction_ceiling(observed_tokens: u64) -> Option<u64> {
+    if observed_tokens < MIN_COMPACTION_OBSERVATION_TOKENS {
+        None
+    } else if (200_000..=320_000).contains(&observed_tokens) {
+        Some(256_000)
+    } else if (440_000..=620_000).contains(&observed_tokens) {
+        Some(512_000)
+    } else {
+        Some(observed_tokens)
+    }
+}
+
+pub fn bypass_threshold_for(ceiling_tokens: u64, compaction_count: u32) -> u64 {
+    if compaction_count == 0 {
+        ceiling_tokens.saturating_mul(115) / 100
+    } else {
+        ceiling_tokens.saturating_mul(125) / 100
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CompactionInputs {
+    pub compaction_count: u32,
+    pub last_compaction_tokens: Option<u64>,
+    pub learned: Option<LearnedCompactionState>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CeilingSource {
+    SessionCheckpoint,
+    LearnedModelCache,
+    ColdStartDefault,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EffectiveCeiling {
+    Scaled {
+        ceiling_tokens: u64,
+        source: CeilingSource,
+    },
+    PhysicalWindow,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompactionResolution {
+    pub effective: EffectiveCeiling,
+    pub stale_bypass: Option<(u64, Option<u64>)>,
+}
+
+const _: () = assert!(COLD_START_LARGE_WINDOW_MIN_TOKENS > DEFAULT_COMPACTION_CEILING_TOKENS);
+
+/// Precedence: `SessionCheckpoint` > `LearnedModelCache` > `Invalidated` > `ColdStartDefault` (`>= 900k`).
+/// `stale_bypass` fires only when `authoritative_current_usage_tokens` exceeds the threshold so
+/// cumulative session token fallbacks never poison cross-session model caches.
+pub fn resolve_compaction_ceiling(
+    phys_win: u64,
+    compaction_count: u32,
+    last_compaction_tokens: Option<u64>,
+    learned: Option<LearnedCompactionState>,
+    used_tokens: Option<u64>,
+    authoritative_current_usage_tokens: Option<u64>,
+) -> CompactionResolution {
+    let session_ceiling = last_compaction_tokens
+        .and_then(snap_compaction_ceiling)
+        .filter(|&c| c < phys_win);
+
+    let (cand_ceiling, source, prev_learned_opt) = if let Some(c) = session_ceiling {
+        (c, CeilingSource::SessionCheckpoint, None)
+    } else if let Some(LearnedCompactionState::Ceiling(c)) = learned
+        && c > 0
+        && c < phys_win
+    {
+        (c, CeilingSource::LearnedModelCache, Some(c))
+    } else if matches!(learned, Some(LearnedCompactionState::Invalidated)) {
+        return CompactionResolution {
+            effective: EffectiveCeiling::PhysicalWindow,
+            stale_bypass: None,
+        };
+    } else if phys_win >= COLD_START_LARGE_WINDOW_MIN_TOKENS {
+        (
+            DEFAULT_COMPACTION_CEILING_TOKENS,
+            CeilingSource::ColdStartDefault,
+            None,
+        )
+    } else {
+        return CompactionResolution {
+            effective: EffectiveCeiling::PhysicalWindow,
+            stale_bypass: None,
+        };
+    };
+
+    let threshold = bypass_threshold_for(cand_ceiling, compaction_count);
+    if used_tokens.is_some_and(|u| u > threshold) {
+        let stale_bypass = if compaction_count == 0
+            && source != CeilingSource::SessionCheckpoint
+            && let Some(au) = authoritative_current_usage_tokens
+            && au > threshold
+        {
+            Some((au, prev_learned_opt))
+        } else {
+            None
+        };
+        return CompactionResolution {
+            effective: EffectiveCeiling::PhysicalWindow,
+            stale_bypass,
+        };
+    }
+
+    CompactionResolution {
+        effective: EffectiveCeiling::Scaled {
+            ceiling_tokens: cand_ceiling,
+            source,
+        },
+        stale_bypass: None,
+    }
+}
+
 pub fn extract_context_metrics_scaled(
     stdin: Option<&AgyStdinData>,
     scale: ContextScaleMode,
-    compaction_count: u32,
-    last_compaction_tokens: Option<u64>,
+    compaction: CompactionInputs,
 ) -> ContextMetrics {
     let raw = extract_context_metrics(stdin);
     if scale == ContextScaleMode::Window {
@@ -310,39 +550,26 @@ pub fn extract_context_metrics_scaled(
     let (Some(used_tok), Some(phys_win)) = (raw.used_tokens, raw.window_size) else {
         return raw;
     };
-    if phys_win <= DEFAULT_COMPACTION_CEILING_TOKENS {
-        return raw;
-    }
 
-    // Antigravity CLI triggers `CHECKPOINT` auto-compaction on 1.0M Gemini models at ~256k
-    // active prompt tokens (with normal single-turn overshoot into ~256k..=320k). Keep a
-    // steady 256k ceiling within that band while adapting if a future model compacts elsewhere.
-    let cand_ceiling = match last_compaction_tokens {
-        Some(obs) if obs >= 32_000 && !(200_000..=320_000).contains(&obs) => obs.min(phys_win),
-        _ => DEFAULT_COMPACTION_CEILING_TOKENS,
+    let resolution = resolve_compaction_ceiling(
+        phys_win,
+        compaction.compaction_count,
+        compaction.last_compaction_tokens,
+        compaction.learned,
+        Some(used_tok),
+        raw.current_usage_tokens,
+    );
+    let EffectiveCeiling::Scaled { ceiling_tokens, .. } = resolution.effective else {
+        return raw;
     };
-    if cand_ceiling == 0 || cand_ceiling >= phys_win {
-        return raw;
-    }
 
-    // Fall back to the physical model window when active tokens clearly bypass auto-compaction
-    // (e.g., direct API sessions without 256k compaction or high-context uncompacted windows).
-    let bypass_threshold = if compaction_count == 0 {
-        cand_ceiling.saturating_mul(115) / 100
-    } else {
-        cand_ceiling.saturating_mul(125) / 100
-    };
-    if used_tok > bypass_threshold {
-        return raw;
-    }
-
-    let used_percent = ((used_tok as f64 / cand_ceiling as f64) * 100.0).clamp(0.0, 100.0);
+    let used_percent = ((used_tok as f64 / ceiling_tokens as f64) * 100.0).clamp(0.0, 100.0);
     let remaining_percent = (100.0 - used_percent).max(0.0);
 
     ContextMetrics {
         used_percent,
         remaining_percent,
-        window_size: Some(cand_ceiling),
+        window_size: Some(ceiling_tokens),
         ..raw
     }
 }

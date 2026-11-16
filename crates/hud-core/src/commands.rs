@@ -5,16 +5,19 @@ use crate::config::{
 };
 use crate::probes::{
     apply_speed_cache, is_newer_semver, normalize_semver_tag, parse_cached_quota_info,
-    parse_cost_ledger_info, parse_memory_info, parse_speed_cache_info, parse_update_cache_info,
-    parse_vcs_info, reconcile_cost_ledger,
+    parse_compaction_ceiling_info, parse_compaction_ceiling_record, parse_cost_ledger_info,
+    parse_memory_info, parse_speed_cache_info, parse_update_cache_info, parse_vcs_info,
+    reconcile_compaction_ceiling, reconcile_cost_ledger,
 };
-use crate::render::{RenderInput, format_config_problem_line, render_hud_lines_full};
+use crate::render::{RenderExtras, RenderInput, format_config_problem_line, render_hud_lines_full};
+use crate::stdin::CompactionScope;
 use crate::transcript::parse_transcript_and_tasks;
 use crate::types::{
     AgyStdinData, CommandOutput, ContextWindowStdin, CostStdin, CurrentUsageStdin, DoctorFacts,
-    GlyphMode, Language, LogicPaths, ModelStdin, ProbeAnswers, RawQuotaBucket, SandboxStdin,
-    SubagentEntry, SubagentStatus, SubagentStdin, TodoItem, TodoStatus, ToolEntry, ToolStatus,
-    TranscriptSummary, UpdateCacheSnapshot, VcsProbeInfo, VimStdin, WorkspaceStdin,
+    GlyphMode, Language, LearnedCompactionState, LogicPaths, ModelStdin, ProbeAnswers,
+    RawQuotaBucket, SandboxStdin, SubagentEntry, SubagentStatus, SubagentStdin, TodoItem,
+    TodoStatus, ToolEntry, ToolStatus, TranscriptSummary, UpdateCacheSnapshot, VcsProbeInfo,
+    VimStdin, WorkspaceStdin,
 };
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
@@ -682,6 +685,7 @@ fn sample_presets(now_ms: i64) -> HashMap<&'static str, SamplePreset> {
         step_count: 24,
         compaction_count: 2,
         last_compaction_tokens: Some(256_000),
+        last_compaction_at_ms: None,
         active_slash_mode: None,
         completed_step_tps_x10: Some(640),
         resolved_tps_x10: None,
@@ -838,6 +842,19 @@ struct StoredSnapshot {
     compaction_count: Option<u32>,
     #[serde(default, rename = "lastCompactionTokens")]
     last_compaction_tokens: Option<u64>,
+    #[serde(default, rename = "lastCompactionAtMs")]
+    last_compaction_at_ms: Option<i64>,
+}
+
+fn resolve_compaction_state(
+    stdin: Option<&AgyStdinData>,
+    probes: &ProbeAnswers,
+    transcript: &TranscriptSummary,
+    now_ms: i64,
+) -> Option<LearnedCompactionState> {
+    let scope = CompactionScope::from_stdin(stdin)?;
+    let existing = parse_compaction_ceiling_info(probes, Some(&scope));
+    reconcile_compaction_ceiling(existing.as_ref(), &scope, stdin, transcript, now_ms).0
 }
 
 fn run_preview(args: &[String], ctx: &CommandContext<'_>) -> CommandOutput {
@@ -887,6 +904,11 @@ fn run_preview(args: &[String], ctx: &CommandContext<'_>) -> CommandOutput {
         }
         if transcript.last_compaction_tokens.is_none() {
             transcript.last_compaction_tokens = snap.last_compaction_tokens;
+            transcript.last_compaction_at_ms = snap.last_compaction_at_ms;
+        } else if transcript.last_compaction_at_ms.is_none()
+            && transcript.last_compaction_tokens == snap.last_compaction_tokens
+        {
+            transcript.last_compaction_at_ms = snap.last_compaction_at_ms;
         }
         let speed_cache = parse_speed_cache_info(&snap.probes);
         let _ = apply_speed_cache(
@@ -902,6 +924,8 @@ fn run_preview(args: &[String], ctx: &CommandContext<'_>) -> CommandOutput {
         let cost_ledger = parse_cost_ledger_info(&snap.probes);
         let (cost_totals, _) =
             reconcile_cost_ledger(cost_ledger.as_ref(), snap.stdin.as_ref(), ctx.now_ms);
+        let compaction_ceiling =
+            resolve_compaction_state(snap.stdin.as_ref(), &snap.probes, &transcript, ctx.now_ms);
         let cols = explicit_width
             .or_else(|| snap.stdin.as_ref().and_then(|s| s.terminal_width))
             .or(Some(100));
@@ -917,7 +941,10 @@ fn run_preview(args: &[String], ctx: &CommandContext<'_>) -> CommandOutput {
                 columns: cols,
                 now_ms: ctx.now_ms,
             },
-            cost_totals.as_ref(),
+            RenderExtras {
+                cost_totals: cost_totals.as_ref(),
+                compaction_ceiling,
+            },
         );
         if let Some(prob) = format_config_problem_line(&loaded.problems, &config, cols) {
             lines.push(prob);
@@ -980,6 +1007,8 @@ fn run_preview(args: &[String], ctx: &CommandContext<'_>) -> CommandOutput {
             out.push(paint(&format!("── {title} ──"), &[DIM, BOLD]));
             let vcs = parse_vcs_info(Some(&p.stdin), &p.probes);
             let memory = parse_memory_info(&p.probes);
+            let compaction_ceiling =
+                resolve_compaction_state(Some(&p.stdin), &p.probes, &p.transcript, ctx.now_ms);
             let rendered = render_hud_lines_full(
                 RenderInput {
                     stdin: Some(&p.stdin),
@@ -992,7 +1021,10 @@ fn run_preview(args: &[String], ctx: &CommandContext<'_>) -> CommandOutput {
                     columns: Some(explicit_width.unwrap_or(*width)),
                     now_ms: ctx.now_ms,
                 },
-                None,
+                RenderExtras {
+                    cost_totals: None,
+                    compaction_ceiling,
+                },
             );
             out.extend(rendered);
             if idx + 1 < scenarios.len() {
@@ -1009,6 +1041,8 @@ fn run_preview(args: &[String], ctx: &CommandContext<'_>) -> CommandOutput {
     if let Some(p) = presets.get(state_arg) {
         let vcs = parse_vcs_info(Some(&p.stdin), &p.probes);
         let memory = parse_memory_info(&p.probes);
+        let compaction_ceiling =
+            resolve_compaction_state(Some(&p.stdin), &p.probes, &p.transcript, ctx.now_ms);
         let cols = explicit_width.or(p.stdin.terminal_width).or(Some(108));
         let mut lines = render_hud_lines_full(
             RenderInput {
@@ -1022,7 +1056,10 @@ fn run_preview(args: &[String], ctx: &CommandContext<'_>) -> CommandOutput {
                 columns: cols,
                 now_ms: ctx.now_ms,
             },
-            None,
+            RenderExtras {
+                cost_totals: None,
+                compaction_ceiling,
+            },
         );
         if let Some(prob) = format_config_problem_line(&loaded.problems, &config, cols) {
             lines.push(prob);
@@ -1038,12 +1075,19 @@ fn run_preview(args: &[String], ctx: &CommandContext<'_>) -> CommandOutput {
     if let Ok(custom_stdin) = serde_json::from_str::<AgyStdinData>(state_arg) {
         let empty_probes = ProbeAnswers::default();
         let vcs = parse_vcs_info(Some(&custom_stdin), &empty_probes);
+        let empty_transcript = TranscriptSummary::default();
+        let compaction_ceiling = resolve_compaction_state(
+            Some(&custom_stdin),
+            &empty_probes,
+            &empty_transcript,
+            ctx.now_ms,
+        );
         let cols = explicit_width.or(custom_stdin.terminal_width).or(Some(100));
         let mut lines = render_hud_lines_full(
             RenderInput {
                 stdin: Some(&custom_stdin),
                 config: &config,
-                transcript: &TranscriptSummary::default(),
+                transcript: &empty_transcript,
                 vcs: vcs.as_ref(),
                 memory: None,
                 cached_quota: None,
@@ -1051,7 +1095,10 @@ fn run_preview(args: &[String], ctx: &CommandContext<'_>) -> CommandOutput {
                 columns: cols,
                 now_ms: ctx.now_ms,
             },
-            None,
+            RenderExtras {
+                cost_totals: None,
+                compaction_ceiling,
+            },
         );
         if let Some(prob) = format_config_problem_line(&loaded.problems, &config, cols) {
             lines.push(prob);
@@ -1163,6 +1210,11 @@ fn scrub_probes(probes: Option<&ProbeAnswers>) -> ProbeAnswers {
             v.repo_url = None;
             serde_json::to_string(&v).ok()
         });
+    let compaction_ceiling = p
+        .compaction_ceiling
+        .as_deref()
+        .and_then(|raw| parse_compaction_ceiling_record(raw, None))
+        .and_then(|rec| serde_json::to_string(&rec).ok());
     ProbeAnswers {
         vcs,
         memory: p.memory.clone(),
@@ -1170,6 +1222,7 @@ fn scrub_probes(probes: Option<&ProbeAnswers>) -> ProbeAnswers {
         update_cache: None,
         speed_cache: None,
         cost_ledger: None,
+        compaction_ceiling,
     }
 }
 
@@ -1219,8 +1272,15 @@ fn run_report(args: &[String], ctx: &CommandContext<'_>) -> CommandOutput {
     let report_transcript = TranscriptSummary {
         compaction_count: snap.as_ref().and_then(|s| s.compaction_count).unwrap_or(0),
         last_compaction_tokens: snap.as_ref().and_then(|s| s.last_compaction_tokens),
+        last_compaction_at_ms: snap.as_ref().and_then(|s| s.last_compaction_at_ms),
         ..TranscriptSummary::default()
     };
+    let compaction_ceiling = resolve_compaction_state(
+        scrubbed_stdin.as_ref(),
+        &scrubbed_probes,
+        &report_transcript,
+        ctx.now_ms,
+    );
 
     let rendered: Vec<String> = render_hud_lines_full(
         RenderInput {
@@ -1234,7 +1294,10 @@ fn run_report(args: &[String], ctx: &CommandContext<'_>) -> CommandOutput {
             columns: cols,
             now_ms: ctx.now_ms,
         },
-        None,
+        RenderExtras {
+            cost_totals: None,
+            compaction_ceiling,
+        },
     )
     .into_iter()
     .map(|l| strip_ansi(&l))

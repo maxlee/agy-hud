@@ -623,6 +623,7 @@ struct StepAccumulator {
     step_lines_seen: usize,
     compaction_count: u32,
     last_compaction_tokens: Option<u64>,
+    last_compaction_at_ms: Option<i64>,
 }
 
 impl StepAccumulator {
@@ -649,6 +650,7 @@ impl StepAccumulator {
                 step_lines_seen: 0,
                 compaction_count: 0,
                 last_compaction_tokens: None,
+                last_compaction_at_ms: None,
             };
         };
 
@@ -695,6 +697,7 @@ impl StepAccumulator {
             step_lines_seen: c.step_lines_seen,
             compaction_count: c.compaction_count,
             last_compaction_tokens: c.last_compaction_tokens,
+            last_compaction_at_ms: c.last_compaction_at_ms,
         }
     }
 
@@ -732,6 +735,7 @@ impl StepAccumulator {
                     .saturating_add(step.cache_creation_tokens.unwrap_or(0));
                 if prompt_tok > 0 {
                     self.last_compaction_tokens = Some(prompt_tok);
+                    self.last_compaction_at_ms = ts;
                 }
             }
             if step_type == "USER_INPUT" {
@@ -975,6 +979,7 @@ impl StepAccumulator {
             step_lines_seen: self.step_lines_seen,
             compaction_count: self.compaction_count,
             last_compaction_tokens: self.last_compaction_tokens,
+            last_compaction_at_ms: self.last_compaction_at_ms,
             folded_tools,
             subagents,
         }
@@ -1064,6 +1069,7 @@ impl StepAccumulator {
             },
             compaction_count: self.compaction_count,
             last_compaction_tokens: self.last_compaction_tokens,
+            last_compaction_at_ms: self.last_compaction_at_ms,
         }
     }
 }
@@ -1432,10 +1438,18 @@ mod tests {
             parse_transcript_with_cursor(None, head, Some(&part1), 0, None, None);
         assert_eq!(summary1.compaction_count, 1);
         assert_eq!(summary1.last_compaction_tokens, Some(256_915));
+        assert_eq!(
+            summary1.last_compaction_at_ms,
+            parse_iso_ms("2026-11-09T03:10:00Z")
+        );
         let cur1 = cursor1.expect("cursor emitted before latest turn");
         assert_eq!(cur1.version, TRANSCRIPT_CURSOR_VERSION);
         assert_eq!(cur1.compaction_count, 1);
         assert_eq!(cur1.last_compaction_tokens, Some(256_915));
+        assert_eq!(
+            cur1.last_compaction_at_ms,
+            parse_iso_ms("2026-11-09T03:10:00Z")
+        );
 
         // Append a second CHECKPOINT + trailing turn and resume from `cur1.offset`
         let more_steps = [
@@ -1472,7 +1486,16 @@ mod tests {
             parse_transcript_with_cursor(Some(&cur1), head, Some(delta), cur1.offset, None, None);
         assert_eq!(summary2.compaction_count, 2);
         assert_eq!(summary2.last_compaction_tokens, Some(258_806));
-        assert_eq!(cursor2.unwrap().compaction_count, 2);
+        assert_eq!(
+            summary2.last_compaction_at_ms,
+            parse_iso_ms("2026-11-09T03:25:00Z")
+        );
+        let cur2 = cursor2.unwrap();
+        assert_eq!(cur2.compaction_count, 2);
+        assert_eq!(
+            cur2.last_compaction_at_ms,
+            parse_iso_ms("2026-11-09T03:25:00Z")
+        );
 
         // Stale v1 cursor must be rejected on upgrade
         let mut stale_v1 = cur1;

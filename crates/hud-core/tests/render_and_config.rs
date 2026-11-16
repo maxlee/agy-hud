@@ -5,24 +5,29 @@ use hud_core::ansi::{
 use hud_core::commands::{CommandContext, execute_subcommand};
 use hud_core::config::{CONFIG_SCHEMA, HudConfig, parse_config_str, parse_set_pairs};
 use hud_core::probes::{
-    apply_speed_cache, is_newer_semver, normalize_github_repo_url, parse_cost_ledger_info,
-    parse_github_latest_release, parse_usage_command_output, parse_vcs_info, reconcile_cost_ledger,
+    apply_speed_cache, is_newer_semver, normalize_github_repo_url, parse_compaction_ceiling_info,
+    parse_compaction_ceiling_record, parse_cost_ledger_info, parse_github_latest_release,
+    parse_usage_command_output, parse_vcs_info, reconcile_compaction_ceiling,
+    reconcile_cost_ledger,
 };
 use hud_core::render::{
-    RenderInput, format_config_problem_line, render_hud_lines, render_hud_lines_full,
+    RenderExtras, RenderInput, format_config_problem_line, render_hud_lines, render_hud_lines_full,
 };
 use hud_core::stdin::{
-    compute_quota_pace, extract_quota_buckets_reconciled, format_session_cost,
-    format_workspace_breadcrumb, normalize_plan_tier,
+    CeilingSource, CompactionInputs, CompactionScope, EffectiveCeiling, compute_quota_pace,
+    extract_context_metrics_scaled, extract_quota_buckets_reconciled, format_session_cost,
+    format_workspace_breadcrumb, normalize_model_family, normalize_plan_tier,
+    resolve_compaction_ceiling, snap_compaction_ceiling,
 };
 use hud_core::transcript::{parse_transcript_and_tasks, parse_transcript_with_cursor};
 use hud_core::types::{
-    AgyStdinData, CachedQuotaSnapshot, ContextScaleMode, ContextValueMode, ContextWindowStdin,
-    CostStdin, CurrentUsageStdin, DoctorFacts, EffortFormatMode, GlyphMode, InstalledPluginFacts,
-    Language, LogicPaths, ModelStdin, PathLevels, PluginFacts, ProbeAnswers, QuotaBucketView,
-    QuotaPace, RawQuotaBucket, RuntimeFacts, SandboxStdin, SubagentEntry, SubagentStatus, TodoItem,
-    TodoStatus, ToolEntry, ToolStatus, TranscriptCursor, TranscriptSummary, UpdateCacheSnapshot,
-    VimStdin, WorkspaceStdin,
+    AgyStdinData, COMPACTION_CEILING_VERSION, CachedQuotaSnapshot, CompactionCeilingRecord,
+    CompactionCeilingState, ContextScaleMode, ContextValueMode, ContextWindowStdin, CostStdin,
+    CurrentUsageStdin, DoctorFacts, EffortFormatMode, GlyphMode, InstalledPluginFacts, Language,
+    LearnedCompactionState, LogicPaths, ModelStdin, PathLevels, PluginFacts, ProbeAnswers,
+    QuotaBucketView, QuotaPace, RawQuotaBucket, RuntimeFacts, SandboxStdin, SubagentEntry,
+    SubagentStatus, TodoItem, TodoStatus, ToolEntry, ToolStatus, TranscriptCursor,
+    TranscriptSummary, UpdateCacheSnapshot, VimStdin, WorkspaceStdin,
 };
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -128,7 +133,7 @@ fn adaptive_layout_handles_ultrawide_standard_narrow_and_zh_hans() {
     assert!(wide_plain.contains("READY"));
     assert!(wide_plain.contains("[PLAN]"));
     assert!(wide_plain.contains("[INSERT]"));
-    assert!(wide_plain.contains("200k+"));
+    assert!(!wide_plain.contains("200k+"));
     assert!(wide_plain.contains("Quota(weekly)"));
 
     // 2. Narrow 62 cols -> auto-compacts and never overflows 62 display columns
@@ -1796,7 +1801,10 @@ fn cost_ledger_watermark_idempotency_rollover_and_restart_carry() {
             columns: Some(140),
             now_ms: mon_morning_ms + 90_000_000,
         },
-        reloaded_totals.as_ref(),
+        RenderExtras {
+            cost_totals: reloaded_totals.as_ref(),
+            compaction_ceiling: None,
+        },
     );
     let joined: String = rendered
         .iter()
@@ -2408,4 +2416,433 @@ fn compaction_scale_watermark_bar_colors_badge_modes_and_snapshot_report_fidelit
     assert_eq!(rep_val["case"]["transcript"]["compaction_count"], 5);
     let rep_lines = rep_val["renderedPlainLines"].to_string();
     assert!(rep_lines.contains("57.0% (146k/256k · ↻5)"));
+}
+
+#[test]
+fn model_family_normalization_preserves_qualifiers_and_strips_effort() {
+    let model = |id: Option<&str>, display: Option<&str>, effort: Option<&str>| ModelStdin {
+        id: id.map(str::to_string),
+        display_name: display.map(str::to_string),
+        effort: effort.map(str::to_string),
+    };
+
+    assert_eq!(
+        normalize_model_family(Some(&model(
+            Some("Orchestrator (Carbon)"),
+            Some("Orchestrator (Carbon)"),
+            None
+        ))),
+        Some("orchestrator (carbon)".to_string())
+    );
+    assert_eq!(
+        normalize_model_family(Some(&model(
+            Some("Orchestrator (Carbon) (High)"),
+            None,
+            Some("high")
+        ))),
+        Some("orchestrator (carbon)".to_string())
+    );
+    assert_eq!(
+        normalize_model_family(Some(&model(
+            Some("Gemini 4 Argon (1M) (XHigh)"),
+            None,
+            Some("xhigh")
+        ))),
+        Some("gemini 4 argon (1m)".to_string())
+    );
+    assert_eq!(
+        normalize_model_family(Some(&model(
+            Some("gemini-4-hydrogen-xhigh"),
+            None,
+            Some("xhigh")
+        ))),
+        Some("gemini-4-hydrogen".to_string())
+    );
+    assert_eq!(
+        normalize_model_family(Some(&model(Some("qwen-max"), None, None))),
+        Some("qwen-max".to_string())
+    );
+    assert_eq!(
+        normalize_model_family(Some(&model(Some("qwen-max"), None, Some("high")))),
+        Some("qwen-max".to_string())
+    );
+    assert_eq!(
+        normalize_model_family(Some(&model(
+            Some("   "),
+            Some("  Gemini\t 4  Argon (Minimal) "),
+            Some("minimal")
+        ))),
+        Some("gemini 4 argon".to_string())
+    );
+
+    let long_id = format!("model-{}", "a".repeat(200));
+    let capped = normalize_model_family(Some(&model(Some(&long_id), None, None))).unwrap();
+    assert!(capped.len() <= 160);
+}
+
+#[test]
+fn tier_snapping_window_thresholds_and_current_usage_absence_behave_accurately() {
+    assert_eq!(snap_compaction_ceiling(31_999), None);
+    assert_eq!(snap_compaction_ceiling(180_000), Some(180_000));
+    assert_eq!(snap_compaction_ceiling(200_000), Some(256_000));
+    assert_eq!(snap_compaction_ceiling(256_915), Some(256_000));
+    assert_eq!(snap_compaction_ceiling(320_000), Some(256_000));
+    assert_eq!(snap_compaction_ceiling(380_000), Some(380_000));
+    assert_eq!(snap_compaction_ceiling(440_000), Some(512_000));
+    assert_eq!(snap_compaction_ceiling(515_000), Some(512_000));
+    assert_eq!(snap_compaction_ceiling(620_000), Some(512_000));
+    assert_eq!(snap_compaction_ceiling(700_000), Some(700_000));
+
+    let mid_win_res =
+        resolve_compaction_ceiling(524_288, 0, None, None, Some(200_000), Some(200_000));
+    assert_eq!(mid_win_res.effective, EffectiveCeiling::PhysicalWindow);
+    assert_eq!(mid_win_res.stale_bypass, None);
+
+    let mid_win_ckpt = resolve_compaction_ceiling(
+        524_288,
+        1,
+        Some(256_500),
+        None,
+        Some(128_000),
+        Some(128_000),
+    );
+    assert_eq!(
+        mid_win_ckpt.effective,
+        EffectiveCeiling::Scaled {
+            ceiling_tokens: 256_000,
+            source: CeilingSource::SessionCheckpoint
+        }
+    );
+
+    let large_cold =
+        resolve_compaction_ceiling(1_048_576, 0, None, None, Some(128_000), Some(128_000));
+    assert_eq!(
+        large_cold.effective,
+        EffectiveCeiling::Scaled {
+            ceiling_tokens: 256_000,
+            source: CeilingSource::ColdStartDefault
+        }
+    );
+
+    let cumulative_only_stdin: AgyStdinData = serde_json::from_value(json!({
+        "exceeds_200k_tokens": true,
+        "model": { "id": "Gemini 4 Argon (High)", "effort": "high" },
+        "context_window": {
+            "total_input_tokens": 350_000,
+            "total_output_tokens": 12_000,
+            "context_window_size": 1_048_576
+        }
+    }))
+    .expect("exceeds_200k_tokens remains deserializable");
+    assert_eq!(cumulative_only_stdin.exceeds_200k_tokens, Some(true));
+
+    let scaled = extract_context_metrics_scaled(
+        Some(&cumulative_only_stdin),
+        ContextScaleMode::Compaction,
+        CompactionInputs::default(),
+    );
+    assert_eq!(scaled.current_usage_tokens, None);
+    assert_eq!(scaled.window_size, Some(1_048_576));
+
+    let scope = CompactionScope::from_stdin(Some(&cumulative_only_stdin)).unwrap();
+    let (learned_state, write_rec) = reconcile_compaction_ceiling(
+        None,
+        &scope,
+        Some(&cumulative_only_stdin),
+        &TranscriptSummary::default(),
+        1_700_000_000_000,
+    );
+    assert_eq!(learned_state, None);
+    assert_eq!(write_rec, None);
+
+    let rendered = render_hud_lines(RenderInput {
+        stdin: Some(&cumulative_only_stdin),
+        config: &HudConfig::default(),
+        transcript: &TranscriptSummary::default(),
+        vcs: None,
+        memory: None,
+        cached_quota: None,
+        update_info: None,
+        columns: Some(160),
+        now_ms: 1_700_000_000_000,
+    })
+    .iter()
+    .map(|l| strip_ansi(l))
+    .collect::<Vec<_>>()
+    .join("\n");
+    assert!(
+        !rendered.contains("200k+"),
+        "unexpected 200k+ badge: {rendered}"
+    );
+}
+
+#[test]
+fn compaction_ceiling_reconciliation_learns_invalidates_recovers_and_scrubs_reports() {
+    let make_stdin = |model_id: &str, effort: &str, cur_tokens: u64| AgyStdinData {
+        model: Some(ModelStdin {
+            id: Some(model_id.to_string()),
+            display_name: Some(model_id.to_string()),
+            effort: Some(effort.to_string()),
+        }),
+        context_window: Some(ContextWindowStdin {
+            context_window_size: Some(1_048_576),
+            current_usage: Some(CurrentUsageStdin {
+                input_tokens: Some(cur_tokens),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    let s1 = make_stdin("Gemini 5 Ultra (High)", "high", 128_000);
+    let scope1 = CompactionScope::from_stdin(Some(&s1)).unwrap();
+    let t1 = TranscriptSummary {
+        compaction_count: 1,
+        last_compaction_tokens: Some(515_000),
+        last_compaction_at_ms: Some(1_700_000_100_000),
+        ..Default::default()
+    };
+    let (eff1, rec1_opt) =
+        reconcile_compaction_ceiling(None, &scope1, Some(&s1), &t1, 1_700_000_105_000);
+    assert_eq!(eff1, Some(LearnedCompactionState::Ceiling(512_000)));
+    let rec1 = rec1_opt.expect("first 515k checkpoint writes learned 512k record");
+    assert_eq!(rec1.updated_at_ms, 1_700_000_100_000);
+    assert_eq!(
+        rec1.state,
+        CompactionCeilingState::Learned {
+            ceiling_tokens: 512_000,
+            observed_tokens: 515_000
+        }
+    );
+
+    let (eff_idem, write_idem) =
+        reconcile_compaction_ceiling(Some(&rec1), &scope1, Some(&s1), &t1, 1_700_000_110_000);
+    assert_eq!(eff_idem, Some(LearnedCompactionState::Ceiling(512_000)));
+    assert_eq!(write_idem, None);
+
+    let s2_low = make_stdin("Gemini 5 Ultra (Low)", "low", 256_000);
+    let scope2 = CompactionScope::from_stdin(Some(&s2_low)).unwrap();
+    assert_eq!(scope1.storage_key(), scope2.storage_key());
+    let (eff2, write2) = reconcile_compaction_ceiling(
+        Some(&rec1),
+        &scope2,
+        Some(&s2_low),
+        &TranscriptSummary::default(),
+        1_700_000_200_000,
+    );
+    assert_eq!(eff2, Some(LearnedCompactionState::Ceiling(512_000)));
+    assert_eq!(write2, None);
+
+    let stale_tx = TranscriptSummary {
+        compaction_count: 1,
+        last_compaction_tokens: Some(256_500),
+        last_compaction_at_ms: Some(1_700_000_050_000),
+        ..Default::default()
+    };
+    let (eff_stale, write_stale) = reconcile_compaction_ceiling(
+        Some(&rec1),
+        &scope2,
+        Some(&s2_low),
+        &stale_tx,
+        1_700_000_210_000,
+    );
+    assert_eq!(eff_stale, Some(LearnedCompactionState::Ceiling(512_000)));
+    assert_eq!(write_stale, None);
+
+    let stale_missing_ts = TranscriptSummary {
+        compaction_count: 1,
+        last_compaction_tokens: Some(256_500),
+        last_compaction_at_ms: None,
+        ..Default::default()
+    };
+    assert_eq!(
+        reconcile_compaction_ceiling(
+            Some(&rec1),
+            &scope2,
+            Some(&s2_low),
+            &stale_missing_ts,
+            1_700_000_215_000
+        )
+        .1,
+        None
+    );
+
+    let rec_256 = CompactionCeilingRecord {
+        version: COMPACTION_CEILING_VERSION,
+        model_family: scope1.model_family().to_string(),
+        phys_win: scope1.phys_win(),
+        state: CompactionCeilingState::Learned {
+            ceiling_tokens: 256_000,
+            observed_tokens: 256_500,
+        },
+        updated_at_ms: 1_700_000_050_000,
+    };
+    let bypass_stdin = make_stdin("Gemini 5 Ultra (High)", "high", 400_000);
+    let (eff_inv, inv_opt) = reconcile_compaction_ceiling(
+        Some(&rec_256),
+        &scope1,
+        Some(&bypass_stdin),
+        &TranscriptSummary::default(),
+        1_700_000_300_000,
+    );
+    assert_eq!(eff_inv, Some(LearnedCompactionState::Invalidated));
+    let inv_rec = inv_opt.expect("400k uncompacted usage invalidates 256k learned ceiling");
+    assert_eq!(
+        inv_rec.state,
+        CompactionCeilingState::Invalidated {
+            bypassed_tokens: 400_000,
+            previous_ceiling_tokens: Some(256_000)
+        }
+    );
+
+    assert_eq!(
+        reconcile_compaction_ceiling(
+            Some(&inv_rec),
+            &scope1,
+            Some(&bypass_stdin),
+            &TranscriptSummary::default(),
+            1_700_000_305_000
+        ),
+        (Some(LearnedCompactionState::Invalidated), None)
+    );
+
+    let (eff_resurrect, write_resurrect) = reconcile_compaction_ceiling(
+        Some(&inv_rec),
+        &scope1,
+        Some(&s1),
+        &stale_tx,
+        1_700_000_310_000,
+    );
+    assert_eq!(eff_resurrect, Some(LearnedCompactionState::Invalidated));
+    assert_eq!(write_resurrect, None);
+
+    let recover_tx = TranscriptSummary {
+        compaction_count: 1,
+        last_compaction_tokens: Some(515_000),
+        last_compaction_at_ms: Some(1_700_000_350_000),
+        ..Default::default()
+    };
+    let (eff_recov, recov_opt) = reconcile_compaction_ceiling(
+        Some(&inv_rec),
+        &scope1,
+        Some(&s1),
+        &recover_tx,
+        1_700_000_355_000,
+    );
+    assert_eq!(eff_recov, Some(LearnedCompactionState::Ceiling(512_000)));
+    assert!(recov_opt.is_some());
+
+    let valid_probe_json = json!({
+        "version": 1,
+        "modelFamily": "gemini 5 ultra",
+        "physWin": 1_048_576,
+        "kind": "learned",
+        "ceiling_tokens": 512_000,
+        "observed_tokens": 515_000,
+        "updatedAtMs": 1_700_000_350_000i64,
+        "secretLeak": "/Users/alice/private"
+    })
+    .to_string();
+    let bad_probe_json = json!({
+        "version": 1,
+        "modelFamily": "gemini 5 ultra",
+        "physWin": 1_048_576,
+        "kind": "learned",
+        "ceiling_tokens": 515_000,
+        "observed_tokens": 515_000,
+        "updatedAtMs": 1_700_000_350_000i64
+    })
+    .to_string();
+    assert!(parse_compaction_ceiling_record(&bad_probe_json, Some(&scope1)).is_none());
+    let parsed_valid = parse_compaction_ceiling_info(
+        &ProbeAnswers {
+            compaction_ceiling: Some(valid_probe_json.clone()),
+            ..Default::default()
+        },
+        Some(&scope1),
+    )
+    .expect("valid probe record parses");
+    assert_eq!(
+        parsed_valid.as_learned_state(),
+        LearnedCompactionState::Ceiling(512_000)
+    );
+
+    let facts = DoctorFacts {
+        cwd: "/Users/alice/app".to_string(),
+        home_dir: "/Users/alice".to_string(),
+        platform: "macos".to_string(),
+        terminal: "Ghostty".to_string(),
+        remote_session: false,
+        runtime: RuntimeFacts {
+            engine: "rust-native".to_string(),
+            version: "1.7.1".to_string(),
+            exec_path: "/Users/alice/.gemini/antigravity-cli/agy-hud/bin/agy-hud".to_string(),
+            supported: true,
+        },
+        plugin: PluginFacts {
+            root: "/Users/alice/.gemini/config/plugins/agy-hud".to_string(),
+            version: "1.7.1".to_string(),
+        },
+        installed_plugin_status: "installed".to_string(),
+        installed_plugin: None,
+        config_path: "/Users/alice/.gemini/antigravity-cli/agy-hud/config.json".to_string(),
+        heartbeat: None,
+    };
+    let snap_valid = json!({
+        "stdin": &s2_low,
+        "probes": { "compaction_ceiling": valid_probe_json }
+    })
+    .to_string();
+    let rep_valid = execute_subcommand(
+        "report",
+        &["valid-ceiling".to_string()],
+        &CommandContext {
+            facts: &facts,
+            paths: &LogicPaths::default(),
+            now_ms: 1_700_000_400_000,
+            config_text: None,
+            cli_settings_text: None,
+            last_snapshot_text: Some(&snap_valid),
+            update_cache_text: None,
+            transcript_head: None,
+            transcript_tail: None,
+            task_md_text: None,
+        },
+    );
+    let rep_valid_json: serde_json::Value =
+        serde_json::from_str(&rep_valid.lines.join("\n")).unwrap();
+    let scrubbed_cc = rep_valid_json["case"]["probes"]["compaction_ceiling"]
+        .as_str()
+        .expect("valid compaction_ceiling survives report");
+    assert!(!scrubbed_cc.contains("secretLeak"));
+    assert!(
+        rep_valid_json["renderedPlainLines"]
+            .to_string()
+            .contains("256k/512k")
+    );
+
+    let snap_bad = json!({
+        "stdin": &s2_low,
+        "probes": { "compaction_ceiling": bad_probe_json }
+    })
+    .to_string();
+    let rep_bad = execute_subcommand(
+        "report",
+        &["bad-ceiling".to_string()],
+        &CommandContext {
+            facts: &facts,
+            paths: &LogicPaths::default(),
+            now_ms: 1_700_000_400_000,
+            config_text: None,
+            cli_settings_text: None,
+            last_snapshot_text: Some(&snap_bad),
+            update_cache_text: None,
+            transcript_head: None,
+            transcript_tail: None,
+            task_md_text: None,
+        },
+    );
+    let rep_bad_json: serde_json::Value = serde_json::from_str(&rep_bad.lines.join("\n")).unwrap();
+    assert!(rep_bad_json["case"]["probes"]["compaction_ceiling"].is_null());
 }

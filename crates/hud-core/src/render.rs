@@ -6,15 +6,16 @@ use crate::config::HudConfig;
 use crate::i18n::{Labels, get_labels};
 use crate::probes::{is_newer_semver, normalize_semver_tag, resolve_output_speed_display};
 use crate::stdin::{
-    compute_quota_pace, extract_context_metrics_scaled, extract_quota_buckets_reconciled,
-    format_compact_tokens, format_duration_seconds, format_model_name_with_glyphs,
-    format_session_cost, format_workspace_breadcrumb, normalize_plan_tier,
+    CompactionInputs, compute_quota_pace, extract_context_metrics_scaled,
+    extract_quota_buckets_reconciled, format_compact_tokens, format_duration_seconds,
+    format_model_name_with_glyphs, format_session_cost, format_workspace_breadcrumb,
+    normalize_plan_tier,
 };
 use crate::types::{
     AgyStdinData, CachedQuotaSnapshot, ContextValueMode, CostTotals, GlyphMode, HUD_VERSION,
-    LineLayout, MemoryProbeInfo, ModelFormatMode, PathLevels, QuotaPace, QuotaValueMode,
-    SubagentEntry, SubagentStatus, TodoStatus, ToolStatus, TranscriptSummary, UpdateCacheSnapshot,
-    VcsProbeInfo,
+    LearnedCompactionState, LineLayout, MemoryProbeInfo, ModelFormatMode, PathLevels, QuotaPace,
+    QuotaValueMode, SubagentEntry, SubagentStatus, TodoStatus, ToolStatus, TranscriptSummary,
+    UpdateCacheSnapshot, VcsProbeInfo,
 };
 
 pub struct RenderInput<'a> {
@@ -27,6 +28,12 @@ pub struct RenderInput<'a> {
     pub update_info: Option<&'a UpdateCacheSnapshot>,
     pub columns: Option<usize>,
     pub now_ms: i64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct RenderExtras<'a> {
+    pub cost_totals: Option<&'a CostTotals>,
+    pub compaction_ceiling: Option<LearnedCompactionState>,
 }
 
 fn sep(gm: GlyphMode) -> String {
@@ -330,7 +337,6 @@ struct MetricsOpts {
     show_cache_hit_rate: bool,
     quota_bar_enabled: bool,
     context_value: ContextValueMode,
-    show_200k: bool,
     show_compactions: bool,
     show_cost: bool,
     show_context_bar: bool,
@@ -342,6 +348,7 @@ struct MetricsOpts {
 fn render_context_segment(
     stdin: Option<&AgyStdinData>,
     transcript: &TranscriptSummary,
+    compaction_ceiling: Option<LearnedCompactionState>,
     config: &HudConfig,
     labels: &Labels,
     effective_width: Option<usize>,
@@ -351,8 +358,11 @@ fn render_context_segment(
     let metrics = extract_context_metrics_scaled(
         stdin,
         config.display.context_scale,
-        transcript.compaction_count,
-        transcript.last_compaction_tokens,
+        CompactionInputs {
+            compaction_count: transcript.compaction_count,
+            last_compaction_tokens: transcript.last_compaction_tokens,
+            learned: compaction_ceiling,
+        },
     );
     let pct_str = format!("{:.1}%", metrics.used_percent);
     let rem_str = format!(
@@ -478,12 +488,6 @@ fn render_context_segment(
         String::new()
     };
 
-    let over_200k = if opts.show_200k && metrics.exceeds_200k {
-        format!(" {}", paint("200k+", &[colors::YELLOW, BOLD]))
-    } else {
-        String::new()
-    };
-
     let cache_part = match (opts.show_cache_hit_rate, metrics.cache_hit_percent) {
         (true, Some(hit)) => {
             let prefix = if gm == GlyphMode::Ascii { "" } else { "⚡ " };
@@ -500,7 +504,7 @@ fn render_context_segment(
     };
 
     format!(
-        "{} {bar}{value_text}{over_200k}{cache_part}",
+        "{} {bar}{value_text}{cache_part}",
         paint(labels.metrics.context, &[DIM]),
     )
 }
@@ -1458,7 +1462,7 @@ fn build_header_line(
 
 fn build_context_meta_line(
     input: &RenderInput<'_>,
-    cost_totals: Option<&CostTotals>,
+    extras: RenderExtras<'_>,
     labels: &Labels,
     effective_width: Option<usize>,
     line_budget: Option<usize>,
@@ -1474,9 +1478,24 @@ fn build_context_meta_line(
     let gm = config.display.glyph_mode;
     let sep_str = sep(gm);
     let dot_str = dot(gm);
-    let ctx_seg = render_context_segment(stdin, transcript, config, labels, effective_width, opts);
-    let meta_items =
-        collect_counts_and_meta_items(stdin, transcript, memory, cost_totals, config, labels, opts);
+    let ctx_seg = render_context_segment(
+        stdin,
+        transcript,
+        extras.compaction_ceiling,
+        config,
+        labels,
+        effective_width,
+        opts,
+    );
+    let meta_items = collect_counts_and_meta_items(
+        stdin,
+        transcript,
+        memory,
+        extras.cost_totals,
+        config,
+        labels,
+        opts,
+    );
     if meta_items.is_empty() {
         return ctx_seg;
     }
@@ -1529,7 +1548,7 @@ fn build_quota_line(
 
 fn build_metrics_line(
     input: &RenderInput<'_>,
-    cost_totals: Option<&CostTotals>,
+    extras: RenderExtras<'_>,
     labels: &Labels,
     effective_width: Option<usize>,
     opts: &MetricsOpts,
@@ -1549,6 +1568,7 @@ fn build_metrics_line(
     metrics_parts.push(render_context_segment(
         stdin,
         transcript,
+        extras.compaction_ceiling,
         config,
         labels,
         effective_width,
@@ -1566,8 +1586,15 @@ fn build_metrics_line(
     if !quota_seg.is_empty() {
         metrics_parts.push(quota_seg);
     }
-    let meta_seg =
-        render_counts_and_meta(stdin, transcript, memory, cost_totals, config, labels, opts);
+    let meta_seg = render_counts_and_meta(
+        stdin,
+        transcript,
+        memory,
+        extras.cost_totals,
+        config,
+        labels,
+        opts,
+    );
     if !meta_seg.is_empty() {
         metrics_parts.push(meta_seg);
     }
@@ -1731,13 +1758,10 @@ pub fn format_config_problem_line(
 }
 
 pub fn render_hud_lines(input: RenderInput<'_>) -> Vec<String> {
-    render_hud_lines_full(input, None)
+    render_hud_lines_full(input, RenderExtras::default())
 }
 
-pub fn render_hud_lines_full(
-    input: RenderInput<'_>,
-    cost_totals: Option<&CostTotals>,
-) -> Vec<String> {
+pub fn render_hud_lines_full(input: RenderInput<'_>, extras: RenderExtras<'_>) -> Vec<String> {
     let RenderInput {
         stdin,
         config,
@@ -1843,7 +1867,6 @@ pub fn render_hud_lines_full(
         show_cache_hit_rate: config.display.show_cache_hit_rate,
         quota_bar_enabled: config.display.quota_bar_enabled,
         context_value: config.display.context_value,
-        show_200k: true,
         show_compactions: true,
         show_cost: has_any_cost,
         show_context_bar: config.display.show_context_bar,
@@ -1859,8 +1882,7 @@ pub fn render_hud_lines_full(
     let sep_str = sep(gm);
     let raw_lines = if layout_mode == LineLayout::Compact {
         let mut compact_opts = base_metrics_opts;
-        let mut line2 =
-            build_metrics_line(&input, cost_totals, labels, effective_width, &compact_opts);
+        let mut line2 = build_metrics_line(&input, extras, labels, effective_width, &compact_opts);
         if let Some(budget) = line_budget {
             let compact_steps: [fn(&mut MetricsOpts); 5] = [
                 |o| {
@@ -1874,7 +1896,6 @@ pub fn render_hud_lines_full(
                     }
                 },
                 |o| {
-                    o.show_200k = false;
                     o.show_compactions = false;
                     o.show_cost = false;
                     o.max_quota_buckets = 1;
@@ -1890,8 +1911,7 @@ pub fn render_hud_lines_full(
                     break;
                 }
                 apply_step(&mut compact_opts);
-                line2 =
-                    build_metrics_line(&input, cost_totals, labels, effective_width, &compact_opts);
+                line2 = build_metrics_line(&input, extras, labels, effective_width, &compact_opts);
             }
         }
 
@@ -1944,7 +1964,7 @@ pub fn render_hud_lines_full(
         }
         let mut ctx_line = build_context_meta_line(
             &input,
-            cost_totals,
+            extras,
             labels,
             effective_width,
             line_budget,
@@ -1958,7 +1978,6 @@ pub fn render_hud_lines_full(
                     if o.context_value == ContextValueMode::Both {
                         o.context_value = ContextValueMode::Percent;
                     }
-                    o.show_200k = false;
                     o.show_cost = false;
                 },
                 |o| {
@@ -1974,7 +1993,7 @@ pub fn render_hud_lines_full(
                 apply_step(&mut ctx_opts);
                 ctx_line = build_context_meta_line(
                     &input,
-                    cost_totals,
+                    extras,
                     labels,
                     effective_width,
                     line_budget,
@@ -1988,7 +2007,7 @@ pub fn render_hud_lines_full(
                 stdin,
                 transcript,
                 input.memory,
-                cost_totals,
+                extras.cost_totals,
                 config,
                 labels,
                 &base_metrics_opts,
@@ -2031,13 +2050,8 @@ pub fn render_hud_lines_full(
             && !has_activity
             && effective_width.is_some_and(|w| w >= 180)
         {
-            let merged_metrics = build_metrics_line(
-                &input,
-                cost_totals,
-                labels,
-                effective_width,
-                &base_metrics_opts,
-            );
+            let merged_metrics =
+                build_metrics_line(&input, extras, labels, effective_width, &base_metrics_opts);
             let wide_line = [&line1, &merged_metrics]
                 .into_iter()
                 .filter(|s| !s.is_empty())

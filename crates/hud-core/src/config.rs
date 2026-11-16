@@ -385,7 +385,7 @@ pub const CONFIG_SCHEMA: &[SchemaEntry] = &[
     SchemaEntry {
         key: "display.contextScale",
         kind: SchemaValueKind::Enum(&["\"compaction\"", "\"window\""]),
-        description: "Context denominator scale: compaction (256k auto-compaction watermark, default) or window (raw 1.0M model ceiling).",
+        description: "Context denominator scale: compaction (auto-detected model compaction watermark such as 256k or 512k, default) or window (raw physical model ceiling).",
     },
     SchemaEntry {
         key: "display.contextWarningThreshold",
