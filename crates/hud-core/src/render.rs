@@ -34,6 +34,8 @@ pub struct RenderInput<'a> {
 pub struct RenderExtras<'a> {
     pub cost_totals: Option<&'a CostTotals>,
     pub compaction_ceiling: Option<LearnedCompactionState>,
+    pub use_short_hud_cmd: bool,
+    pub use_short_update_cmd: bool,
 }
 
 fn sep(gm: GlyphMode) -> String {
@@ -320,6 +322,7 @@ struct HeaderOpts {
     show_custom_tag: bool,
     show_duration: bool,
     show_update: bool,
+    use_short_update_cmd: bool,
     path_levels: PathLevels,
     show_launch_dir: bool,
     model_format: ModelFormatMode,
@@ -1482,8 +1485,13 @@ fn build_header_line(
             GlyphMode::Nerd => ("\u{f062}", "·"),
             GlyphMode::Unicode => ("↑", "·"),
         };
+        let update_cmd = if opts.use_short_update_cmd {
+            "/hud-update"
+        } else {
+            "/agy-hud:hud-update"
+        };
         header_parts.push(paint(
-            &format!("{icon} v{norm} {mid} /agy-hud:hud-update"),
+            &format!("{icon} v{norm} {mid} {update_cmd}"),
             &[colors::YELLOW, BOLD],
         ));
     }
@@ -1750,6 +1758,17 @@ pub fn format_config_problem_line(
     config: &HudConfig,
     columns: Option<usize>,
 ) -> Option<String> {
+    format_config_problem_line_with_cmd(problems, config, columns, false)
+}
+
+/// Same as [`format_config_problem_line`], selecting `/hud` when `use_short_hud_cmd` is `true`
+/// or `/agy-hud:hud` when `false` while preserving narrow-terminal truncation behavior.
+pub fn format_config_problem_line_with_cmd(
+    problems: &[String],
+    config: &HudConfig,
+    columns: Option<usize>,
+    use_short_hud_cmd: bool,
+) -> Option<String> {
     let first = problems.first()?;
     let gm = config.display.glyph_mode;
     let clean_msg = sanitize_text(first);
@@ -1761,9 +1780,11 @@ pub fn format_config_problem_line(
         GlyphMode::Ascii => "! Config: ",
         GlyphMode::Unicode | GlyphMode::Nerd => "⚠ Config: ",
     };
-    let suffix = match gm {
-        GlyphMode::Ascii => " . /agy-hud:hud",
-        GlyphMode::Unicode | GlyphMode::Nerd => " · /agy-hud:hud",
+    let (cmd, suffix) = match (use_short_hud_cmd, gm) {
+        (true, GlyphMode::Ascii) => ("/hud", " . /hud"),
+        (true, GlyphMode::Unicode | GlyphMode::Nerd) => ("/hud", " · /hud"),
+        (false, GlyphMode::Ascii) => ("/agy-hud:hud", " . /agy-hud:hud"),
+        (false, GlyphMode::Unicode | GlyphMode::Nerd) => ("/agy-hud:hud", " · /agy-hud:hud"),
     };
 
     let effective_width = match (config.max_width, columns) {
@@ -1784,7 +1805,7 @@ pub fn format_config_problem_line(
                     paint(suffix, &[colors::CYAN, BOLD]),
                 )
             } else {
-                let minimal = format!("{prefix}/agy-hud:hud");
+                let minimal = format!("{prefix}{cmd}");
                 let clipped = truncate_ansi_with_ellipsis(&minimal, budget, ellipsis(gm));
                 paint(&clipped, &[colors::YELLOW, BOLD])
             }
@@ -1845,6 +1866,7 @@ pub fn render_hud_lines_full(input: RenderInput<'_>, extras: RenderExtras<'_>) -
         show_custom_tag: true,
         show_duration: config.display.show_duration,
         show_update: config.updates.enabled,
+        use_short_update_cmd: extras.use_short_update_cmd,
         path_levels: if layout_mode == LineLayout::Compact {
             PathLevels::One
         } else {

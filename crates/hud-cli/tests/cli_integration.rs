@@ -50,6 +50,7 @@ fn run_bin(
     let mut cmd = Command::new(bin);
     cmd.args(args)
         .env("AGY_HUD_DISABLE_BG_UPDATE", "1")
+        .env("AGY_SKIP_PLUGIN_INSTALL", "1")
         .env("LC_ALL", "en_US.UTF-8")
         .env("LANG", "en_US.UTF-8")
         .stdout(Stdio::piped())
@@ -258,7 +259,18 @@ fn sharded_vcs_cache_isolates_workspaces_and_invalidates_on_mtime_stdin_flip_and
         fs::write(r.join(".git/index"), "v1").unwrap();
     }
 
+    let fake_home = tmp.path.join("home");
+    let gemini_cfg = fake_home.join(".gemini/config");
     let mut env_map = HashMap::new();
+    env_map.insert("HOME".to_string(), fake_home.to_string_lossy().into_owned());
+    env_map.insert(
+        "USERPROFILE".to_string(),
+        fake_home.to_string_lossy().into_owned(),
+    );
+    env_map.insert(
+        "AGY_CONFIG_DIR".to_string(),
+        gemini_cfg.to_string_lossy().into_owned(),
+    );
     env_map.insert(
         "AGY_CLI_DIR".to_string(),
         tmp.path.join("cli").to_string_lossy().into_owned(),
@@ -268,6 +280,7 @@ fn sharded_vcs_cache_isolates_workspaces_and_invalidates_on_mtime_stdin_flip_and
         tmp.path.join("hud").to_string_lossy().into_owned(),
     );
     let paths = AgyPaths::from_env_map(&env_map);
+    assert_eq!(paths.gemini_config_dir, gemini_cfg);
 
     let spawns = AtomicUsize::new(0);
     let runner = |_cmd: &str, _args: &[String], _cwd: Option<&Path>| -> Option<String> {
@@ -355,7 +368,13 @@ fn full_binary_cli_lifecycle_install_render_doctor_set_undo_report_uninstall() {
     )
     .unwrap();
 
-    let env_vars: [(&str, &Path); 2] = [
+    let fake_home = tmp.path.join("home");
+    let gemini_cfg = fake_home.join(".gemini/config");
+    fs::create_dir_all(&fake_home).unwrap();
+    let env_vars: [(&str, &Path); 5] = [
+        ("HOME", fake_home.as_path()),
+        ("USERPROFILE", fake_home.as_path()),
+        ("AGY_CONFIG_DIR", gemini_cfg.as_path()),
         ("AGY_CLI_DIR", cli_dir.as_path()),
         ("AGY_HUD_HOME", hud_home.as_path()),
     ];
@@ -385,6 +404,18 @@ fn full_binary_cli_lifecycle_install_render_doctor_set_undo_report_uninstall() {
     assert_eq!(inst_json["stackWithDefault"], true);
     assert_eq!(inst_json["engine"], "rust-native");
     assert_eq!(inst_json["replaced"], "other");
+    assert_eq!(inst_json["unprefixedSkills"]["hud"], "installed");
+    assert_eq!(inst_json["unprefixedSkills"]["hudUpdate"], "installed");
+    assert!(
+        gemini_cfg
+            .join("skills/hud/.agy-hud-managed.json")
+            .is_file()
+    );
+    assert!(
+        gemini_cfg
+            .join("skills/hud-update/.agy-hud-managed.json")
+            .is_file()
+    );
     assert!(Path::new(inst_json["backupPath"].as_str().unwrap()).exists());
     let expected_bin = if cfg!(windows) {
         "agy-hud.exe"
@@ -470,6 +501,11 @@ fn full_binary_cli_lifecycle_install_render_doctor_set_undo_report_uninstall() {
     assert_eq!(uninst_json["restoredPrevious"], true);
     assert_eq!(uninst_json["statusLineAction"], "restored-previous");
     assert!(uninst_json["removedBackups"].as_u64().unwrap() >= 1);
+    assert_eq!(
+        uninst_json["unprefixedSkillsRemoved"],
+        json!(["hud", "hud-update"])
+    );
+    assert!(!gemini_cfg.join("skills").exists());
     assert!(!backup_from_install.exists());
     assert!(
         !hud_home.exists(),
@@ -508,7 +544,13 @@ fn full_binary_cli_lifecycle_install_render_doctor_set_undo_report_uninstall() {
         .unwrap(),
     )
     .unwrap();
-    let clean_env: [(&str, &Path); 2] = [
+    let clean_home = tmp.path.join("clean-home");
+    let clean_cfg = clean_home.join(".gemini/config");
+    fs::create_dir_all(&clean_home).unwrap();
+    let clean_env: [(&str, &Path); 5] = [
+        ("HOME", clean_home.as_path()),
+        ("USERPROFILE", clean_home.as_path()),
+        ("AGY_CONFIG_DIR", clean_cfg.as_path()),
         ("AGY_CLI_DIR", clean_cli_dir.as_path()),
         ("AGY_HUD_HOME", clean_hud_home.as_path()),
     ];
@@ -552,7 +594,10 @@ fn full_binary_cli_lifecycle_install_render_doctor_set_undo_report_uninstall() {
 
     // 11. AGY_HUD_DISABLE=1 suppresses render output cleanly
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_agy-hud"));
-    cmd.env("AGY_CLI_DIR", &cli_dir)
+    cmd.env("HOME", &fake_home)
+        .env("USERPROFILE", &fake_home)
+        .env("AGY_CONFIG_DIR", &gemini_cfg)
+        .env("AGY_CLI_DIR", &cli_dir)
         .env("AGY_HUD_HOME", &hud_home)
         .env("AGY_HUD_DISABLE", "1")
         .stdin(Stdio::piped())
@@ -572,6 +617,8 @@ fn full_binary_cli_lifecycle_install_render_doctor_set_undo_report_uninstall() {
 #[test]
 fn open_pipe_stdin_exits_early_without_eof_and_nested_mode_is_inert() {
     let tmp = TempDir::new("open-pipe");
+    let fake_home = tmp.path.join("home");
+    let gemini_cfg = fake_home.join(".gemini/config");
     let cli_dir = tmp.path.join("cli");
     let hud_home = cli_dir.join("agy-hud");
 
@@ -587,6 +634,9 @@ fn open_pipe_stdin_exits_early_without_eof_and_nested_mode_is_inert() {
     // 1. Open pipe WITHOUT closing `child_stdin` (`antigravity-cli#698` regression guard)
     let started = std::time::Instant::now();
     let mut child = Command::new(env!("CARGO_BIN_EXE_agy-hud"))
+        .env("HOME", &fake_home)
+        .env("USERPROFILE", &fake_home)
+        .env("AGY_CONFIG_DIR", &gemini_cfg)
         .env("AGY_CLI_DIR", &cli_dir)
         .env("AGY_HUD_HOME", &hud_home)
         .env("LC_ALL", "en_US.UTF-8")
@@ -620,6 +670,9 @@ fn open_pipe_stdin_exits_early_without_eof_and_nested_mode_is_inert() {
     // 2. AGY_HUD_NESTED=1 exits 0 with zero output and zero disk writes
     let nested_hud_home = tmp.path.join("nested-hud-home");
     let mut nested = Command::new(env!("CARGO_BIN_EXE_agy-hud"))
+        .env("HOME", &fake_home)
+        .env("USERPROFILE", &fake_home)
+        .env("AGY_CONFIG_DIR", &gemini_cfg)
         .env("AGY_CLI_DIR", &cli_dir)
         .env("AGY_HUD_HOME", &nested_hud_home)
         .env("AGY_HUD_NESTED", "1")
@@ -660,7 +713,18 @@ fn git_worktree_current_dir_priority_and_zero_subprocess_git_head_fallback() {
     )
     .unwrap();
 
+    let fake_home = tmp.path.join("home");
+    let gemini_cfg = fake_home.join(".gemini/config");
     let mut env_map = HashMap::new();
+    env_map.insert("HOME".to_string(), fake_home.to_string_lossy().into_owned());
+    env_map.insert(
+        "USERPROFILE".to_string(),
+        fake_home.to_string_lossy().into_owned(),
+    );
+    env_map.insert(
+        "AGY_CONFIG_DIR".to_string(),
+        gemini_cfg.to_string_lossy().into_owned(),
+    );
     env_map.insert(
         "AGY_CLI_DIR".to_string(),
         tmp.path.join("cli").to_string_lossy().into_owned(),
@@ -670,6 +734,7 @@ fn git_worktree_current_dir_priority_and_zero_subprocess_git_head_fallback() {
         tmp.path.join("hud").to_string_lossy().into_owned(),
     );
     let paths = AgyPaths::from_env_map(&env_map);
+    assert_eq!(paths.gemini_config_dir, gemini_cfg);
 
     // 1. `workspace.current_dir` (worktree) takes priority over `workspace.project_dir` (main repo)
     let stdin = AgyStdinData {
@@ -737,6 +802,8 @@ fn windows_statusline_quote_fix_and_isolated_quota_refresh_e2e() {
     {
         use std::os::unix::fs::PermissionsExt;
         let tmp = TempDir::new("quota-refresh");
+        let fake_home = tmp.path.join("home");
+        let gemini_cfg = fake_home.join(".gemini/config");
         let cli_dir = tmp.path.join("cli");
         let hud_home = cli_dir.join("agy-hud");
         let fake_agy = tmp.path.join("fake-agy.sh");
@@ -759,7 +826,10 @@ EOF
         fs::write(&fake_agy, script).unwrap();
         fs::set_permissions(&fake_agy, fs::Permissions::from_mode(0o755)).unwrap();
 
-        let env_vars: [(&str, &Path); 3] = [
+        let env_vars: [(&str, &Path); 6] = [
+            ("HOME", fake_home.as_path()),
+            ("USERPROFILE", fake_home.as_path()),
+            ("AGY_CONFIG_DIR", gemini_cfg.as_path()),
             ("AGY_CLI_DIR", cli_dir.as_path()),
             ("AGY_HUD_HOME", hud_home.as_path()),
             ("AGY_HUD_AGY_BIN", fake_agy.as_path()),
@@ -898,11 +968,17 @@ fn install_sh_version_logging_and_self_update_e2e() {
     .unwrap();
 
     // 1. Verify `install.sh --stack` prints clear version logs!
+    let home_sh = tmp.path.join("home-sh");
+    let cfg_sh = home_sh.join(".gemini/config");
     let cli_sh = tmp.path.join("cli-sh");
     let hud_sh = cli_sh.join("agy-hud");
+    fs::create_dir_all(&home_sh).unwrap();
     let sh_out = Command::new("sh")
         .arg(workspace_root.join("install.sh"))
         .arg("--stack")
+        .env("HOME", &home_sh)
+        .env("USERPROFILE", &home_sh)
+        .env("AGY_CONFIG_DIR", &cfg_sh)
         .env("AGY_CLI_DIR", &cli_sh)
         .env("AGY_HUD_HOME", &hud_sh)
         .env("AGY_HUD_ARCHIVE_DIR", &stage_parent)
@@ -914,11 +990,25 @@ fn install_sh_version_logging_and_self_update_e2e() {
     assert!(sh_stdout.contains("==> Installing agy-hud v9.9.0..."));
     assert!(sh_stdout.contains("==> Deploying native agy-hud v9.9.0 statusLine binary..."));
     assert!(sh_stdout.contains("==> Done! agy-hud v9.9.0 is active."));
+    assert!(sh_stdout.contains("/hud") && sh_stdout.contains("/hud-update"));
+    assert!(sh_stdout.contains("/agy-hud:hud") && sh_stdout.contains("/agy-hud:hud-update"));
+    assert!(cfg_sh.join("skills/hud/.agy-hud-managed.json").is_file());
+    assert!(
+        cfg_sh
+            .join("skills/hud-update/.agy-hud-managed.json")
+            .is_file()
+    );
 
     // 2. Test `agy-hud update --check`, live `/hud-update` badge, and `agy-hud update` self-upgrade!
+    let home_upd = tmp.path.join("home-upd");
+    let cfg_upd = home_upd.join(".gemini/config");
     let cli_upd = tmp.path.join("cli-upd");
     let hud_upd = cli_upd.join("agy-hud");
-    let upd_env: [(&str, &Path); 2] = [
+    fs::create_dir_all(&home_upd).unwrap();
+    let upd_env: [(&str, &Path); 5] = [
+        ("HOME", home_upd.as_path()),
+        ("USERPROFILE", home_upd.as_path()),
+        ("AGY_CONFIG_DIR", cfg_upd.as_path()),
         ("AGY_CLI_DIR", cli_upd.as_path()),
         ("AGY_HUD_HOME", hud_upd.as_path()),
     ];
@@ -937,6 +1027,9 @@ fn install_sh_version_logging_and_self_update_e2e() {
 
     let check_out = Command::new(env!("CARGO_BIN_EXE_agy-hud"))
         .args(["update", "--check"])
+        .env("HOME", &home_upd)
+        .env("USERPROFILE", &home_upd)
+        .env("AGY_CONFIG_DIR", &cfg_upd)
         .env("AGY_CLI_DIR", &cli_upd)
         .env("AGY_HUD_HOME", &hud_upd)
         .env("AGY_HUD_UPDATE_CHECK_JSON", &mock_release)
@@ -948,7 +1041,7 @@ fn install_sh_version_logging_and_self_update_e2e() {
     assert_eq!(check_json["latestVersion"], "9.9.0");
     assert!(hud_upd.join("data/update-cache.json").exists());
 
-    // Live render now displays `↑ v9.9.0 · /agy-hud:hud-update` badge!
+    // Live render displays `↑ v9.9.0 · /hud-update` badge when unprefixed `/hud-update` shortcut is installed!
     let live_payload = json!({
         "cwd": "/tmp/demo",
         "model": { "id": "Gemini 4 Argon", "display_name": "Gemini 4 Argon" },
@@ -959,12 +1052,19 @@ fn install_sh_version_logging_and_self_update_e2e() {
     .to_string();
     let (ok_badge, badge_out) = run_bin(&[], &upd_env, Some(&live_payload));
     assert!(ok_badge);
-    assert!(badge_out.contains("/agy-hud:hud-update"));
+    assert!(badge_out.contains("/hud-update"), "badge_out: {badge_out}");
+    assert!(
+        !badge_out.contains("/agy-hud:hud-update"),
+        "expected unprefixed /hud-update when installed: {badge_out}"
+    );
     assert!(badge_out.contains("v9.9.0"));
 
     // Run `agy-hud update` end-to-end (without needing to re-pass `--stack`)!
     let upgrade_out = Command::new(env!("CARGO_BIN_EXE_agy-hud"))
         .arg("update")
+        .env("HOME", &home_upd)
+        .env("USERPROFILE", &home_upd)
+        .env("AGY_CONFIG_DIR", &cfg_upd)
         .env("AGY_CLI_DIR", &cli_upd)
         .env("AGY_HUD_HOME", &hud_upd)
         .env("AGY_HUD_UPDATE_CHECK_JSON", &mock_release)
@@ -1060,7 +1160,12 @@ fn resolve_transcript_path_recovers_cli_brain_when_stdin_points_to_ide_dir() {
     })
     .to_string();
 
-    let env_vars = [
+    let fake_home = tmp.path.join("home");
+    let gemini_cfg = fake_home.join(".gemini/config");
+    let env_vars: [(&str, &Path); 5] = [
+        ("HOME", fake_home.as_path()),
+        ("USERPROFILE", fake_home.as_path()),
+        ("AGY_CONFIG_DIR", gemini_cfg.as_path()),
         ("AGY_CLI_DIR", cli_dir.as_path()),
         ("AGY_HUD_HOME", hud_dir.as_path()),
     ];
@@ -1166,6 +1271,8 @@ fn marketplace_plugin_router_runs_bundled_binary_and_sha256_bootstrap_fallback()
         fs::set_permissions(&exec_p, fs::Permissions::from_mode(0o755)).unwrap();
     }
 
+    let fresh_home = tmp.path.join("fresh-home");
+    let fresh_cfg = fresh_home.join(".gemini/config");
     let fresh_cli = tmp.path.join("fresh-cli");
     let fresh_hud = fresh_cli.join("agy-hud");
 
@@ -1174,9 +1281,13 @@ fn marketplace_plugin_router_runs_bundled_binary_and_sha256_bootstrap_fallback()
         .arg("scripts/hud-cli.sh")
         .arg("doctor")
         .current_dir(mp_plugin.join("skills/hud"))
+        .env("HOME", &fresh_home)
+        .env("USERPROFILE", &fresh_home)
+        .env("AGY_CONFIG_DIR", &fresh_cfg)
         .env("AGY_CLI_DIR", &fresh_cli)
         .env("AGY_HUD_HOME", &fresh_hud)
         .env("AGY_HUD_NO_BOOTSTRAP", "1")
+        .env("AGY_SKIP_PLUGIN_INSTALL", "1")
         .output()
         .unwrap();
     assert!(
@@ -1236,6 +1347,9 @@ fn marketplace_plugin_router_runs_bundled_binary_and_sha256_bootstrap_fallback()
         .arg("scripts/hud-cli.sh")
         .arg("--version")
         .current_dir(mp_plugin.join("skills/hud"))
+        .env("HOME", &fresh_home)
+        .env("USERPROFILE", &fresh_home)
+        .env("AGY_CONFIG_DIR", &fresh_cfg)
         .env("AGY_CLI_DIR", &fresh_cli)
         .env("AGY_HUD_HOME", &fresh_hud)
         .env("AGY_HUD_ARCHIVE_DIR", &bundle_stage_root)
@@ -1287,6 +1401,7 @@ fn doctor_detects_disabled_plugin_in_gemini_config_json() {
         .arg("doctor")
         .env("HOME", &fake_home)
         .env("USERPROFILE", &fake_home)
+        .env_remove("AGY_CONFIG_DIR")
         .env("AGY_CLI_DIR", &cli_dir)
         .env("AGY_HUD_HOME", &hud_home)
         .env("LC_ALL", "en_US.UTF-8")
@@ -1590,7 +1705,13 @@ fn live_binary_cross_session_cost_ledger_and_invalid_config_warning_line() {
     )
     .unwrap();
 
-    let env_vars: [(&str, &Path); 2] = [
+    let fake_home = tmp.path.join("home");
+    let gemini_cfg = fake_home.join(".gemini/config");
+    fs::create_dir_all(&fake_home).unwrap();
+    let env_vars: [(&str, &Path); 5] = [
+        ("HOME", fake_home.as_path()),
+        ("USERPROFILE", fake_home.as_path()),
+        ("AGY_CONFIG_DIR", gemini_cfg.as_path()),
         ("AGY_CLI_DIR", cli_dir.as_path()),
         ("AGY_HUD_HOME", hud_home.as_path()),
     ];
@@ -1650,7 +1771,13 @@ fn live_binary_learns_model_compaction_ceiling_across_sessions_and_hides_200k_ba
     let hud_home = cli_dir.join("agy-hud");
     fs::create_dir_all(&hud_home).unwrap();
 
-    let env_vars: [(&str, &Path); 2] = [
+    let fake_home = tmp.path.join("home");
+    let gemini_cfg = fake_home.join(".gemini/config");
+    fs::create_dir_all(&fake_home).unwrap();
+    let env_vars: [(&str, &Path); 5] = [
+        ("HOME", fake_home.as_path()),
+        ("USERPROFILE", fake_home.as_path()),
+        ("AGY_CONFIG_DIR", gemini_cfg.as_path()),
         ("AGY_CLI_DIR", cli_dir.as_path()),
         ("AGY_HUD_HOME", hud_home.as_path()),
     ];
@@ -1859,9 +1986,17 @@ fn live_binary_learns_model_compaction_ceiling_across_sessions_and_hides_200k_ba
 #[test]
 fn japanese_localization_and_locale_autodetection_e2e() {
     let tmp = TempDir::new("ja-i18n");
+    let fake_home = tmp.path.join("home");
+    let gemini_cfg = fake_home.join(".gemini/config");
     let cli_dir = tmp.path.join("cli");
     let hud_home = cli_dir.join("agy-hud");
-    let env_vars: [(&str, &Path); 2] = [("AGY_CLI_DIR", &cli_dir), ("AGY_HUD_HOME", &hud_home)];
+    let env_vars: [(&str, &Path); 5] = [
+        ("HOME", &fake_home),
+        ("USERPROFILE", &fake_home),
+        ("AGY_CONFIG_DIR", &gemini_cfg),
+        ("AGY_CLI_DIR", &cli_dir),
+        ("AGY_HUD_HOME", &hud_home),
+    ];
 
     let payload = json!({
         "cwd": tmp.path,
@@ -1914,6 +2049,9 @@ fn japanese_localization_and_locale_autodetection_e2e() {
     let mut cmd_ja = Command::new(env!("CARGO_BIN_EXE_agy-hud"));
     cmd_ja
         .env("AGY_HUD_DISABLE_BG_UPDATE", "1")
+        .env("HOME", &fake_home)
+        .env("USERPROFILE", &fake_home)
+        .env("AGY_CONFIG_DIR", &gemini_cfg)
         .env("AGY_CLI_DIR", &cli_dir)
         .env("AGY_HUD_HOME", &hud_home)
         .env("LANG", "ja_JP.UTF-8")
@@ -1940,6 +2078,9 @@ fn japanese_localization_and_locale_autodetection_e2e() {
     let mut cmd_zh = Command::new(env!("CARGO_BIN_EXE_agy-hud"));
     cmd_zh
         .env("AGY_HUD_DISABLE_BG_UPDATE", "1")
+        .env("HOME", &fake_home)
+        .env("USERPROFILE", &fake_home)
+        .env("AGY_CONFIG_DIR", &gemini_cfg)
         .env("AGY_CLI_DIR", &cli_dir)
         .env("AGY_HUD_HOME", &hud_home)
         .env("LANG", "zh_CN.UTF-8")
@@ -1967,6 +2108,9 @@ fn japanese_localization_and_locale_autodetection_e2e() {
     let mut cmd_override = Command::new(env!("CARGO_BIN_EXE_agy-hud"));
     cmd_override
         .env("AGY_HUD_DISABLE_BG_UPDATE", "1")
+        .env("HOME", &fake_home)
+        .env("USERPROFILE", &fake_home)
+        .env("AGY_CONFIG_DIR", &gemini_cfg)
         .env("AGY_CLI_DIR", &cli_dir)
         .env("AGY_HUD_HOME", &hud_home)
         .env("LANG", "ja_JP.UTF-8")
@@ -1986,4 +2130,751 @@ fn japanese_localization_and_locale_autodetection_e2e() {
         en_override_str.contains("READY"),
         "expected explicit English 'READY', got: {en_override_str}"
     );
+}
+
+#[test]
+fn unprefixed_skills_install_standalone_exec_embedded_fallback_and_clean_uninstall() {
+    let tmp = TempDir::new("unprefixed-install-e2e");
+    let fake_home = tmp.path.join("home");
+    let gemini_cfg = fake_home.join(".gemini/config");
+    let skills_dir = gemini_cfg.join("skills");
+    let sibling_skill_dir = skills_dir.join("user-custom");
+    let cli_dir = fake_home.join(".gemini/antigravity-cli");
+    let hud_home = cli_dir.join("agy-hud");
+
+    fs::create_dir_all(&sibling_skill_dir).unwrap();
+    fs::write(sibling_skill_dir.join("SKILL.md"), "# custom user skill\n").unwrap();
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&gemini_cfg, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(&skills_dir, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let env_vars: [(&str, &Path); 5] = [
+        ("HOME", fake_home.as_path()),
+        ("USERPROFILE", fake_home.as_path()),
+        ("AGY_CONFIG_DIR", gemini_cfg.as_path()),
+        ("AGY_CLI_DIR", cli_dir.as_path()),
+        ("AGY_HUD_HOME", hud_home.as_path()),
+    ];
+
+    // 1. Install deploys managed unprefixed `/hud` and `/hud-update` skills without chmod 0700 on parent dirs
+    let (ok_inst, inst_out) = run_bin(&["install", "--stack"], &env_vars, None);
+    assert!(ok_inst, "install failed: {inst_out}");
+    let inst_json: Value = serde_json::from_str(&inst_out).unwrap();
+    assert_eq!(inst_json["unprefixedSkills"]["hud"], "installed");
+    assert_eq!(inst_json["unprefixedSkills"]["hudUpdate"], "installed");
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            fs::metadata(&gemini_cfg).unwrap().permissions().mode() & 0o777,
+            0o755,
+            "install must never chmod 0700 existing gemini_config_dir"
+        );
+        assert_eq!(
+            fs::metadata(&skills_dir).unwrap().permissions().mode() & 0o777,
+            0o755,
+            "install must never chmod 0700 existing skills dir"
+        );
+        for name in ["hud", "hud-update"] {
+            let d = skills_dir.join(name);
+            assert_eq!(
+                fs::metadata(d.join("SKILL.md"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o644
+            );
+            assert_eq!(
+                fs::metadata(d.join(".agy-hud-managed.json"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o644
+            );
+            assert_eq!(
+                fs::metadata(d.join("scripts/hud-cli.sh"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o755
+            );
+        }
+    }
+
+    for name in ["hud", "hud-update"] {
+        let marker: Value = serde_json::from_str(
+            &fs::read_to_string(skills_dir.join(name).join(".agy-hud-managed.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(marker["managedBy"], "agy-hud");
+        assert_eq!(marker["skill"], name);
+        assert_eq!(marker["version"], env!("CARGO_PKG_VERSION"));
+    }
+
+    // 2. `doctor` JSON and `--pretty` report both unprefixed skills installed & abbreviate `~`
+    let (ok_doc, doc_out) = run_bin(&["doctor"], &env_vars, None);
+    assert!(ok_doc);
+    let doc_json: Value = serde_json::from_str(&doc_out).unwrap();
+    assert_eq!(doc_json["unprefixedSkills"]["hud"], "installed");
+    assert_eq!(doc_json["unprefixedSkills"]["hudUpdate"], "installed");
+
+    let (ok_pretty, pretty_out) = run_bin(&["doctor", "--pretty"], &env_vars, None);
+    assert!(ok_pretty);
+    let pretty_plain = strip_ansi(&pretty_out);
+    assert!(
+        pretty_plain.contains(
+            "Unprefixed Skills: /hud=installed · /hud-update=installed (~/.gemini/config/skills)"
+        ),
+        "unexpected pretty line: {pretty_plain}"
+    );
+
+    // 3. Execute standalone `skills/{hud,hud-update}/scripts/hud-cli.sh --version` outside any plugin root
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for name in ["hud", "hud-update"] {
+            let sh_out = Command::new("sh")
+                .args(["scripts/hud-cli.sh", "--version"])
+                .current_dir(skills_dir.join(name))
+                .env("HOME", &fake_home)
+                .env("USERPROFILE", &fake_home)
+                .env("AGY_CONFIG_DIR", &gemini_cfg)
+                .env("AGY_CLI_DIR", &cli_dir)
+                .env("AGY_HUD_HOME", &hud_home)
+                .output()
+                .unwrap();
+            assert!(
+                sh_out.status.success(),
+                "standalone {name}/scripts/hud-cli.sh failed: {}",
+                String::from_utf8_lossy(&sh_out.stderr)
+            );
+            let ver_str = String::from_utf8_lossy(&sh_out.stdout);
+            assert!(ver_str.contains("rust-native"), "ver_str: {ver_str}");
+        }
+
+        // Verify `hud-cli.sh` fallback chain when `$HUD_HOME/bin/agy-hud` is absent
+        let bin_path = hud_home.join("bin/agy-hud");
+        let bin_backup = tmp.path.join("agy-hud.bak");
+        fs::rename(&bin_path, &bin_backup).unwrap();
+
+        let hud_plugin_router = hud_home.join("plugin/scripts/agy-hud");
+        fs::create_dir_all(hud_plugin_router.parent().unwrap()).unwrap();
+        fs::write(&hud_plugin_router, "#!/bin/sh\necho from-hud-home-plugin\n").unwrap();
+        fs::set_permissions(&hud_plugin_router, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let cfg_plugin_router = gemini_cfg.join("plugins/agy-hud/scripts/agy-hud");
+        fs::create_dir_all(cfg_plugin_router.parent().unwrap()).unwrap();
+        fs::write(
+            &cfg_plugin_router,
+            "#!/bin/sh\necho from-gemini-config-plugin\n",
+        )
+        .unwrap();
+        fs::set_permissions(&cfg_plugin_router, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let fb1 = Command::new("sh")
+            .arg("scripts/hud-cli.sh")
+            .current_dir(skills_dir.join("hud"))
+            .env("HOME", &fake_home)
+            .env("USERPROFILE", &fake_home)
+            .env("AGY_CONFIG_DIR", &gemini_cfg)
+            .env("AGY_CLI_DIR", &cli_dir)
+            .env("AGY_HUD_HOME", &hud_home)
+            .output()
+            .unwrap();
+        assert!(fb1.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&fb1.stdout).trim(),
+            "from-hud-home-plugin"
+        );
+
+        fs::remove_file(&hud_plugin_router).unwrap();
+        let fb2 = Command::new("sh")
+            .arg("scripts/hud-cli.sh")
+            .current_dir(skills_dir.join("hud-update"))
+            .env("HOME", &fake_home)
+            .env("USERPROFILE", &fake_home)
+            .env("AGY_CONFIG_DIR", &gemini_cfg)
+            .env("AGY_CLI_DIR", &cli_dir)
+            .env("AGY_HUD_HOME", &hud_home)
+            .output()
+            .unwrap();
+        assert!(fb2.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&fb2.stdout).trim(),
+            "from-gemini-config-plugin"
+        );
+
+        fs::rename(&bin_backup, &bin_path).unwrap();
+        fs::remove_dir_all(hud_home.join("plugin")).unwrap();
+        fs::remove_dir_all(gemini_cfg.join("plugins")).unwrap();
+    }
+
+    // 4. Standalone binary (outside repo `target/`) tests `resolve_plugin_root` & compile-time `include_str!` fallback
+    let standalone_dir = tmp.path.join("standalone-bin");
+    fs::create_dir_all(&standalone_dir).unwrap();
+    let standalone_bin_name = if cfg!(windows) {
+        "agy-hud.exe"
+    } else {
+        "agy-hud"
+    };
+    let standalone_exe = standalone_dir.join(standalone_bin_name);
+    fs::copy(env!("CARGO_BIN_EXE_agy-hud"), &standalone_exe).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&standalone_exe, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let iso_home = tmp.path.join("iso-home");
+    let iso_cfg = iso_home.join(".gemini/config");
+    let iso_cli = iso_home.join(".gemini/antigravity-cli");
+    let iso_hud = iso_cli.join("agy-hud");
+    fs::create_dir_all(&iso_home).unwrap();
+
+    // 4a. `resolve_plugin_root` finds `gemini_config_dir/plugins/agy-hud`, then `hud_home/plugin`, then `cwd` ancestors
+    let cfg_plugin = iso_cfg.join("plugins/agy-hud");
+    fs::create_dir_all(&cfg_plugin).unwrap();
+    fs::write(
+        cfg_plugin.join("plugin.json"),
+        r#"{"name":"agy-hud","version":"8.8.8"}"#,
+    )
+    .unwrap();
+    let doc_cfg_root = Command::new(&standalone_exe)
+        .arg("doctor")
+        .current_dir(&standalone_dir)
+        .env("HOME", &iso_home)
+        .env("USERPROFILE", &iso_home)
+        .env("AGY_CONFIG_DIR", &iso_cfg)
+        .env("AGY_CLI_DIR", &iso_cli)
+        .env("AGY_HUD_HOME", &iso_hud)
+        .env("AGY_SKIP_PLUGIN_INSTALL", "1")
+        .output()
+        .unwrap();
+    assert!(doc_cfg_root.status.success());
+    let doc_cfg_json: Value = serde_json::from_slice(&doc_cfg_root.stdout).unwrap();
+    assert_eq!(doc_cfg_json["plugin"]["version"], "8.8.8");
+
+    fs::remove_dir_all(&cfg_plugin).unwrap();
+    let staged_plugin = iso_hud.join("plugin");
+    fs::create_dir_all(&staged_plugin).unwrap();
+    fs::write(
+        staged_plugin.join("plugin.json"),
+        r#"{"name":"agy-hud","version":"7.7.7"}"#,
+    )
+    .unwrap();
+    let doc_staged_root = Command::new(&standalone_exe)
+        .arg("doctor")
+        .current_dir(&standalone_dir)
+        .env("HOME", &iso_home)
+        .env("USERPROFILE", &iso_home)
+        .env("AGY_CONFIG_DIR", &iso_cfg)
+        .env("AGY_CLI_DIR", &iso_cli)
+        .env("AGY_HUD_HOME", &iso_hud)
+        .env("AGY_SKIP_PLUGIN_INSTALL", "1")
+        .output()
+        .unwrap();
+    assert!(doc_staged_root.status.success());
+    let doc_staged_json: Value = serde_json::from_slice(&doc_staged_root.stdout).unwrap();
+    assert_eq!(doc_staged_json["plugin"]["version"], "7.7.7");
+
+    fs::remove_dir_all(&staged_plugin).unwrap();
+    let cwd_plugin = tmp.path.join("cwd-plugin");
+    let cwd_skill = cwd_plugin.join("skills/hud");
+    fs::create_dir_all(&cwd_skill).unwrap();
+    fs::write(
+        cwd_plugin.join("plugin.json"),
+        r#"{"name":"agy-hud","version":"6.6.6"}"#,
+    )
+    .unwrap();
+    let doc_cwd_root = Command::new(&standalone_exe)
+        .arg("doctor")
+        .current_dir(&cwd_skill)
+        .env("HOME", &iso_home)
+        .env("USERPROFILE", &iso_home)
+        .env("AGY_CONFIG_DIR", &iso_cfg)
+        .env("AGY_CLI_DIR", &iso_cli)
+        .env("AGY_HUD_HOME", &iso_hud)
+        .env("AGY_SKIP_PLUGIN_INSTALL", "1")
+        .output()
+        .unwrap();
+    assert!(doc_cwd_root.status.success());
+    let doc_cwd_json: Value = serde_json::from_slice(&doc_cwd_root.stdout).unwrap();
+    assert_eq!(doc_cwd_json["plugin"]["version"], "6.6.6");
+
+    // 4b. Compile-time embedded fallback installs skills when NO on-disk `skills/` exists anywhere
+    let embed_inst = Command::new(&standalone_exe)
+        .args(["install", "--stack"])
+        .current_dir(&standalone_dir)
+        .env("HOME", &iso_home)
+        .env("USERPROFILE", &iso_home)
+        .env("AGY_CONFIG_DIR", &iso_cfg)
+        .env("AGY_CLI_DIR", &iso_cli)
+        .env("AGY_HUD_HOME", &iso_hud)
+        .output()
+        .unwrap();
+    assert!(
+        embed_inst.status.success(),
+        "embedded fallback install failed: {}",
+        String::from_utf8_lossy(&embed_inst.stderr)
+    );
+    let embed_json: Value = serde_json::from_slice(&embed_inst.stdout).unwrap();
+    assert_eq!(embed_json["unprefixedSkills"]["hud"], "installed");
+    assert_eq!(embed_json["unprefixedSkills"]["hudUpdate"], "installed");
+    let installed_hud_md = fs::read_to_string(iso_cfg.join("skills/hud/SKILL.md")).unwrap();
+    assert!(installed_hud_md.contains("name: hud"));
+    assert!(
+        fs::read_to_string(iso_cfg.join("skills/hud-update/scripts/hud-cli.sh"))
+            .unwrap()
+            .contains("HUD_HOME")
+    );
+
+    // Clean uninstall on `iso_home` (no siblings) removes `skills/` completely
+    let iso_uninst = Command::new(&standalone_exe)
+        .arg("uninstall")
+        .current_dir(&standalone_dir)
+        .env("HOME", &iso_home)
+        .env("USERPROFILE", &iso_home)
+        .env("AGY_CONFIG_DIR", &iso_cfg)
+        .env("AGY_CLI_DIR", &iso_cli)
+        .env("AGY_HUD_HOME", &iso_hud)
+        .output()
+        .unwrap();
+    assert!(iso_uninst.status.success());
+    assert!(!iso_cfg.join("skills").exists());
+
+    // 5. Uninstall on `fake_home` removes ONLY managed shortcuts while preserving `skills/user-custom`
+    let (ok_uninst, uninst_out) = run_bin(&["uninstall"], &env_vars, None);
+    assert!(ok_uninst);
+    let uninst_json: Value = serde_json::from_str(&uninst_out).unwrap();
+    assert_eq!(
+        uninst_json["unprefixedSkillsRemoved"],
+        json!(["hud", "hud-update"])
+    );
+    assert!(!skills_dir.join("hud").exists());
+    assert!(!skills_dir.join("hud-update").exists());
+    assert_eq!(
+        fs::read_to_string(sibling_skill_dir.join("SKILL.md")).unwrap(),
+        "# custom user skill\n"
+    );
+}
+
+#[test]
+fn unprefixed_skills_conflict_protection_dirs_symlinks_and_readonly_skills_json() {
+    let tmp = TempDir::new("unprefixed-conflicts");
+    let fake_home = tmp.path.join("home");
+    let gemini_cfg = fake_home.join(".gemini/config");
+    let skills_dir = gemini_cfg.join("skills");
+    let cli_dir = fake_home.join(".gemini/antigravity-cli");
+    let hud_home = cli_dir.join("agy-hud");
+
+    // 1. Existing non-managed dir (`skills/hud`) and symlink/dangling symlink (`skills/hud-update`)
+    fs::create_dir_all(skills_dir.join("hud")).unwrap();
+    fs::write(skills_dir.join("hud/SKILL.md"), "# my custom hud\n").unwrap();
+
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(
+        tmp.path.join("nonexistent-skill-target"),
+        skills_dir.join("hud-update"),
+    )
+    .unwrap();
+    #[cfg(not(unix))]
+    {
+        fs::create_dir_all(skills_dir.join("hud-update")).unwrap();
+        fs::write(
+            skills_dir.join("hud-update/SKILL.md"),
+            "# my custom hud-update\n",
+        )
+        .unwrap();
+    }
+
+    let env_vars: [(&str, &Path); 5] = [
+        ("HOME", fake_home.as_path()),
+        ("USERPROFILE", fake_home.as_path()),
+        ("AGY_CONFIG_DIR", gemini_cfg.as_path()),
+        ("AGY_CLI_DIR", cli_dir.as_path()),
+        ("AGY_HUD_HOME", hud_home.as_path()),
+    ];
+
+    let (ok_inst, inst_out) = run_bin(&["install", "--stack"], &env_vars, None);
+    assert!(ok_inst, "install failed: {inst_out}");
+    let inst_json: Value = serde_json::from_str(&inst_out).unwrap();
+    assert_eq!(inst_json["unprefixedSkills"]["hud"], "skipped-conflict");
+    assert_eq!(
+        inst_json["unprefixedSkills"]["hudUpdate"],
+        "skipped-conflict"
+    );
+    assert_eq!(
+        fs::read_to_string(skills_dir.join("hud/SKILL.md")).unwrap(),
+        "# my custom hud\n"
+    );
+    assert!(!skills_dir.join("hud/.agy-hud-managed.json").exists());
+    assert!(fs::symlink_metadata(skills_dir.join("hud-update")).is_ok());
+
+    let (ok_doc, doc_out) = run_bin(&["doctor"], &env_vars, None);
+    assert!(ok_doc);
+    let doc_json: Value = serde_json::from_str(&doc_out).unwrap();
+    assert_eq!(doc_json["unprefixedSkills"]["hud"], "conflict");
+    assert_eq!(doc_json["unprefixedSkills"]["hudUpdate"], "conflict");
+    let findings = doc_json["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        findings.contains("preserved (not overwritten)"),
+        "{findings}"
+    );
+    assert!(findings.contains("/agy-hud:hud"), "{findings}");
+    assert!(findings.contains("/agy-hud:hud-update"), "{findings}");
+
+    let (ok_uninst, uninst_out) = run_bin(&["uninstall"], &env_vars, None);
+    assert!(ok_uninst);
+    let uninst_json: Value = serde_json::from_str(&uninst_out).unwrap();
+    assert_eq!(uninst_json["unprefixedSkillsRemoved"], json!([]));
+    assert_eq!(
+        fs::read_to_string(skills_dir.join("hud/SKILL.md")).unwrap(),
+        "# my custom hud\n"
+    );
+    assert!(fs::symlink_metadata(skills_dir.join("hud-update")).is_ok());
+
+    // 1b. Symlink pointing to a directory that DOES contain `.agy-hud-managed.json` must STILL be preserved
+    #[cfg(unix)]
+    {
+        fs::remove_dir_all(skills_dir.join("hud")).unwrap();
+        let target_dir = tmp.path.join("symlink-target-managed");
+        fs::create_dir_all(&target_dir).unwrap();
+        fs::write(
+            target_dir.join(".agy-hud-managed.json"),
+            r#"{"managedBy":"agy-hud","skill":"hud","version":"1.0.0"}"#,
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&target_dir, skills_dir.join("hud")).unwrap();
+
+        let (_, inst_sym) = run_bin(&["install", "--stack"], &env_vars, None);
+        let inst_sym_json: Value = serde_json::from_str(&inst_sym).unwrap();
+        assert_eq!(inst_sym_json["unprefixedSkills"]["hud"], "skipped-conflict");
+
+        let (_, uninst_sym) = run_bin(&["uninstall"], &env_vars, None);
+        let uninst_sym_json: Value = serde_json::from_str(&uninst_sym).unwrap();
+        assert_eq!(uninst_sym_json["unprefixedSkillsRemoved"], json!([]));
+        assert!(
+            fs::symlink_metadata(skills_dir.join("hud"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(target_dir.join(".agy-hud-managed.json").is_file());
+    }
+
+    // 2. Strictly read-only `skills.json` conflict protection (JSONC + exclude + self-exclusion + inherits)
+    let _ = fs::remove_dir_all(&skills_dir);
+
+    let custom_root = fake_home.join("custom-skills");
+    fs::create_dir_all(custom_root.join("hud")).unwrap();
+    fs::create_dir_all(custom_root.join("hud-update")).unwrap();
+    fs::write(custom_root.join("hud/SKILL.md"), "# foreign hud\n").unwrap();
+    fs::write(
+        custom_root.join("hud-update/SKILL.md"),
+        "# excluded hud-update\n",
+    )
+    .unwrap();
+
+    // Plant `agy-hud`'s own plugin skill dirs to verify self-exclusion
+    let self_plugin_skills = gemini_cfg.join("plugins/agy-hud/skills");
+    fs::create_dir_all(self_plugin_skills.join("hud-update")).unwrap();
+    fs::write(
+        self_plugin_skills.join("hud-update/SKILL.md"),
+        "# self plugin skill\n",
+    )
+    .unwrap();
+    let self_staged_skills = hud_home.join("plugin/skills");
+    fs::create_dir_all(self_staged_skills.join("hud-update")).unwrap();
+    fs::write(
+        self_staged_skills.join("hud-update/SKILL.md"),
+        "# self staged skill\n",
+    )
+    .unwrap();
+
+    let skills_json_path = gemini_cfg.join("skills.json");
+    let skills_json_raw = format!(
+        r#"{{
+  // User JSONC comment that must NEVER be stripped or rewritten
+  "entries": [
+    {{
+      "path": "~/custom-skills",
+      "exclude": ["hud-update"],
+    }},
+    {{
+      "path": "~/.gemini/config/plugins/agy-hud/skills"
+    }},
+    {{
+      "path": {:?}
+    }},
+  ]
+}}
+"#,
+        self_staged_skills.to_string_lossy()
+    );
+    fs::write(&skills_json_path, &skills_json_raw).unwrap();
+
+    let (ok_json_inst, json_inst_out) = run_bin(&["install", "--stack"], &env_vars, None);
+    assert!(ok_json_inst, "install failed: {json_inst_out}");
+    let json_inst: Value = serde_json::from_str(&json_inst_out).unwrap();
+    assert_eq!(json_inst["unprefixedSkills"]["hud"], "skipped-conflict");
+    assert_eq!(json_inst["unprefixedSkills"]["hudUpdate"], "installed");
+    assert!(!skills_dir.join("hud").exists());
+    assert!(
+        skills_dir
+            .join("hud-update/.agy-hud-managed.json")
+            .is_file()
+    );
+    assert_eq!(
+        fs::read_to_string(&skills_json_path).unwrap(),
+        skills_json_raw,
+        "skills.json must remain strictly read-only"
+    );
+
+    let (_, json_doc_out) = run_bin(&["doctor"], &env_vars, None);
+    let json_doc: Value = serde_json::from_str(&json_doc_out).unwrap();
+    assert_eq!(json_doc["unprefixedSkills"]["hud"], "conflict");
+    assert_eq!(json_doc["unprefixedSkills"]["hudUpdate"], "installed");
+
+    let (_, json_uninst_out) = run_bin(&["uninstall"], &env_vars, None);
+    let json_uninst: Value = serde_json::from_str(&json_uninst_out).unwrap();
+    assert_eq!(
+        json_uninst["unprefixedSkillsRemoved"],
+        json!(["hud-update"])
+    );
+    assert_eq!(
+        fs::read_to_string(&skills_json_path).unwrap(),
+        skills_json_raw
+    );
+
+    // 3. Test `inherits` + `include_only` + direct `<name>` folder in `skills.json`
+    let direct_hud_update = tmp.path.join("direct-dir/hud-update");
+    fs::create_dir_all(&direct_hud_update).unwrap();
+    fs::write(
+        direct_hud_update.join("SKILL.md"),
+        "# direct inherited hud-update\n",
+    )
+    .unwrap();
+    let shared_json_path = gemini_cfg.join("shared-skills.json");
+    fs::write(
+        &shared_json_path,
+        serde_json::to_string_pretty(&json!({
+            "entries": [{ "path": direct_hud_update }]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let inherited_raw = serde_json::to_string_pretty(&json!({
+        "inherits": [{
+            "path": "shared-skills.json",
+            "include_only": ["hud-update"]
+        }]
+    }))
+    .unwrap();
+    fs::write(&skills_json_path, &inherited_raw).unwrap();
+
+    let (_, inh_inst_out) = run_bin(&["install", "--stack"], &env_vars, None);
+    let inh_inst: Value = serde_json::from_str(&inh_inst_out).unwrap();
+    assert_eq!(inh_inst["unprefixedSkills"]["hud"], "installed");
+    assert_eq!(
+        inh_inst["unprefixedSkills"]["hudUpdate"],
+        "skipped-conflict"
+    );
+    let (_, inh_doc_out) = run_bin(&["doctor"], &env_vars, None);
+    let inh_doc: Value = serde_json::from_str(&inh_doc_out).unwrap();
+    assert_eq!(inh_doc["unprefixedSkills"]["hud"], "installed");
+    assert_eq!(inh_doc["unprefixedSkills"]["hudUpdate"], "conflict");
+    assert_eq!(
+        fs::read_to_string(&skills_json_path).unwrap(),
+        inherited_raw
+    );
+}
+
+#[test]
+fn live_statusline_preview_and_uninstall_sh_fallback_with_short_and_prefixed_commands() {
+    let tmp = TempDir::new("live-cmd-switch");
+    let fake_home = tmp.path.join("home");
+    let gemini_cfg = fake_home.join(".gemini/config");
+    let skills_dir = gemini_cfg.join("skills");
+    let cli_dir = fake_home.join(".gemini/antigravity-cli");
+    let hud_home = cli_dir.join("agy-hud");
+
+    fs::create_dir_all(hud_home.join("data")).unwrap();
+    fs::write(
+        hud_home.join("config.json"),
+        r#"{"invalidKeyForTest":true}"#,
+    )
+    .unwrap();
+    fs::write(
+        hud_home.join("data/update-cache.json"),
+        serde_json::to_string(&json!({
+            "checkedAt": 1_700_000_000_000i64,
+            "latestVersion": "9.9.0"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let env_vars: [(&str, &Path); 5] = [
+        ("HOME", fake_home.as_path()),
+        ("USERPROFILE", fake_home.as_path()),
+        ("AGY_CONFIG_DIR", gemini_cfg.as_path()),
+        ("AGY_CLI_DIR", cli_dir.as_path()),
+        ("AGY_HUD_HOME", hud_home.as_path()),
+    ];
+    let live_payload = json!({
+        "cwd": tmp.path,
+        "conversation_id": "cmd-switch-conv",
+        "agent_state": "idle",
+        "terminal_width": 140,
+        "model": { "id": "Gemini 3 Flash", "display_name": "Gemini 3 Flash" },
+        "context_window": { "context_window_size": 1_048_576, "used_percentage": 18.0 }
+    })
+    .to_string();
+
+    // 1. Neither unprefixed shortcut installed -> live & preview use `/agy-hud:hud` and `/agy-hud:hud-update`
+    let (ok_absent, out_absent) = run_bin(&[], &env_vars, Some(&live_payload));
+    assert!(ok_absent);
+    let plain_absent = strip_ansi(&out_absent);
+    assert!(
+        plain_absent.contains("· /agy-hud:hud"),
+        "expected /agy-hud:hud config warning: {plain_absent}"
+    );
+    assert!(
+        plain_absent.contains("↑ v9.9.0 · /agy-hud:hud-update"),
+        "expected /agy-hud:hud-update badge: {plain_absent}"
+    );
+
+    let (ok_prev_absent, prev_absent) = run_bin(&["preview", "--state", "idle"], &env_vars, None);
+    assert!(ok_prev_absent);
+    assert!(strip_ansi(&prev_absent).contains("· /agy-hud:hud"));
+
+    // 2. Mixed state: `/hud` conflicted while `/hud-update` installed -> `/agy-hud:hud` + `/hud-update`
+    fs::create_dir_all(skills_dir.join("hud")).unwrap();
+    fs::write(skills_dir.join("hud/SKILL.md"), "# custom hud\n").unwrap();
+    let (ok_mixed_inst, _) = run_bin(&["install", "--stack"], &env_vars, None);
+    assert!(ok_mixed_inst);
+
+    let (ok_mixed, out_mixed) = run_bin(&[], &env_vars, Some(&live_payload));
+    assert!(ok_mixed);
+    let plain_mixed = strip_ansi(&out_mixed);
+    assert!(
+        plain_mixed.contains("· /agy-hud:hud"),
+        "conflicted /hud must keep /agy-hud:hud: {plain_mixed}"
+    );
+    assert!(
+        plain_mixed.contains("↑ v9.9.0 · /hud-update"),
+        "installed /hud-update must use short command: {plain_mixed}"
+    );
+    assert!(!plain_mixed.contains("/agy-hud:hud-update"));
+
+    // 3. Both installed cleanly -> live & preview use `/hud` and `/hud-update`
+    fs::remove_dir_all(skills_dir.join("hud")).unwrap();
+    let (ok_both_inst, _) = run_bin(&["install", "--stack"], &env_vars, None);
+    assert!(ok_both_inst);
+
+    let (ok_short, out_short) = run_bin(&[], &env_vars, Some(&live_payload));
+    assert!(ok_short);
+    let plain_short = strip_ansi(&out_short);
+    assert!(plain_short.contains("· /hud"), "{plain_short}");
+    assert!(
+        plain_short.contains("↑ v9.9.0 · /hud-update"),
+        "{plain_short}"
+    );
+    assert!(!plain_short.contains("/agy-hud:hud"), "{plain_short}");
+
+    let (ok_prev_short, prev_short) = run_bin(&["preview", "--state", "idle"], &env_vars, None);
+    assert!(ok_prev_short);
+    let prev_short_plain = strip_ansi(&prev_short);
+    assert!(prev_short_plain.contains("· /hud"), "{prev_short_plain}");
+    assert!(
+        !prev_short_plain.contains("/agy-hud:hud"),
+        "{prev_short_plain}"
+    );
+
+    // 4. `uninstall.sh` binary-missing fallback cleans managed skill dirs while preserving foreign/symlinked ones
+    #[cfg(unix)]
+    {
+        let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .unwrap();
+        fs::remove_file(hud_home.join("bin/agy-hud")).unwrap();
+
+        // Replace `skills/hud-update` with a foreign directory (no `.agy-hud-managed.json`), keep `skills/hud` managed
+        fs::remove_dir_all(skills_dir.join("hud-update")).unwrap();
+        fs::create_dir_all(skills_dir.join("hud-update")).unwrap();
+        fs::write(
+            skills_dir.join("hud-update/SKILL.md"),
+            "# foreign hud-update\n",
+        )
+        .unwrap();
+
+        let sh_uninst = Command::new("sh")
+            .arg(workspace_root.join("uninstall.sh"))
+            .env("HOME", &fake_home)
+            .env("USERPROFILE", &fake_home)
+            .env("AGY_CONFIG_DIR", &gemini_cfg)
+            .env("AGY_CLI_DIR", &cli_dir)
+            .env("AGY_HUD_HOME", &hud_home)
+            .env("AGY_SKIP_PLUGIN_INSTALL", "1")
+            .output()
+            .unwrap();
+        assert!(
+            sh_uninst.status.success(),
+            "uninstall.sh fallback failed: {}",
+            String::from_utf8_lossy(&sh_uninst.stderr)
+        );
+        assert!(
+            !skills_dir.join("hud").exists(),
+            "managed skills/hud must be removed by uninstall.sh fallback"
+        );
+        assert_eq!(
+            fs::read_to_string(skills_dir.join("hud-update/SKILL.md")).unwrap(),
+            "# foreign hud-update\n",
+            "foreign skills/hud-update must be preserved by uninstall.sh fallback"
+        );
+        assert!(!hud_home.exists());
+
+        // Also test `uninstall.sh` fallback refuses to follow a symlinked `skills/hud` even if target has marker
+        let sym_target = tmp.path.join("sym-managed-target");
+        fs::create_dir_all(&sym_target).unwrap();
+        fs::write(
+            sym_target.join(".agy-hud-managed.json"),
+            r#"{"managedBy":"agy-hud","skill":"hud","version":"1.0.0"}"#,
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&sym_target, skills_dir.join("hud")).unwrap();
+        let sh_uninst2 = Command::new("sh")
+            .arg(workspace_root.join("uninstall.sh"))
+            .env("HOME", &fake_home)
+            .env("USERPROFILE", &fake_home)
+            .env("AGY_CONFIG_DIR", &gemini_cfg)
+            .env("AGY_CLI_DIR", &cli_dir)
+            .env("AGY_HUD_HOME", &hud_home)
+            .env("AGY_SKIP_PLUGIN_INSTALL", "1")
+            .output()
+            .unwrap();
+        assert!(sh_uninst2.status.success());
+        assert!(
+            fs::symlink_metadata(skills_dir.join("hud"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(sym_target.join(".agy-hud-managed.json").is_file());
+    }
 }

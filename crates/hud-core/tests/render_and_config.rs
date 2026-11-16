@@ -13,7 +13,8 @@ use hud_core::probes::{
     reconcile_cost_ledger,
 };
 use hud_core::render::{
-    RenderExtras, RenderInput, format_config_problem_line, render_hud_lines, render_hud_lines_full,
+    RenderExtras, RenderInput, format_config_problem_line, format_config_problem_line_with_cmd,
+    render_hud_lines, render_hud_lines_full,
 };
 use hud_core::stdin::{
     CeilingSource, CompactionInputs, CompactionScope, EffectiveCeiling, compute_quota_pace,
@@ -29,7 +30,8 @@ use hud_core::types::{
     LearnedCompactionState, LineLayout, LogicPaths, ModelStdin, PathLevels, PluginFacts,
     ProbeAnswers, QuotaBucketView, QuotaPace, RawQuotaBucket, RuntimeFacts, SandboxStdin,
     SubagentEntry, SubagentStatus, SubagentStdin, TodoItem, TodoStatus, ToolEntry, ToolStatus,
-    TranscriptCursor, TranscriptSummary, UpdateCacheSnapshot, VimStdin, WorkspaceStdin,
+    TranscriptCursor, TranscriptSummary, UnprefixedSkillsFacts, UpdateCacheSnapshot, VimStdin,
+    WorkspaceStdin,
 };
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
@@ -318,6 +320,7 @@ fn config_schema_matches_hud_config_leaf_keys_and_preview_showcase_renders_5_sce
         }),
         config_path: "/Users/alice/.gemini/antigravity-cli/agy-hud/config.json".to_string(),
         heartbeat: None,
+        ..DoctorFacts::default()
     };
     let paths = LogicPaths {
         config: "/Users/alice/.gemini/antigravity-cli/agy-hud/config.json".to_string(),
@@ -705,6 +708,7 @@ fn update_semver_parsing_badge_rendering_and_doctor_findings() {
         installed_plugin: None,
         config_path: "/Users/alice/.gemini/antigravity-cli/agy-hud/config.json".to_string(),
         heartbeat: None,
+        ..DoctorFacts::default()
     };
     let paths = LogicPaths {
         config: "/Users/alice/.gemini/antigravity-cli/agy-hud/config.json".to_string(),
@@ -1275,6 +1279,7 @@ fn agy_1_5_4_schema_vcs_fallback_show_project_decoupling_and_subagent_statuses()
         installed_plugin: None,
         config_path: "/cfg/config.json".to_string(),
         heartbeat: None,
+        ..DoctorFacts::default()
     };
     let paths = LogicPaths::default();
     let report_out = execute_subcommand(
@@ -1852,6 +1857,7 @@ fn cost_ledger_watermark_idempotency_rollover_and_restart_carry() {
         RenderExtras {
             cost_totals: reloaded_totals.as_ref(),
             compaction_ceiling: None,
+            ..RenderExtras::default()
         },
     );
     let joined: String = rendered
@@ -2072,6 +2078,7 @@ fn width_preserving_report_scrub_and_incremental_transcript_cursor_parity() {
         installed_plugin: None,
         config_path: "/Users/max/.gemini/antigravity-cli/agy-hud/config.json".to_string(),
         heartbeat: None,
+        ..DoctorFacts::default()
     };
     let report = execute_subcommand(
         "report",
@@ -2437,6 +2444,7 @@ fn compaction_scale_watermark_bar_colors_badge_modes_and_snapshot_report_fidelit
         installed_plugin: None,
         config_path: "/Users/dev/.gemini/antigravity-cli/agy-hud/config.json".to_string(),
         heartbeat: None,
+        ..DoctorFacts::default()
     };
     let cmd_ctx = CommandContext {
         facts: &facts,
@@ -2839,6 +2847,7 @@ fn compaction_ceiling_reconciliation_learns_invalidates_recovers_and_scrubs_repo
         installed_plugin: None,
         config_path: "/Users/alice/.gemini/antigravity-cli/agy-hud/config.json".to_string(),
         heartbeat: None,
+        ..DoctorFacts::default()
     };
     let snap_valid = json!({
         "stdin": &s2_low,
@@ -3186,6 +3195,7 @@ fn artifact_count_visibility_defaults_i18n_compact_meta_and_config_overrides() {
         installed_plugin: None,
         config_path: "/Users/alice/.gemini/antigravity-cli/agy-hud/config.json".to_string(),
         heartbeat: None,
+        ..DoctorFacts::default()
     };
     let ctx = CommandContext {
         facts: &facts,
@@ -3363,4 +3373,418 @@ fn japanese_language_rendering_and_cjk_alignment() {
     let loaded_auto = parse_config_str(Some(r#"{"language":"auto"}"#));
     assert_eq!(loaded_auto.config.language, Language::Auto);
     assert!(loaded_auto.problems.is_empty());
+}
+
+#[test]
+fn short_vs_prefixed_update_badge_and_config_warning_line() {
+    let default_extras = RenderExtras::default();
+    assert!(!default_extras.use_short_hud_cmd);
+    assert!(!default_extras.use_short_update_cmd);
+
+    let stdin = sample_stdin(140);
+    let update = UpdateCacheSnapshot {
+        checked_at: 1_700_000_000_000,
+        latest_version: "9.9.0".to_string(),
+        release_url: Some("https://github.com/maxlee/agy-hud/releases/tag/v9.9.0".to_string()),
+    };
+
+    for (gm, short_expected, prefixed_expected, check_ascii) in [
+        (
+            GlyphMode::Unicode,
+            "↑ v9.9.0 · /hud-update",
+            "↑ v9.9.0 · /agy-hud:hud-update",
+            false,
+        ),
+        (
+            GlyphMode::Nerd,
+            "\u{f062} v9.9.0 · /hud-update",
+            "\u{f062} v9.9.0 · /agy-hud:hud-update",
+            false,
+        ),
+        (
+            GlyphMode::Ascii,
+            "^ v9.9.0 . /hud-update",
+            "^ v9.9.0 . /agy-hud:hud-update",
+            true,
+        ),
+    ] {
+        let mut cfg = HudConfig::default();
+        cfg.display.glyph_mode = gm;
+
+        let prefixed_lines = render_hud_lines_full(
+            RenderInput {
+                stdin: Some(&stdin),
+                config: &cfg,
+                transcript: &TranscriptSummary::default(),
+                vcs: None,
+                memory: None,
+                cached_quota: None,
+                update_info: Some(&update),
+                columns: Some(140),
+                now_ms: 1_700_000_000_000,
+            },
+            RenderExtras::default(),
+        );
+        if check_ascii {
+            assert!(prefixed_lines[0].is_ascii());
+        }
+        let prefixed_plain = strip_ansi(&prefixed_lines[0]);
+        assert!(
+            prefixed_plain.contains(prefixed_expected),
+            "expected `{prefixed_expected}` in `{prefixed_plain}`"
+        );
+
+        let short_lines = render_hud_lines_full(
+            RenderInput {
+                stdin: Some(&stdin),
+                config: &cfg,
+                transcript: &TranscriptSummary::default(),
+                vcs: None,
+                memory: None,
+                cached_quota: None,
+                update_info: Some(&update),
+                columns: Some(140),
+                now_ms: 1_700_000_000_000,
+            },
+            RenderExtras {
+                use_short_update_cmd: true,
+                ..RenderExtras::default()
+            },
+        );
+        if check_ascii {
+            assert!(short_lines[0].is_ascii());
+        }
+        let short_plain = strip_ansi(&short_lines[0]);
+        assert!(
+            short_plain.contains(short_expected),
+            "expected `{short_expected}` in `{short_plain}`"
+        );
+        assert!(!short_plain.contains("/agy-hud:hud-update"));
+    }
+
+    let mut disabled_cfg = HudConfig::default();
+    disabled_cfg.updates.enabled = false;
+    let hidden_lines = render_hud_lines_full(
+        RenderInput {
+            stdin: Some(&stdin),
+            config: &disabled_cfg,
+            transcript: &TranscriptSummary::default(),
+            vcs: None,
+            memory: None,
+            cached_quota: None,
+            update_info: Some(&update),
+            columns: Some(140),
+            now_ms: 1_700_000_000_000,
+        },
+        RenderExtras {
+            use_short_update_cmd: true,
+            ..RenderExtras::default()
+        },
+    );
+    assert!(!strip_ansi(&hidden_lines[0]).contains("/hud-update"));
+
+    // Config problem line: prefixed fallback vs short `/hud`, including narrow 42-col preservation
+    let problems = vec![
+        "Unknown configuration key \"display.superLongInvalidPropertyNameForNarrowTerminal\""
+            .to_string(),
+    ];
+    let mut ascii_cfg = HudConfig::default();
+    ascii_cfg.display.glyph_mode = GlyphMode::Ascii;
+    let uni_cfg = HudConfig::default();
+
+    assert_eq!(
+        format_config_problem_line(&problems, &uni_cfg, Some(80)),
+        format_config_problem_line_with_cmd(&problems, &uni_cfg, Some(80), false)
+    );
+    assert!(format_config_problem_line_with_cmd(&[], &uni_cfg, Some(80), true).is_none());
+
+    let short_uni_42 =
+        format_config_problem_line_with_cmd(&problems, &uni_cfg, Some(42), true).unwrap();
+    let short_uni_42_plain = strip_ansi(&short_uni_42);
+    assert!(
+        short_uni_42_plain.ends_with(" · /hud"),
+        "expected ` · /hud` suffix: {short_uni_42_plain}"
+    );
+    assert!(
+        text_width(&short_uni_42_plain) <= 42,
+        "got width {}: {short_uni_42_plain}",
+        text_width(&short_uni_42_plain)
+    );
+
+    let short_ascii_42 =
+        format_config_problem_line_with_cmd(&problems, &ascii_cfg, Some(42), true).unwrap();
+    assert!(short_ascii_42.is_ascii());
+    let short_ascii_42_plain = strip_ansi(&short_ascii_42);
+    assert!(
+        short_ascii_42_plain.ends_with(" . /hud"),
+        "expected ` . /hud` suffix: {short_ascii_42_plain}"
+    );
+    assert!(
+        text_width(&short_ascii_42_plain) <= 42,
+        "got width {}: {short_ascii_42_plain}",
+        text_width(&short_ascii_42_plain)
+    );
+
+    let prefixed_ascii_42 =
+        format_config_problem_line_with_cmd(&problems, &ascii_cfg, Some(42), false).unwrap();
+    let prefixed_ascii_42_plain = strip_ansi(&prefixed_ascii_42);
+    assert!(prefixed_ascii_42_plain.ends_with(" . /agy-hud:hud"));
+    assert!(short_ascii_42_plain.len() > prefixed_ascii_42_plain.len() - 8);
+
+    let ultra_narrow_short =
+        format_config_problem_line_with_cmd(&problems, &ascii_cfg, Some(20), true).unwrap();
+    let ultra_narrow_plain = strip_ansi(&ultra_narrow_short);
+    assert_eq!(ultra_narrow_plain, "! Config: /hud");
+    assert!(text_width(&ultra_narrow_plain) <= 20);
+
+    // `updates.enabled` schema description documents both `/hud-update` and `/agy-hud:hud-update`
+    let updates_entry = CONFIG_SCHEMA
+        .iter()
+        .find(|e| e.key == "updates.enabled")
+        .expect("updates.enabled schema entry");
+    assert!(updates_entry.description.contains("/hud-update"));
+    assert!(updates_entry.description.contains("/agy-hud:hud-update"));
+}
+
+#[test]
+fn doctor_reports_unprefixed_skills_installed_conflict_and_not_installed() {
+    // Omitted `unprefixedSkills` in serialized DoctorFacts deserializes to defaults cleanly
+    let legacy_facts_json = json!({
+        "cwd": "/Users/alice/project",
+        "runtime": {
+            "engine": "rust-native",
+            "version": "1.8.0",
+            "execPath": "/Users/alice/.gemini/antigravity-cli/agy-hud/bin/agy-hud",
+            "supported": true
+        },
+        "plugin": {
+            "root": "/Users/alice/.gemini/config/plugins/agy-hud",
+            "version": "1.8.0"
+        },
+        "configPath": "/Users/alice/.gemini/antigravity-cli/agy-hud/config.json",
+        "heartbeat": null
+    });
+    let parsed_facts: DoctorFacts =
+        serde_json::from_value(legacy_facts_json).expect("legacy DoctorFacts JSON");
+    assert_eq!(
+        parsed_facts.unprefixed_skills,
+        UnprefixedSkillsFacts::default()
+    );
+
+    let base_facts = DoctorFacts {
+        cwd: "/Users/alice/project".to_string(),
+        home_dir: "/Users/alice".to_string(),
+        platform: "macos".to_string(),
+        terminal: "Ghostty".to_string(),
+        remote_session: false,
+        locale: None,
+        runtime: RuntimeFacts {
+            engine: "rust-native".to_string(),
+            version: "1.8.0".to_string(),
+            exec_path: "/Users/alice/.gemini/antigravity-cli/agy-hud/bin/agy-hud".to_string(),
+            supported: true,
+        },
+        plugin: PluginFacts {
+            root: "/Users/alice/.gemini/config/plugins/agy-hud".to_string(),
+            version: "1.8.0".to_string(),
+        },
+        installed_plugin_status: "installed".to_string(),
+        installed_plugin: None,
+        unprefixed_skills: UnprefixedSkillsFacts {
+            hud: "installed".to_string(),
+            hud_update: "installed".to_string(),
+            skills_dir: "/Users/alice/.gemini/config/skills".to_string(),
+        },
+        config_path: "/Users/alice/.gemini/antigravity-cli/agy-hud/config.json".to_string(),
+        heartbeat: None,
+    };
+    let paths = LogicPaths {
+        config: "/Users/alice/.gemini/antigravity-cli/agy-hud/config.json".to_string(),
+        cli_settings: "/Users/alice/.gemini/antigravity-cli/settings.json".to_string(),
+        ..LogicPaths::default()
+    };
+    let settings_with_hud = json!({
+        "statusLine": {
+            "command": "/Users/alice/.gemini/antigravity-cli/agy-hud/bin/agy-hud",
+            "enabled": true
+        }
+    })
+    .to_string();
+    let update_json = serde_json::to_string(&UpdateCacheSnapshot {
+        checked_at: 1_700_000_000_000,
+        latest_version: "9.9.0".to_string(),
+        release_url: None,
+    })
+    .unwrap();
+
+    // 1. Both unprefixed skills installed -> JSON + pretty + update finding uses `/hud-update`
+    let installed_ctx = CommandContext {
+        facts: &base_facts,
+        paths: &paths,
+        now_ms: 1_700_000_000_000,
+        config_text: None,
+        cli_settings_text: Some(&settings_with_hud),
+        last_snapshot_text: None,
+        update_cache_text: Some(&update_json),
+        transcript_head: None,
+        transcript_tail: None,
+        task_md_text: None,
+    };
+    let doc_installed = execute_subcommand("doctor", &[], &installed_ctx);
+    let doc_installed_json: Value = serde_json::from_str(&doc_installed.lines.join("\n")).unwrap();
+    assert_eq!(doc_installed_json["unprefixedSkills"]["hud"], "installed");
+    assert_eq!(
+        doc_installed_json["unprefixedSkills"]["hudUpdate"],
+        "installed"
+    );
+    assert_eq!(
+        doc_installed_json["unprefixedSkills"]["skillsDir"],
+        "/Users/alice/.gemini/config/skills"
+    );
+    let findings_installed = doc_installed_json["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(findings_installed.contains("`/hud-update`"));
+    assert!(!findings_installed.contains("/agy-hud:hud-update"));
+    assert!(!findings_installed.contains("preserved"));
+    assert!(!findings_installed.contains("register `/hud`"));
+
+    let pretty_installed = execute_subcommand("doctor", &["--pretty".to_string()], &installed_ctx);
+    let pretty_installed_plain = pretty_installed
+        .lines
+        .iter()
+        .map(|l| strip_ansi(l))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!pretty_installed_plain.contains("/Users/alice"));
+    assert!(pretty_installed_plain.contains(
+        "Unprefixed Skills: /hud=installed · /hud-update=installed (~/.gemini/config/skills)"
+    ));
+    assert!(pretty_installed_plain.contains("run `/hud-update` or `agy-hud update`"));
+
+    // Preview honors `unprefixed_skills.hud == "installed"` for config problem line
+    let preview_err = execute_subcommand(
+        "preview",
+        &["--state".to_string(), "idle".to_string()],
+        &CommandContext {
+            config_text: Some(r#"{"unknownKey":true}"#),
+            ..installed_ctx
+        },
+    );
+    let preview_err_plain = preview_err
+        .lines
+        .iter()
+        .map(|l| strip_ansi(l))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(preview_err_plain.contains("· /hud"));
+    assert!(!preview_err_plain.contains("/agy-hud:hud"));
+
+    // 2. Conflict on `/hud` and `/hud-update` -> finding preserves custom skills & directs to `/agy-hud:*`
+    let mut conflict_facts = base_facts.clone();
+    conflict_facts.unprefixed_skills = UnprefixedSkillsFacts {
+        hud: "conflict".to_string(),
+        hud_update: "conflict".to_string(),
+        skills_dir: "/Users/alice/.gemini/config/skills".to_string(),
+    };
+    let conflict_ctx = CommandContext {
+        facts: &conflict_facts,
+        update_cache_text: Some(&update_json),
+        ..installed_ctx
+    };
+    let doc_conflict = execute_subcommand("doctor", &[], &conflict_ctx);
+    let doc_conflict_json: Value = serde_json::from_str(&doc_conflict.lines.join("\n")).unwrap();
+    assert_eq!(doc_conflict_json["unprefixedSkills"]["hud"], "conflict");
+    assert_eq!(
+        doc_conflict_json["unprefixedSkills"]["hudUpdate"],
+        "conflict"
+    );
+    let findings_conflict = doc_conflict_json["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(findings_conflict.contains("preserved (not overwritten)"));
+    assert!(findings_conflict.contains("`/hud`"));
+    assert!(findings_conflict.contains("`/hud-update`"));
+    assert!(findings_conflict.contains("/agy-hud:hud"));
+    assert!(findings_conflict.contains("/agy-hud:hud-update"));
+    assert!(!findings_conflict.contains("run `/hud-update`"));
+
+    let pretty_conflict = execute_subcommand("doctor", &["--pretty".to_string()], &conflict_ctx);
+    let pretty_conflict_plain = pretty_conflict
+        .lines
+        .iter()
+        .map(|l| strip_ansi(l))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!pretty_conflict_plain.contains("/Users/alice"));
+    assert!(pretty_conflict_plain.contains(
+        "Unprefixed Skills: /hud=conflict · /hud-update=conflict (~/.gemini/config/skills)"
+    ));
+    assert!(pretty_conflict_plain.contains("run `/agy-hud:hud-update` or `agy-hud update`"));
+
+    // 3. `not-installed` when `kind == "agy-hud"` suggests `agy-hud install`, and falls back when `kind == "none"`
+    let mut missing_facts = base_facts.clone();
+    missing_facts.unprefixed_skills = UnprefixedSkillsFacts {
+        hud: "not-installed".to_string(),
+        hud_update: "not-installed".to_string(),
+        skills_dir: "/Users/alice/.gemini/config/skills".to_string(),
+    };
+    let missing_ctx = CommandContext {
+        facts: &missing_facts,
+        update_cache_text: Some(&update_json),
+        ..installed_ctx
+    };
+    let doc_missing = execute_subcommand("doctor", &[], &missing_ctx);
+    let doc_missing_json: Value = serde_json::from_str(&doc_missing.lines.join("\n")).unwrap();
+    assert_eq!(doc_missing_json["unprefixedSkills"]["hud"], "not-installed");
+    assert_eq!(
+        doc_missing_json["unprefixedSkills"]["hudUpdate"],
+        "not-installed"
+    );
+    let findings_missing = doc_missing_json["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(findings_missing.contains("agy-hud install"));
+    assert!(findings_missing.contains("/hud"));
+    assert!(findings_missing.contains("/hud-update"));
+    assert!(findings_missing.contains("`/agy-hud:hud-update`"));
+
+    let pretty_missing = execute_subcommand("doctor", &["--pretty".to_string()], &missing_ctx);
+    let pretty_missing_plain = pretty_missing
+        .lines
+        .iter()
+        .map(|l| strip_ansi(l))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(pretty_missing_plain.contains("/hud=not-installed · /hud-update=not-installed"));
+
+    // When `statusLine` is not configured (`kind == "none"`), do not emit duplicate install shortcut finding
+    let no_sl_ctx = CommandContext {
+        cli_settings_text: None,
+        update_cache_text: None,
+        ..missing_ctx
+    };
+    let doc_no_sl = execute_subcommand("doctor", &[], &no_sl_ctx);
+    let doc_no_sl_json: Value = serde_json::from_str(&doc_no_sl.lines.join("\n")).unwrap();
+    let findings_no_sl = doc_no_sl_json["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(findings_no_sl.contains("No statusLine is configured"));
+    assert!(!findings_no_sl.contains("shortcut skill is not installed"));
 }

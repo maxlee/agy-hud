@@ -82,6 +82,7 @@ fn evaluate_corpus_case(case: &CorpusCase) -> Result<(), String> {
         RenderExtras {
             cost_totals: cost_totals.as_ref(),
             compaction_ceiling,
+            ..RenderExtras::default()
         },
     );
 
@@ -216,6 +217,7 @@ fn scrubbed_report_case_roundtrips_directly_into_corpus_evaluator() {
         installed_plugin: None,
         config_path: "/Users/alice/.gemini/antigravity-cli/agy-hud/config.json".to_string(),
         heartbeat: None,
+        ..DoctorFacts::default()
     };
 
     let out = execute_subcommand(

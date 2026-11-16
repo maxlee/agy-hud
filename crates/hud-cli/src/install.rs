@@ -1,9 +1,15 @@
 use crate::collector::{exec_file_safe, read_bounded_string};
-use crate::paths::{AgyPaths, atomic_write_bytes, canonical_or_parent, create_private_dir_all};
+use crate::paths::{
+    AgyPaths, atomic_write_bytes, atomic_write_public_bytes, canonical_or_parent,
+    canonicalize_with_tail, create_private_dir_all,
+};
+use hud_core::types::UnprefixedSkillsFacts;
+use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use std::collections::BTreeSet;
-use std::fs;
-use std::path::Path;
+use std::fs::{self, File};
+use std::io::Read;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Formats `statusLine.command` safely per OS:
@@ -101,6 +107,832 @@ fn file_mode_or_default(path: &Path, default_mode: u32) -> u32 {
 }
 
 const INSTALLER_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+const MANAGED_SKILL_NAMES: [&str; 2] = ["hud", "hud-update"];
+const MANAGED_MARKER_FILE: &str = ".agy-hud-managed.json";
+const MAX_SKILLS_JSON_BYTES: u64 = 256 * 1024;
+const MAX_INHERITS_DEPTH: usize = 8;
+
+const EMBEDDED_HUD_SKILL_MD: &str = include_str!("../../../skills/hud/SKILL.md");
+const EMBEDDED_HUD_CLI_SH: &str = include_str!("../../../skills/hud/scripts/hud-cli.sh");
+const EMBEDDED_HUD_UPDATE_SKILL_MD: &str = include_str!("../../../skills/hud-update/SKILL.md");
+const EMBEDDED_HUD_UPDATE_CLI_SH: &str =
+    include_str!("../../../skills/hud-update/scripts/hud-cli.sh");
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DestState {
+    Absent,
+    Managed,
+    Conflict,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct SkillsJsonFile {
+    #[serde(default)]
+    entries: Vec<SkillsJsonEntry>,
+    #[serde(default)]
+    inherits: Vec<SkillsJsonEntry>,
+    #[serde(default)]
+    exclude: Vec<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct SkillsJsonEntry {
+    #[serde(default)]
+    path: String,
+    #[serde(default)]
+    include_only: Option<Vec<String>>,
+    #[serde(default)]
+    exclude: Vec<String>,
+}
+
+fn embedded_skill_files(skill_name: &str) -> (&'static str, &'static str) {
+    match skill_name {
+        "hud" => (EMBEDDED_HUD_SKILL_MD, EMBEDDED_HUD_CLI_SH),
+        "hud-update" => (EMBEDDED_HUD_UPDATE_SKILL_MD, EMBEDDED_HUD_UPDATE_CLI_SH),
+        _ => ("", ""),
+    }
+}
+
+fn load_skill_source_files(
+    paths: &AgyPaths,
+    plugin_root: &Path,
+    skill_name: &str,
+) -> (Vec<u8>, Vec<u8>) {
+    let candidates = [
+        plugin_root.join("skills"),
+        paths
+            .gemini_config_dir
+            .join("plugins")
+            .join("agy-hud")
+            .join("skills"),
+        paths.hud_home.join("plugin").join("skills"),
+    ];
+    for root in candidates {
+        let skill_dir = root.join(skill_name);
+        let md_path = skill_dir.join("SKILL.md");
+        let sh_path = skill_dir.join("scripts").join("hud-cli.sh");
+        if let (Some(md), Some(sh)) = (
+            read_bounded_string(&md_path, 256 * 1024),
+            read_bounded_string(&sh_path, 64 * 1024),
+        ) {
+            return (md.into_bytes(), sh.into_bytes());
+        }
+    }
+    let (md, sh) = embedded_skill_files(skill_name);
+    (md.as_bytes().to_vec(), sh.as_bytes().to_vec())
+}
+
+fn inspect_dest_state(dest: &Path, skill_name: &str) -> DestState {
+    let meta = match fs::symlink_metadata(dest) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return DestState::Absent,
+        Err(_) => return DestState::Conflict,
+    };
+    if meta.file_type().is_symlink() || !meta.file_type().is_dir() {
+        return DestState::Conflict;
+    }
+    let marker_path = dest.join(MANAGED_MARKER_FILE);
+    let Ok(marker_meta) = fs::symlink_metadata(&marker_path) else {
+        return DestState::Conflict;
+    };
+    if marker_meta.file_type().is_symlink() || !marker_meta.file_type().is_file() {
+        return DestState::Conflict;
+    }
+    let Some(raw) = read_bounded_string(&marker_path, 16 * 1024) else {
+        return DestState::Conflict;
+    };
+    let Ok(val) = serde_json::from_str::<Value>(&raw) else {
+        return DestState::Conflict;
+    };
+    let is_ours = val.get("managedBy").and_then(Value::as_str) == Some("agy-hud")
+        && val.get("skill").and_then(Value::as_str) == Some(skill_name);
+    if is_ours {
+        DestState::Managed
+    } else {
+        DestState::Conflict
+    }
+}
+
+fn read_regular_or_symlink_bounded(path: &Path, max_bytes: u64) -> Option<String> {
+    let meta = fs::metadata(path).ok()?;
+    if !meta.is_file() || meta.len() > max_bytes {
+        return None;
+    }
+    let f = File::open(path).ok()?;
+    let mut buf = Vec::with_capacity(meta.len() as usize);
+    f.take(max_bytes + 1).read_to_end(&mut buf).ok()?;
+    if (buf.len() as u64) > max_bytes {
+        return None;
+    }
+    String::from_utf8(buf).ok()
+}
+
+fn strip_jsonc_comments_and_trailing_commas(raw: &str) -> String {
+    let src = raw.strip_prefix('\u{feff}').unwrap_or(raw).as_bytes();
+    let mut no_comments = Vec::with_capacity(src.len());
+    let mut i = 0;
+    let mut in_string = false;
+    while i < src.len() {
+        let b = src[i];
+        if in_string {
+            no_comments.push(b);
+            if b == b'\\' && i + 1 < src.len() {
+                i += 1;
+                no_comments.push(src[i]);
+            } else if b == b'"' {
+                in_string = false;
+            }
+            i += 1;
+            continue;
+        }
+        if b == b'"' {
+            in_string = true;
+            no_comments.push(b);
+            i += 1;
+        } else if b == b'/' && i + 1 < src.len() && src[i + 1] == b'/' {
+            i += 2;
+            while i < src.len() && src[i] != b'\n' {
+                i += 1;
+            }
+        } else if b == b'/' && i + 1 < src.len() && src[i + 1] == b'*' {
+            i += 2;
+            while i + 1 < src.len() && !(src[i] == b'*' && src[i + 1] == b'/') {
+                i += 1;
+            }
+            i = (i + 2).min(src.len());
+        } else {
+            no_comments.push(b);
+            i += 1;
+        }
+    }
+
+    let mut clean = Vec::with_capacity(no_comments.len());
+    in_string = false;
+    let mut j = 0;
+    while j < no_comments.len() {
+        let b = no_comments[j];
+        if in_string {
+            clean.push(b);
+            if b == b'\\' && j + 1 < no_comments.len() {
+                j += 1;
+                clean.push(no_comments[j]);
+            } else if b == b'"' {
+                in_string = false;
+            }
+            j += 1;
+            continue;
+        }
+        if b == b'"' {
+            in_string = true;
+            clean.push(b);
+            j += 1;
+            continue;
+        }
+        if b == b',' {
+            let mut k = j + 1;
+            while k < no_comments.len() && no_comments[k].is_ascii_whitespace() {
+                k += 1;
+            }
+            if k < no_comments.len() && matches!(no_comments[k], b']' | b'}') {
+                j += 1;
+                continue;
+            }
+        }
+        clean.push(b);
+        j += 1;
+    }
+
+    String::from_utf8_lossy(&clean).into_owned()
+}
+
+fn split_top_level_alternates(pat: &str) -> Vec<&str> {
+    let bytes = pat.as_bytes();
+    let mut out = Vec::new();
+    let mut depth = 0usize;
+    let mut in_class = false;
+    let mut escaped = false;
+    let mut start = 0usize;
+    for (idx, &b) in bytes.iter().enumerate() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if b == b'\\' {
+            escaped = true;
+            continue;
+        }
+        if in_class {
+            if b == b']' {
+                in_class = false;
+            }
+            continue;
+        }
+        match b {
+            b'[' => in_class = true,
+            b'(' => depth += 1,
+            b')' => depth = depth.saturating_sub(1),
+            b'|' if depth == 0 => {
+                out.push(&pat[start..idx]);
+                start = idx + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push(&pat[start..]);
+    out
+}
+
+fn find_matching_paren(bytes: &[u8], open_idx: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut in_class = false;
+    let mut escaped = false;
+    for (idx, &b) in bytes.iter().enumerate().skip(open_idx) {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if b == b'\\' {
+            escaped = true;
+            continue;
+        }
+        if in_class {
+            if b == b']' {
+                in_class = false;
+            }
+            continue;
+        }
+        match b {
+            b'[' => in_class = true,
+            b'(' => depth += 1,
+            b')' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Some(idx);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+#[derive(Clone, Copy)]
+enum AtomMatcher<'a> {
+    Any,
+    Lit(u8),
+    Class { body: &'a [u8], neg: bool },
+}
+
+impl AtomMatcher<'_> {
+    fn matches(self, c: u8) -> bool {
+        match self {
+            Self::Any => true,
+            Self::Lit(lit) => c == lit,
+            Self::Class { body, neg } => {
+                let mut found = false;
+                let mut idx = 0;
+                while idx < body.len() {
+                    if idx + 2 < body.len() && body[idx + 1] == b'-' {
+                        if c >= body[idx] && c <= body[idx + 2] {
+                            found = true;
+                            break;
+                        }
+                        idx += 3;
+                    } else {
+                        if c == body[idx] {
+                            found = true;
+                            break;
+                        }
+                        idx += 1;
+                    }
+                }
+                if neg { !found } else { found }
+            }
+        }
+    }
+}
+
+fn regex_match_here(pat: &[u8], text: &[u8], anchor_end: bool, budget: &mut usize) -> bool {
+    if *budget == 0 {
+        return false;
+    }
+    *budget -= 1;
+
+    if pat.is_empty() {
+        return !anchor_end || text.is_empty();
+    }
+
+    // Parenthesized group `(a|b)` with optional `?`/`*`/`+`
+    if pat[0] == b'('
+        && let Some(close_idx) = find_matching_paren(pat, 0)
+    {
+        let inner = std::str::from_utf8(&pat[1..close_idx]).unwrap_or("");
+        let rest = &pat[close_idx + 1..];
+        let (quant, after_quant) = match rest.first().copied() {
+            Some(q @ (b'?' | b'*' | b'+')) => (Some(q), &rest[1..]),
+            _ => (None, rest),
+        };
+        let alts = split_top_level_alternates(inner);
+        match quant {
+            Some(b'?') => {
+                if regex_match_here(after_quant, text, anchor_end, budget) {
+                    return true;
+                }
+                for alt in alts {
+                    let mut combined = alt.as_bytes().to_vec();
+                    combined.extend_from_slice(after_quant);
+                    if regex_match_here(&combined, text, anchor_end, budget) {
+                        return true;
+                    }
+                }
+                return false;
+            }
+            Some(b'*') => {
+                if regex_match_here(after_quant, text, anchor_end, budget) {
+                    return true;
+                }
+                for split in 1..=text.len() {
+                    for alt in &alts {
+                        if regex_match_here(alt.as_bytes(), &text[..split], true, budget)
+                            && regex_match_here(pat, &text[split..], anchor_end, budget)
+                        {
+                            return true;
+                        }
+                    }
+                }
+                return false;
+            }
+            Some(b'+') => {
+                for split in 1..=text.len() {
+                    for alt in &alts {
+                        if regex_match_here(alt.as_bytes(), &text[..split], true, budget)
+                            && (regex_match_here(after_quant, &text[split..], anchor_end, budget)
+                                || regex_match_here(pat, &text[split..], anchor_end, budget))
+                        {
+                            return true;
+                        }
+                    }
+                }
+                return false;
+            }
+            _ => {
+                for alt in alts {
+                    let mut combined = alt.as_bytes().to_vec();
+                    combined.extend_from_slice(after_quant);
+                    if regex_match_here(&combined, text, anchor_end, budget) {
+                        return true;
+                    }
+                }
+                return false;
+            }
+        }
+    }
+
+    // Parse single atom: `\x`, `[...]`, `.`, or literal byte
+    let (atom_end, atom) = if pat[0] == b'\\' && pat.len() >= 2 {
+        (2, AtomMatcher::Lit(pat[1]))
+    } else if pat[0] == b'['
+        && let Some(rel_close) = pat[1..].iter().position(|&b| b == b']')
+    {
+        let class_slice = &pat[1..1 + rel_close];
+        let (neg, body) = if let Some(rest) = class_slice.strip_prefix(b"^") {
+            (true, rest)
+        } else {
+            (false, class_slice)
+        };
+        (2 + rel_close, AtomMatcher::Class { body, neg })
+    } else if pat[0] == b'.' {
+        (1, AtomMatcher::Any)
+    } else {
+        (1, AtomMatcher::Lit(pat[0]))
+    };
+
+    let after_atom = &pat[atom_end..];
+    match after_atom.first().copied() {
+        Some(b'*') => {
+            let rest = &after_atom[1..];
+            let mut idx = 0;
+            loop {
+                if regex_match_here(rest, &text[idx..], anchor_end, budget) {
+                    return true;
+                }
+                if idx >= text.len() || !atom.matches(text[idx]) {
+                    break;
+                }
+                idx += 1;
+            }
+            false
+        }
+        Some(b'+') => {
+            let rest = &after_atom[1..];
+            let mut idx = 0;
+            while idx < text.len() && atom.matches(text[idx]) {
+                idx += 1;
+                if regex_match_here(rest, &text[idx..], anchor_end, budget) {
+                    return true;
+                }
+            }
+            false
+        }
+        Some(b'?') => {
+            let rest = &after_atom[1..];
+            if !text.is_empty()
+                && atom.matches(text[0])
+                && regex_match_here(rest, &text[1..], anchor_end, budget)
+            {
+                return true;
+            }
+            regex_match_here(rest, text, anchor_end, budget)
+        }
+        _ => {
+            !text.is_empty()
+                && atom.matches(text[0])
+                && regex_match_here(after_atom, &text[1..], anchor_end, budget)
+        }
+    }
+}
+
+fn pattern_matches_skill(pattern: &str, skill_name: &str) -> bool {
+    let pat = pattern.trim();
+    if pat.is_empty() {
+        return false;
+    }
+    let pat = pat
+        .strip_suffix("/SKILL.md")
+        .unwrap_or(pat)
+        .trim_end_matches('/');
+    if pat == "*" {
+        return true;
+    }
+
+    let has_meta = pat.bytes().any(|b| {
+        matches!(
+            b,
+            b'^' | b'$' | b'.' | b'*' | b'+' | b'?' | b'(' | b')' | b'[' | b']' | b'|' | b'\\'
+        )
+    });
+    if !has_meta {
+        return pat == skill_name;
+    }
+
+    for alt in split_top_level_alternates(pat) {
+        let (anchored_start, body) = match alt.strip_prefix('^') {
+            Some(rest) => (true, rest),
+            None => (false, alt),
+        };
+        let (anchored_end, body) = match body.strip_suffix('$') {
+            Some(rest) => (true, rest),
+            None => (false, body),
+        };
+        let pat_bytes = body.as_bytes();
+        let text_bytes = skill_name.as_bytes();
+        let mut budget = 1024usize;
+        if anchored_start {
+            if regex_match_here(pat_bytes, text_bytes, anchored_end, &mut budget) {
+                return true;
+            }
+        } else {
+            for start in 0..=text_bytes.len() {
+                if regex_match_here(pat_bytes, &text_bytes[start..], anchored_end, &mut budget) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+fn resolve_skills_json_path(raw_path: &str, base_dir: &Path, home: &Path) -> PathBuf {
+    let trimmed = raw_path.trim();
+    if trimmed == "~" {
+        return home.to_path_buf();
+    }
+    if let Some(rest) = trimmed
+        .strip_prefix("~/")
+        .or_else(|| trimmed.strip_prefix("~\\"))
+    {
+        return home.join(rest);
+    }
+    let p = Path::new(trimmed);
+    if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        base_dir.join(p)
+    }
+}
+
+fn build_excluded_self_skill_roots(paths: &AgyPaths, plugin_root: Option<&Path>) -> Vec<PathBuf> {
+    let mut roots = vec![
+        canonicalize_with_tail(
+            &paths
+                .gemini_config_dir
+                .join("plugins")
+                .join("agy-hud")
+                .join("skills"),
+        ),
+        canonicalize_with_tail(&paths.hud_home.join("plugin").join("skills")),
+        canonicalize_with_tail(&paths.gemini_config_dir.join("skills")),
+    ];
+    if let Some(pr) = plugin_root {
+        roots.push(canonicalize_with_tail(&pr.join("skills")));
+    }
+    roots
+}
+
+fn is_excluded_self_dir(dir: &Path, excluded_roots: &[PathBuf]) -> bool {
+    let canon = canonicalize_with_tail(dir);
+    excluded_roots
+        .iter()
+        .any(|root| canon == *root || canon.starts_with(root))
+}
+
+fn dir_exposes_foreign_skill(dir: &Path, skill_name: &str, excluded_roots: &[PathBuf]) -> bool {
+    if is_excluded_self_dir(dir, excluded_roots) {
+        return false;
+    }
+    // 1. Entry points directly to a `<skill_name>` directory containing `SKILL.md`
+    if dir.file_name().and_then(|s| s.to_str()) == Some(skill_name)
+        && dir.join("SKILL.md").is_file()
+        && inspect_dest_state(dir, skill_name) != DestState::Managed
+    {
+        return true;
+    }
+    // 2. Standard 1-level scan: `<dir>/<skill_name>/SKILL.md`
+    let child = dir.join(skill_name);
+    !is_excluded_self_dir(&child, excluded_roots)
+        && child.join("SKILL.md").is_file()
+        && inspect_dest_state(&child, skill_name) != DestState::Managed
+}
+
+fn entry_allows_skill(
+    skill_name: &str,
+    entry_include_only: Option<&[String]>,
+    entry_exclude: &[String],
+    inherited_includes: &[&[String]],
+    inherited_excludes: &[&[String]],
+) -> bool {
+    if entry_exclude
+        .iter()
+        .any(|p| pattern_matches_skill(p, skill_name))
+    {
+        return false;
+    }
+    for group in inherited_excludes {
+        if group.iter().any(|p| pattern_matches_skill(p, skill_name)) {
+            return false;
+        }
+    }
+    if let Some(inc) = entry_include_only
+        && !inc.iter().any(|p| pattern_matches_skill(p, skill_name))
+    {
+        return false;
+    }
+    for group in inherited_includes {
+        if !group.iter().any(|p| pattern_matches_skill(p, skill_name)) {
+            return false;
+        }
+    }
+    true
+}
+
+#[allow(clippy::too_many_arguments)]
+fn check_skills_json_file_conflict(
+    cfg_path: &Path,
+    paths: &AgyPaths,
+    excluded_roots: &[PathBuf],
+    skill_name: &str,
+    inherited_includes: &[&[String]],
+    inherited_excludes: &[&[String]],
+    depth: usize,
+    visited: &mut BTreeSet<PathBuf>,
+) -> bool {
+    if depth > MAX_INHERITS_DEPTH {
+        return false;
+    }
+    let canon_cfg = canonicalize_with_tail(cfg_path);
+    if !visited.insert(canon_cfg) {
+        return false;
+    }
+
+    let Some(raw) = read_regular_or_symlink_bounded(cfg_path, MAX_SKILLS_JSON_BYTES) else {
+        return false;
+    };
+    let sanitized = strip_jsonc_comments_and_trailing_commas(&raw);
+    let Ok(parsed) = serde_json::from_str::<SkillsJsonFile>(&sanitized) else {
+        return false;
+    };
+
+    let base_dir = cfg_path
+        .parent()
+        .unwrap_or(paths.gemini_config_dir.as_path());
+    let mut next_excludes: Vec<&[String]> = inherited_excludes.to_vec();
+    if !parsed.exclude.is_empty() {
+        next_excludes.push(&parsed.exclude);
+    }
+
+    for entry in &parsed.entries {
+        let raw_entry = entry.path.trim();
+        if raw_entry.is_empty() {
+            continue;
+        }
+        let resolved_dir = resolve_skills_json_path(raw_entry, base_dir, &paths.home);
+        if is_excluded_self_dir(&resolved_dir, excluded_roots) {
+            continue;
+        }
+
+        // Check nested `include_only` relative paths (e.g. `nested/hud`)
+        if let Some(ref inc_list) = entry.include_only
+            && inc_list.iter().any(|item| {
+                let trimmed = item.trim().trim_end_matches('/');
+                if !trimmed.contains(['/', '\\']) {
+                    return false;
+                }
+                let candidate = resolved_dir.join(trimmed);
+                candidate.file_name().and_then(|s| s.to_str()) == Some(skill_name)
+                    && !is_excluded_self_dir(&candidate, excluded_roots)
+                    && candidate.join("SKILL.md").is_file()
+                    && inspect_dest_state(&candidate, skill_name) != DestState::Managed
+                    && entry_allows_skill(
+                        skill_name,
+                        None,
+                        &entry.exclude,
+                        inherited_includes,
+                        &next_excludes,
+                    )
+            })
+        {
+            return true;
+        }
+
+        if entry_allows_skill(
+            skill_name,
+            entry.include_only.as_deref(),
+            &entry.exclude,
+            inherited_includes,
+            &next_excludes,
+        ) && dir_exposes_foreign_skill(&resolved_dir, skill_name, excluded_roots)
+        {
+            return true;
+        }
+    }
+
+    for inh in &parsed.inherits {
+        let raw_inh = inh.path.trim();
+        if raw_inh.is_empty() {
+            continue;
+        }
+        let inh_path = resolve_skills_json_path(raw_inh, base_dir, &paths.home);
+        let mut child_includes = inherited_includes.to_vec();
+        if let Some(ref inc) = inh.include_only {
+            child_includes.push(inc);
+        }
+        let mut child_excludes = next_excludes.clone();
+        if !inh.exclude.is_empty() {
+            child_excludes.push(&inh.exclude);
+        }
+        if check_skills_json_file_conflict(
+            &inh_path,
+            paths,
+            excluded_roots,
+            skill_name,
+            &child_includes,
+            &child_excludes,
+            depth + 1,
+            visited,
+        ) {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn has_skills_json_conflict(
+    paths: &AgyPaths,
+    plugin_root: Option<&Path>,
+    skill_name: &str,
+) -> bool {
+    let skills_json_path = paths.gemini_config_dir.join("skills.json");
+    if fs::metadata(&skills_json_path).is_err() {
+        return false;
+    }
+    let excluded_roots = build_excluded_self_skill_roots(paths, plugin_root);
+    let mut visited = BTreeSet::new();
+    check_skills_json_file_conflict(
+        &skills_json_path,
+        paths,
+        &excluded_roots,
+        skill_name,
+        &[],
+        &[],
+        0,
+        &mut visited,
+    )
+}
+
+/// Read-only inspection of unprefixed `/hud` and `/hud-update` shortcut skill states under
+/// `paths.gemini_config_dir/skills` (preserving symlink/foreign/skills.json conflicts).
+pub fn inspect_unprefixed_skills(
+    paths: &AgyPaths,
+    plugin_root: Option<&Path>,
+) -> UnprefixedSkillsFacts {
+    let skills_dir = paths.gemini_config_dir.join("skills");
+    let detect_one = |skill_name: &str| -> String {
+        let dest = skills_dir.join(skill_name);
+        match inspect_dest_state(&dest, skill_name) {
+            DestState::Conflict => "conflict".to_string(),
+            DestState::Managed => {
+                if has_skills_json_conflict(paths, plugin_root, skill_name) {
+                    "conflict".to_string()
+                } else {
+                    "installed".to_string()
+                }
+            }
+            DestState::Absent => {
+                if has_skills_json_conflict(paths, plugin_root, skill_name) {
+                    "conflict".to_string()
+                } else {
+                    "not-installed".to_string()
+                }
+            }
+        }
+    };
+
+    UnprefixedSkillsFacts {
+        hud: detect_one("hud"),
+        hud_update: detect_one("hud-update"),
+        skills_dir: canonicalize_with_tail(&skills_dir)
+            .to_string_lossy()
+            .into_owned(),
+    }
+}
+
+fn install_unprefixed_skills(paths: &AgyPaths, plugin_root: &Path) -> Result<Value, String> {
+    let skills_dir = paths.gemini_config_dir.join("skills");
+    let parent_blocked = fs::symlink_metadata(&skills_dir).is_ok() && !skills_dir.is_dir();
+
+    let mut statuses: [&'static str; 2] = ["skipped-conflict", "skipped-conflict"];
+    for (idx, skill_name) in MANAGED_SKILL_NAMES.iter().enumerate() {
+        if parent_blocked {
+            statuses[idx] = "skipped-conflict";
+            continue;
+        }
+        let dest = skills_dir.join(skill_name);
+        let dest_state = inspect_dest_state(&dest, skill_name);
+        let json_conflict = has_skills_json_conflict(paths, Some(plugin_root), skill_name);
+        if dest_state == DestState::Conflict || json_conflict {
+            statuses[idx] = "skipped-conflict";
+            continue;
+        }
+
+        // Never `chmod 0700` existing `gemini_config_dir` or `skills/`
+        fs::create_dir_all(&dest).map_err(|e| {
+            format!(
+                "Failed to prepare unprefixed skill directory {}: {e}",
+                dest.display()
+            )
+        })?;
+
+        let scripts_dir = dest.join("scripts");
+        if let Ok(meta) = fs::symlink_metadata(&scripts_dir)
+            && (meta.file_type().is_symlink() || !meta.file_type().is_dir())
+        {
+            let _ = fs::remove_file(&scripts_dir);
+        }
+        fs::create_dir_all(&scripts_dir).map_err(|e| {
+            format!(
+                "Failed to prepare skill scripts directory {}: {e}",
+                scripts_dir.display()
+            )
+        })?;
+
+        let (skill_md_bytes, hud_cli_sh_bytes) =
+            load_skill_source_files(paths, plugin_root, skill_name);
+        let mut marker_bytes = serde_json::to_vec_pretty(&json!({
+            "managedBy": "agy-hud",
+            "skill": skill_name,
+            "version": INSTALLER_VERSION,
+        }))
+        .map_err(|e| e.to_string())?;
+        marker_bytes.push(b'\n');
+
+        atomic_write_public_bytes(&dest.join("SKILL.md"), &skill_md_bytes, 0o644)
+            .map_err(|e| e.to_string())?;
+        atomic_write_public_bytes(&scripts_dir.join("hud-cli.sh"), &hud_cli_sh_bytes, 0o755)
+            .map_err(|e| e.to_string())?;
+        atomic_write_public_bytes(&dest.join(MANAGED_MARKER_FILE), &marker_bytes, 0o644)
+            .map_err(|e| e.to_string())?;
+
+        statuses[idx] = "installed";
+    }
+
+    Ok(json!({
+        "skillsDir": canonicalize_with_tail(&skills_dir).to_string_lossy(),
+        "hud": statuses[0],
+        "hudUpdate": statuses[1],
+    }))
+}
 
 pub fn detect_installed_binary_version(paths: &AgyPaths) -> Option<String> {
     let meta_path = paths.hud_home.join("install-meta.json");
@@ -274,6 +1106,8 @@ pub fn install_status_line(
     out_bytes.push(b'\n');
     atomic_write_bytes(&target_settings, &out_bytes, mode).map_err(|e| e.to_string())?;
 
+    let unprefixed_skills = install_unprefixed_skills(paths, plugin_root)?;
+
     let mut report = json!({
         "installed": true,
         "version": INSTALLER_VERSION,
@@ -285,6 +1119,7 @@ pub fn install_status_line(
         "stackWithDefault": stack,
         "replaced": current_kind,
         "backupPath": backup_path,
+        "unprefixedSkills": unprefixed_skills,
     });
     if let Some(warn_msg) = command_warning
         && let Some(obj) = report.as_object_mut()
@@ -414,6 +1249,24 @@ pub fn uninstall_status_line(paths: &AgyPaths, argv: &[String]) -> Result<Value,
         }
     }
 
+    // 5. Clean up managed unprefixed shortcut skills under `<gemini_config_dir>/skills/{hud,hud-update}`
+    let skills_dir = paths.gemini_config_dir.join("skills");
+    let mut unprefixed_skills_removed: Vec<&'static str> = Vec::new();
+    for skill_name in MANAGED_SKILL_NAMES {
+        let skill_dir = skills_dir.join(skill_name);
+        if inspect_dest_state(&skill_dir, skill_name) == DestState::Managed
+            && fs::remove_dir_all(&skill_dir).is_ok()
+        {
+            unprefixed_skills_removed.push(skill_name);
+        }
+    }
+    if let Ok(meta) = fs::symlink_metadata(&skills_dir)
+        && !meta.file_type().is_symlink()
+        && meta.file_type().is_dir()
+    {
+        let _ = fs::remove_dir(&skills_dir);
+    }
+
     Ok(json!({
         "uninstalled": true,
         "settingsPath": paths.cli_settings_path.to_string_lossy(),
@@ -423,5 +1276,6 @@ pub fn uninstall_status_line(paths: &AgyPaths, argv: &[String]) -> Result<Value,
         "pluginUninstalled": plugin_uninstalled,
         "removedHudHome": removed_hud_home,
         "keptConfig": keep_config,
+        "unprefixedSkillsRemoved": unprefixed_skills_removed,
     }))
 }

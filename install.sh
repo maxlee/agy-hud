@@ -35,6 +35,26 @@ if [ "${1:-}" = "--uninstall" ] || [ "${1:-}" = "uninstall" ]; then
   if [ -d "$HUD_HOME" ] && [ "$HUD_HOME" != "$CLI_DIR" ] && [ "$HUD_HOME" != "$HOME" ]; then
     rm -rf "$HUD_HOME"
   fi
+  CONFIG_DIR_RAW="${AGY_CONFIG_DIR:-$HOME/.gemini/config}"
+  CONFIG_DIR=$(expand_tilde "$CONFIG_DIR_RAW")
+  SKILLS_DIR="$CONFIG_DIR/skills"
+  for skill_name in hud hud-update; do
+    skill_dir="$SKILLS_DIR/$skill_name"
+    marker="$skill_dir/.agy-hud-managed.json"
+    if [ -d "$skill_dir" ] && [ ! -L "$skill_dir" ] && [ -f "$marker" ] && [ ! -L "$marker" ]; then
+      compact=$(head -n 20 "$marker" 2>/dev/null | tr -d ' \t\r\n' || true)
+      case "$compact" in
+        *'"managedBy":"agy-hud"'*)
+          case "$compact" in
+            *'"skill":"'"$skill_name"'"'*) rm -rf "$skill_dir" ;;
+          esac
+          ;;
+      esac
+    fi
+  done
+  if [ -d "$SKILLS_DIR" ] && [ ! -L "$SKILLS_DIR" ]; then
+    rmdir "$SKILLS_DIR" 2>/dev/null || true
+  fi
   printf '==> agy-hud directory cleaned.\n'
   exit 0
 fi
@@ -186,4 +206,4 @@ if [ -n "$PLUGIN_FLAG" ]; then
 else
   "$PLUGIN_STAGE/scripts/bin/$PLATFORM/agy-hud" install "$@"
 fi
-printf '==> Done! agy-hud v%s is active. Launch `agy` and try `/agy-hud:hud` or `/agy-hud:hud-update` (if `agy` is already open, run `/skills reload` first).\n' "$BUNDLE_VERSION"
+printf '==> Done! agy-hud v%s is active. Launch `agy` and try `/hud` or `/hud-update` (or `/agy-hud:hud` / `/agy-hud:hud-update`; if `agy` is already open, run `/skills reload` first).\n' "$BUNDLE_VERSION"

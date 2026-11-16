@@ -716,7 +716,7 @@ pub struct HeartbeatInfo {
     pub duration_ms: Option<u64>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RuntimeFacts {
     pub engine: String,
@@ -725,7 +725,7 @@ pub struct RuntimeFacts {
     pub supported: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PluginFacts {
     pub root: String,
     pub version: String,
@@ -739,7 +739,18 @@ pub struct InstalledPluginFacts {
     pub enabled: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct UnprefixedSkillsFacts {
+    #[serde(default)]
+    pub hud: String,
+    #[serde(default)]
+    pub hud_update: String,
+    #[serde(default)]
+    pub skills_dir: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DoctorFacts {
     pub cwd: String,
@@ -759,6 +770,8 @@ pub struct DoctorFacts {
     pub installed_plugin_status: String,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub installed_plugin: Option<InstalledPluginFacts>,
+    #[serde(default)]
+    pub unprefixed_skills: UnprefixedSkillsFacts,
     pub config_path: String,
     pub heartbeat: Option<HeartbeatInfo>,
 }

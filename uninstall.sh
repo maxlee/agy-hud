@@ -41,6 +41,26 @@ else
       rm -rf "$HUD_HOME"
     fi
   fi
+  CONFIG_DIR_RAW="${AGY_CONFIG_DIR:-$HOME/.gemini/config}"
+  CONFIG_DIR=$(expand_tilde "$CONFIG_DIR_RAW")
+  SKILLS_DIR="$CONFIG_DIR/skills"
+  for skill_name in hud hud-update; do
+    skill_dir="$SKILLS_DIR/$skill_name"
+    marker="$skill_dir/.agy-hud-managed.json"
+    if [ -d "$skill_dir" ] && [ ! -L "$skill_dir" ] && [ -f "$marker" ] && [ ! -L "$marker" ]; then
+      compact=$(head -n 20 "$marker" 2>/dev/null | tr -d ' \t\r\n' || true)
+      case "$compact" in
+        *'"managedBy":"agy-hud"'*)
+          case "$compact" in
+            *'"skill":"'"$skill_name"'"'*) rm -rf "$skill_dir" ;;
+          esac
+          ;;
+      esac
+    fi
+  done
+  if [ -d "$SKILLS_DIR" ] && [ ! -L "$SKILLS_DIR" ]; then
+    rmdir "$SKILLS_DIR" 2>/dev/null || true
+  fi
   printf '==> Cleaned up agy-hud directory (%s).\n' "$HUD_HOME"
   if [ -f "$CLI_DIR/settings.json" ] && grep -q 'agy-hud' "$CLI_DIR/settings.json" 2>/dev/null; then
     printf 'Note: Run `/statusline delete` inside `agy` CLI to clear statusLine in %s/settings.json.\n' "$CLI_DIR"

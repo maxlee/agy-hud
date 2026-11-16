@@ -9,7 +9,9 @@ use crate::probes::{
     parse_memory_info, parse_speed_cache_info, parse_update_cache_info, parse_vcs_info,
     reconcile_compaction_ceiling, reconcile_cost_ledger,
 };
-use crate::render::{RenderExtras, RenderInput, format_config_problem_line, render_hud_lines_full};
+use crate::render::{
+    RenderExtras, RenderInput, format_config_problem_line_with_cmd, render_hud_lines_full,
+};
 use crate::stdin::CompactionScope;
 use crate::transcript::parse_transcript_and_tasks;
 use crate::types::{
@@ -235,6 +237,34 @@ fn run_doctor(args: &[String], ctx: &CommandContext<'_>) -> CommandOutput {
         }
     }
 
+    let hud_skill = ctx.facts.unprefixed_skills.hud.as_str();
+    let hud_update_skill = ctx.facts.unprefixed_skills.hud_update.as_str();
+    if hud_skill == "conflict" || hud_update_skill == "conflict" {
+        let mut conflicted = Vec::new();
+        if hud_skill == "conflict" {
+            conflicted.push("`/hud`");
+        }
+        if hud_update_skill == "conflict" {
+            conflicted.push("`/hud-update`");
+        }
+        let where_clause = if ctx.facts.unprefixed_skills.skills_dir.is_empty() {
+            String::new()
+        } else {
+            format!(" in {}", ctx.facts.unprefixed_skills.skills_dir)
+        };
+        findings.push(format!(
+            "Existing non-agy-hud {} skill{} preserved (not overwritten){where_clause}. Use `/agy-hud:hud` / `/agy-hud:hud-update` instead.",
+            conflicted.join(" and "),
+            if conflicted.len() > 1 { "s were" } else { " was" },
+        ));
+    } else if kind == "agy-hud"
+        && (hud_skill == "not-installed" || hud_update_skill == "not-installed")
+    {
+        findings.push(
+            "Unprefixed `/hud` or `/hud-update` shortcut skill is not installed. Fix: run `agy-hud install` to register `/hud` & `/hud-update` shortcuts (or use `/agy-hud:hud` / `/agy-hud:hud-update`).".to_string(),
+        );
+    }
+
     if kind == "agy-hud" && enabled && ctx.facts.heartbeat.is_none() {
         findings.push(
             "agy CLI has not executed agy-hud yet. Fix: start `agy` and send a prompt to trigger the first statusLine render.".to_string(),
@@ -247,6 +277,12 @@ fn run_doctor(args: &[String], ctx: &CommandContext<'_>) -> CommandOutput {
             hb.outcome
         ));
     }
+
+    let preferred_update_cmd = if hud_update_skill == "installed" {
+        "/hud-update"
+    } else {
+        "/agy-hud:hud-update"
+    };
 
     let cached_update: Option<UpdateCacheSnapshot> = ctx
         .update_cache_text
@@ -261,7 +297,7 @@ fn run_doctor(args: &[String], ctx: &CommandContext<'_>) -> CommandOutput {
             .is_some_and(|u| is_newer_semver(&ctx.facts.runtime.version, &u.latest_version));
     if update_available && let Some(ref u) = cached_update {
         findings.push(format!(
-            "New agy-hud release available: v{} (current: v{}). Fix: run `/agy-hud:hud-update` inside agy CLI or `agy-hud update`.",
+            "New agy-hud release available: v{} (current: v{}). Fix: run `{preferred_update_cmd}` inside agy CLI or `agy-hud update`.",
             u.latest_version, ctx.facts.runtime.version
         ));
     }
@@ -348,6 +384,26 @@ fn run_doctor(args: &[String], ctx: &CommandContext<'_>) -> CommandOutput {
         } else {
             out.push(format!("  Installed Plugin : {plugin_status}"));
         }
+        let hud_skill_status = if hud_skill.is_empty() {
+            "unknown"
+        } else {
+            hud_skill
+        };
+        let hud_update_skill_status = if hud_update_skill.is_empty() {
+            "unknown"
+        } else {
+            hud_update_skill
+        };
+        if ctx.facts.unprefixed_skills.skills_dir.is_empty() {
+            out.push(format!(
+                "  Unprefixed Skills: /hud={hud_skill_status} · /hud-update={hud_update_skill_status}"
+            ));
+        } else {
+            out.push(format!(
+                "  Unprefixed Skills: /hud={hud_skill_status} · /hud-update={hud_update_skill_status} ({})",
+                abbreviate_home_path(&ctx.facts.unprefixed_skills.skills_dir, home)
+            ));
+        }
         out.push(format!(
             "  Config           : {} (glyphMode={glyph_str}, updates.enabled={}, quota.backgroundRefresh={})",
             abbreviate_home_path(&ctx.paths.config, home),
@@ -357,7 +413,7 @@ fn run_doctor(args: &[String], ctx: &CommandContext<'_>) -> CommandOutput {
         if let Some(ref u) = cached_update {
             if update_available {
                 out.push(format!(
-                    "  Updates          : v{} available! (current v{} -> run `/agy-hud:hud-update` or `agy-hud update`)",
+                    "  Updates          : v{} available! (current v{} -> run `{preferred_update_cmd}` or `agy-hud update`)",
                     u.latest_version, ctx.facts.runtime.version
                 ));
             } else {
@@ -443,6 +499,7 @@ fn run_doctor(args: &[String], ctx: &CommandContext<'_>) -> CommandOutput {
                 "runsInstalledCopy": runs_installed_copy,
             })),
         },
+        "unprefixedSkills": ctx.facts.unprefixed_skills,
         "statusLine": {
             "settingsFile": ctx.paths.cli_settings,
             "kind": kind,
@@ -880,6 +937,8 @@ fn run_preview(args: &[String], ctx: &CommandContext<'_>) -> CommandOutput {
         .get("--width")
         .and_then(|v| v.first())
         .and_then(|s| s.parse::<usize>().ok());
+    let use_short_hud_cmd = ctx.facts.unprefixed_skills.hud == "installed";
+    let use_short_update_cmd = ctx.facts.unprefixed_skills.hud_update == "installed";
 
     if flags.contains_key("--last") {
         let Some(raw_snap) = ctx.last_snapshot_text else {
@@ -949,9 +1008,13 @@ fn run_preview(args: &[String], ctx: &CommandContext<'_>) -> CommandOutput {
             RenderExtras {
                 cost_totals: cost_totals.as_ref(),
                 compaction_ceiling,
+                use_short_hud_cmd,
+                use_short_update_cmd,
             },
         );
-        if let Some(prob) = format_config_problem_line(&loaded.problems, &config, cols) {
+        if let Some(prob) =
+            format_config_problem_line_with_cmd(&loaded.problems, &config, cols, use_short_hud_cmd)
+        {
             lines.push(prob);
         }
         return CommandOutput {
@@ -1029,6 +1092,8 @@ fn run_preview(args: &[String], ctx: &CommandContext<'_>) -> CommandOutput {
                 RenderExtras {
                     cost_totals: None,
                     compaction_ceiling,
+                    use_short_hud_cmd,
+                    use_short_update_cmd,
                 },
             );
             out.extend(rendered);
@@ -1064,9 +1129,13 @@ fn run_preview(args: &[String], ctx: &CommandContext<'_>) -> CommandOutput {
             RenderExtras {
                 cost_totals: None,
                 compaction_ceiling,
+                use_short_hud_cmd,
+                use_short_update_cmd,
             },
         );
-        if let Some(prob) = format_config_problem_line(&loaded.problems, &config, cols) {
+        if let Some(prob) =
+            format_config_problem_line_with_cmd(&loaded.problems, &config, cols, use_short_hud_cmd)
+        {
             lines.push(prob);
         }
         return CommandOutput {
@@ -1103,9 +1172,13 @@ fn run_preview(args: &[String], ctx: &CommandContext<'_>) -> CommandOutput {
             RenderExtras {
                 cost_totals: None,
                 compaction_ceiling,
+                use_short_hud_cmd,
+                use_short_update_cmd,
             },
         );
-        if let Some(prob) = format_config_problem_line(&loaded.problems, &config, cols) {
+        if let Some(prob) =
+            format_config_problem_line_with_cmd(&loaded.problems, &config, cols, use_short_hud_cmd)
+        {
             lines.push(prob);
         }
         return CommandOutput {
@@ -1302,6 +1375,7 @@ fn run_report(args: &[String], ctx: &CommandContext<'_>) -> CommandOutput {
         RenderExtras {
             cost_totals: None,
             compaction_ceiling,
+            ..RenderExtras::default()
         },
     )
     .into_iter()

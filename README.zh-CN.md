@@ -69,7 +69,7 @@
 - **🎯 混合毫秒级 `~tok/s` 测速与配额增速预警（`▲`）**：精确剥离 `thinking`/Prefill 首字延迟（`TTFT`）与工具等待时间，并受 `display.showSpeed` 控制展示速度分档图标（`🐢` `<50`、`🛵` `50–99`、`🚗` `100–149`、`🚅` `150–199`、`✈️` `200–249`、`🚀` `250–299`、`🛰️` `300–399`、`🛸` `400–499`、`👽` `500+`；`display.glyphMode=ascii` 时隐藏）与会话 `(min~max)` 速率区间（由已完成步骤或原生 `stdin` 速率累积、跨模型切换保留、出现两个不同取整速率后展示）；同时 `display.quotaPace` 根据时间窗口剩余比例智能预测配额耗尽速度（提前亮起琥珀/红色 `▲`），`display.showDailyCost` / `showWeeklyCost` 跨会话幂等汇总今日/本周开销。
 - **🎨 完整字素簇宽度引擎与可组合布局**：零硬编码黑白灰前景色，深浅色主题通吃；纯 Rust 完整支持 Unicode Extended Grapheme Clusters（ZWJ 组合 Emoji、肤色修饰符、国旗双区域指示符、CJK 双列对齐），支持 `display.mergeGroups` 多行自由合并（窄屏自动堆叠并对齐中文进度条起始列）与 `display.rightAlign` 右对齐。
 - **🌿 纵深安全加固的 `git` / `jj` / `hg` 探针**：内置 Windows `CreateProcessW` 工作目录可执行劫持防御、作用域感知的 Git `[include]` 过滤器精准拆弹（保留全局 `git-lfs`，仅清空不可信仓库过滤器，异常过滤器名自动降级至零子进程 `.git/HEAD`）、GitHub 分支点击跳转与 `↑N` 未推送阈值变色提醒。
-- **🔄 内置 SHA-256 校验自更新**：每 6 小时后台静默检查新版本并在顶栏温和提示（`↑ vX.Y.Z · /agy-hud:hud-update`），一键校验升级并完整保留 `--stack` 与个性化配置。
+- **🔄 内置 SHA-256 校验自更新**：每 6 小时后台静默检查新版本并在顶栏温和提示（`↑ vX.Y.Z · /hud-update`，未安装或存在冲突时自动回退显示 `/agy-hud:hud-update`），一键校验升级二进制、插件与托管快捷技能，并完整保留 `--stack` 与个性化配置。
 - **🌏 原生多语言界面**：根据系统语言自动选择，亦可手动切换英文（`en`）、简体中文（`zh-Hans`）与日语（`ja`）。
 
 ---
@@ -81,11 +81,22 @@
 - **Antigravity CLI (`agy`)** `v1.4.5+`（已完整对齐 `v1.5.4+` 最新内部接口）
 - **零 Rust / Node.js / npm 依赖**（使用一键脚本、GitHub 插件或预编译包安装时无需编译环境；仅从源码构建时需 `rustc 1.85+`）
 
-> **Marketplace 上架状态**：已提交至 Antigravity Marketplace 官方审核队列，审核通过后即可在 Antigravity 桌面端 **Customizations → Marketplace** 中搜索 **AGY HUD** 一键添加，并点击 **"Set up the HUD status line in Antigravity CLI"** 快捷引导胶囊启用。
+> **Marketplace 上架状态**：已提交至 Antigravity Marketplace 官方审核队列，审核通过后即可在 Antigravity 桌面端 **Customizations → Marketplace** 中搜索 **AGY HUD** 一键添加，并点击 **"Set up the HUD status line in Antigravity CLI"** 快捷引导胶囊一键启用状态栏与全局 `/hud`、`/hud-update` 快捷技能。
+
+### 双兼顾斜杠命令设计（`/hud` + `/agy-hud:hud`）
+
+`agy-hud` 同时兼顾 **Antigravity 官方插件规范** 与 **无前缀短斜杠命令体验**，并原生覆盖 **Antigravity CLI (`agy`) 与 Antigravity App**：
+
+- **完整保留插件形态**：保留标准 `agy-hud` v1 插件结构（完整兼容 Marketplace 与 `agy plugin install`），原生提供 `/agy-hud:hud` 与 `/agy-hud:hud-update`。
+- **冲突安全的无前缀快捷技能**：在执行 `install.sh`、`agy-hud install` 或 `agy-hud update` 时，`agy-hud` 会向 `~/.gemini/config/skills/hud` 与 `~/.gemini/config/skills/hud-update` 部署带 `.agy-hud-managed.json` 归属标记的独立托管技能，使无前缀 `/hud` 与 `/hud-update` 在 **Antigravity CLI 与 Antigravity App** 中均可直接调用。
+- **零覆盖安全保障**：写入前会先检查目标目录与软链接，并以**严格只读**方式检查 `~/.gemini/config/skills.json`。若发现你已自定义非 `agy-hud` 的 `/hud` 或 `/hud-update` 技能（或对应的 `skills.json` 条目），`agy-hud` 绝不覆盖且绝不修改 `skills.json`，自动保留原有命令并继续使用 `/agy-hud:hud` 与 `/agy-hud:hud-update`。
+- **开箱即用 vs. 一次激活**：
+  - **方式一（一行脚本 `install.sh`）用户**：安装完成后立即可用 `/hud` 与 `/hud-update`（同时兼容 `/agy-hud:hud` 与 `/agy-hud:hud-update`）。
+  - **`agy plugin install` / Marketplace 用户**：先运行一次 `/agy-hud:hud`（或点击快捷引导胶囊 / 用自然语言触发）完成激活后，`/hud` 与 `/hud-update` 同样会在 CLI 与桌面端全局生效。
 
 ### 方式一：一行脚本 SHA-256 校验安装（推荐，macOS & Linux）
 
-自动识别平台架构（`darwin-arm64`、`darwin-x64`、`linux-x64`、`linux-arm64`），下载发行包并比对 `SHA256SUMS` 校验和，注册 `/agy-hud:hud` 与 `/agy-hud:hud-update` 技能，部署原生二进制至 `~/.gemini/antigravity-cli/agy-hud/bin/agy-hud` 并原子更新 `settings.json`：
+自动识别平台架构（`darwin-arm64`、`darwin-x64`、`linux-x64`、`linux-arm64`），下载发行包并比对 `SHA256SUMS` 校验和，注册 `agy-hud` 插件（`/agy-hud:hud` 与 `/agy-hud:hud-update`），向 `~/.gemini/config/skills/` 部署冲突安全的托管快捷技能（`/hud` 与 `/hud-update`），部署原生二进制至 `~/.gemini/antigravity-cli/agy-hud/bin/agy-hud` 并原子更新 `settings.json`：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/maxlee/agy-hud/main/install.sh | sh
@@ -105,7 +116,7 @@ curl -fsSL https://raw.githubusercontent.com/maxlee/agy-hud/main/install.sh | sh
 agy plugin install https://github.com/maxlee/agy-hud
 ```
 
-安装后启动 `agy` 并输入 `/agy-hud:hud`（若通过桌面端插件卡片安装，也可直接点击 **"Set up the HUD status line in Antigravity CLI"** 快捷引导胶囊）即可自动完成 `settings.json` 挂载*（若安装前 `agy` 已处于运行状态，请先执行 `/skills reload` 刷新技能菜单）*。
+安装后启动 `agy` 并运行一次 `/agy-hud:hud`（若通过桌面端插件卡片安装，也可直接点击 **"Set up the HUD status line in Antigravity CLI"** 快捷引导胶囊或用自然语言触发），即可完成 `settings.json` 挂载并自动向 `~/.gemini/config/skills/` 部署托管 `/hud` 与 `/hud-update` 快捷技能*（激活后 CLI 与 Antigravity App 中均可直接输入 `/hud` 与 `/hud-update`；若安装前 `agy` 已处于运行状态，请先执行 `/skills reload` 刷新技能菜单）*。
 
 ### 方式三：手动下载预编译发行包（macOS / Linux / Windows）
 
@@ -118,6 +129,8 @@ agy plugin install https://github.com/maxlee/agy-hud
 | **Linux (x64)** | `agy-hud-linux-x64.tar.gz` | `x86_64-unknown-linux-musl` | 纯静态 `musl` 链接，零 `glibc` 依赖 |
 | **Linux (ARM64)** | `agy-hud-linux-arm64.tar.gz` | `aarch64-unknown-linux-musl` | 纯静态 `musl` 链接 |
 | **Windows (x64)** | `agy-hud-windows-x64.zip` | `x86_64-pc-windows-msvc` | 原生 `agy-hud.exe`（兼容含空格路径防引号 Bug） |
+
+解压后运行 `agy-hud/scripts/bin/<platform>/agy-hud install`（Windows 下运行 `agy-hud\scripts\bin\windows-x64\agy-hud.exe install`）即可完成 `settings.json` 配置并部署全局 `/hud` 与 `/hud-update` 快捷技能。
 
 ### 方式四：从源码编译安装
 
@@ -133,12 +146,12 @@ agy plugin install .
 
 ## 🛠️ 命令行与个性化配置
 
-### `agy` 会话内交互斜杠命令
+### 会话内交互斜杠命令（支持 `agy` CLI 与 Antigravity App）
 
 | 斜杠命令 | 功能说明 |
 | :--- | :--- |
-| `/agy-hud:hud` | 使用自然语言交互式安装、诊断、预览或调整布局、界面语言与各模块开关 |
-| `/agy-hud:hud-update` | 检查 GitHub 最新发行版并一键完成 SHA-256 校验的二进制与插件同步升级 |
+| `/hud` · `/agy-hud:hud` | 使用自然语言交互式安装、诊断、预览或调整布局、界面语言与各模块开关（执行 `agy-hud install` 后 `/hud` 在 CLI 与桌面端全局可用；`/agy-hud:hud` 始终作为插件入口可用） |
+| `/hud-update` · `/agy-hud:hud-update` | 检查 GitHub 最新发行版并一键完成 SHA-256 校验的二进制、插件与托管快捷技能同步升级 |
 | `/statusline` | `agy` 官方内置命令，用于临时开启或隐藏底部状态栏 |
 
 ### 原生 CLI 子命令一览
@@ -147,13 +160,13 @@ agy plugin install .
 
 | 子命令 | 用途说明 |
 | :--- | :--- |
-| `install [--stack] [--replace]` | 部署原生二进制并原子写入 `settings.json`（自动创建带时间戳的备份） |
-| `uninstall [--plugin] [--keep-config]` | 移除 `statusLine`、清理备份与数据目录，无损恢复 `agy` 官方默认状态栏 |
-| `doctor [--pretty]` | 检查运行引擎、插件启用状态、`statusLine` 挂载、配置合法性及终端图标对齐情况 |
+| `install [--stack] [--replace]` | 部署原生二进制、原子写入 `settings.json`（自动创建带时间戳的备份），并在 `~/.gemini/config/skills/` 安装冲突安全的 `/hud` 与 `/hud-update` 快捷技能 |
+| `uninstall [--plugin] [--keep-config]` | 移除 `statusLine`、清理备份与数据目录、仅清理 `agy-hud` 托管的快捷技能，并无损恢复 `agy` 官方默认状态栏 |
+| `doctor [--pretty]` | 检查运行引擎、插件启用状态、无前缀快捷技能状态、`statusLine` 挂载、配置合法性及终端图标对齐情况 |
 | `preview [--state <name>] [--last] [--set k=v]` | 预览 `showcase`（5 大场景）、`idle`、`tool_use`、`confirm`、`high-context` 或最近一次真实快照 |
 | `schema [关键词]` | 检索全部受强类型校验的配置项、类型、默认值与说明 |
 | `set <key>=<value> ...` / `set --undo` | 原子修改 `~/.gemini/antigravity-cli/agy-hud/config.json` 或一键回滚上一次修改 |
-| `update [--check] [--force]` | 检查或执行经过 SHA-256 校验的自升级 |
+| `update [--check] [--force]` | 检查或执行经过 SHA-256 校验的自升级（同步升级二进制、插件与托管快捷技能） |
 | `quota refresh` | 在隔离临时目录执行一次 `agy -p /usage` 官方配额缓存校准 |
 | `report [--note "..."]` | 导出保持视觉宽度的隐私脱敏诊断 JSON 及可直接回归回放的 `.case` 快照 |
 
@@ -207,7 +220,7 @@ agy plugin install .
 
 ## 🧹 零残留干净卸载
 
-随时可通过一条命令完整卸载——自动移除 `settings.json` 中的 `statusLine` 字段（恢复 `agy` 官方默认状态栏并完整保留你的其余所有配置）、清理备份、注销插件并删除 `~/.gemini/antigravity-cli/agy-hud`：
+随时可通过一条命令完整卸载——自动移除 `settings.json` 中的 `statusLine` 字段（恢复 `agy` 官方默认状态栏并完整保留你的其余所有配置）、清理备份、注销插件、**仅清理**经 `.agy-hud-managed.json` 校验归属 `agy-hud` 的 `~/.gemini/config/skills/{hud,hud-update}` 托管快捷技能（绝不删除用户自定义的同名技能，也不触碰 `skills.json`），并删除 `~/.gemini/antigravity-cli/agy-hud`：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/maxlee/agy-hud/main/uninstall.sh | sh
@@ -232,7 +245,7 @@ agy-hud/
 ├── crates/
 │   ├── hud-core/   # 纯确定性解析与排版内核（#![forbid(unsafe_code)]，零系统 I/O 能力）
 │   └── hud-cli/    # 极薄系统外壳：有界文件读取、只读加固 VCS 探针、原子缓存读写
-├── skills/         # Antigravity 斜杠命令技能定义（/agy-hud:hud 与 /agy-hud:hud-update）
+├── skills/         # Antigravity 斜杠命令技能定义（/hud 与 /agy-hud:hud、/hud-update 与 /agy-hud:hud-update）
 ├── scripts/        # POSIX 多平台二进制路由与 Marketplace SHA-256 同步脚本
 └── plugin.json     # 符合 Antigravity v1 严格规范的插件清单
 ```

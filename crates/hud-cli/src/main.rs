@@ -5,7 +5,7 @@ use hud_cli::collector::{
     drain_stdin_nested, exec_file_safe, read_bounded_string, read_stdin_payload,
     read_transcript_slices,
 };
-use hud_cli::install::{install_status_line, uninstall_status_line};
+use hud_cli::install::{inspect_unprefixed_skills, install_status_line, uninstall_status_line};
 use hud_cli::paths::{
     AgyPaths, atomic_write_bytes, build_logic_paths, canonical_or_parent, existing_data_dir,
     prepare_data_dir, undo_config, with_exclusive_lock_file, write_config_with_undo,
@@ -22,12 +22,13 @@ use hud_core::probes::{
     reconcile_cost_ledger,
 };
 use hud_core::render::{
-    RenderExtras, RenderInput, format_config_problem_line, render_hud_lines_full,
+    RenderExtras, RenderInput, format_config_problem_line_with_cmd, render_hud_lines_full,
 };
 use hud_core::stdin::CompactionScope;
 use hud_core::types::{
     AgyStdinData, CostLedgerSnapshot, DoctorFacts, HeartbeatInfo, InstalledPluginFacts,
     LearnedCompactionState, LogicPaths, PluginFacts, ProbeAnswers, RuntimeFacts, TranscriptSummary,
+    UnprefixedSkillsFacts,
 };
 use serde_json::{Value, json};
 use std::io::{IsTerminal, Write};
@@ -165,8 +166,8 @@ fn detect_installed_plugin(paths: &AgyPaths) -> (String, Option<InstalledPluginF
         return res;
     }
 
-    // Fast filesystem check under `~/.gemini/config/plugins/agy-hud/plugin.json`
-    let gemini_cfg_dir = paths.home.join(".gemini").join("config");
+    // Fast filesystem check under `<gemini_config_dir>/plugins/agy-hud/plugin.json`
+    let gemini_cfg_dir = &paths.gemini_config_dir;
     let default_plugin_dir = gemini_cfg_dir.join("plugins").join("agy-hud");
     let manifest = default_plugin_dir.join("plugin.json");
     if let Some(raw) = read_bounded_string(&manifest, 32 * 1024)
@@ -214,6 +215,16 @@ fn detect_installed_plugin(paths: &AgyPaths) -> (String, Option<InstalledPluginF
     ("unavailable".to_string(), None)
 }
 
+fn detect_unprefixed_skills(paths: &AgyPaths) -> UnprefixedSkillsFacts {
+    let plugin_root = if paths.gemini_config_dir.join("skills.json").exists() {
+        let current_exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("agy-hud"));
+        Some(resolve_plugin_root(&current_exe, paths))
+    } else {
+        None
+    };
+    inspect_unprefixed_skills(paths, plugin_root.as_deref())
+}
+
 fn print_filtered_with_repo<S: AsRef<str>>(lines: &[S], allowed_github_repo: Option<&str>) {
     if lines.is_empty() {
         return;
@@ -242,15 +253,46 @@ fn resolve_plugin_root(current_exe: &Path, paths: &AgyPaths) -> PathBuf {
         cursor = dir.parent();
     }
 
-    // Check install-meta.json written when `install` ran from the plugin directory
+    // Walk up to 4 parent directories from `current_dir()` looking for `plugin.json`
+    if let Ok(cwd) = std::env::current_dir() {
+        let cwd_real = canonical_or_parent(&cwd);
+        let mut cwd_cursor = Some(cwd_real.as_path());
+        for _ in 0..=4 {
+            let Some(dir) = cwd_cursor else { break };
+            if dir.join("plugin.json").is_file() {
+                return dir.to_path_buf();
+            }
+            cwd_cursor = dir.parent();
+        }
+    }
+
+    // Check install-meta.json written when `install` ran from a plugin directory
+    let mut fallback_existing_meta_root: Option<PathBuf> = None;
     if let Some(meta_str) = read_bounded_string(&paths.hud_home.join("install-meta.json"), 8192)
         && let Ok(val) = serde_json::from_str::<Value>(&meta_str)
         && let Some(root_str) = val.get("pluginRoot").and_then(Value::as_str)
     {
         let p = PathBuf::from(root_str);
-        if p.exists() {
+        if p.join("plugin.json").is_file() {
             return p;
         }
+        if p.exists() {
+            fallback_existing_meta_root = Some(p);
+        }
+    }
+
+    let installed_plugin_dir = paths.gemini_config_dir.join("plugins").join("agy-hud");
+    if installed_plugin_dir.join("plugin.json").is_file() {
+        return installed_plugin_dir;
+    }
+
+    let staged_plugin_dir = paths.hud_home.join("plugin");
+    if staged_plugin_dir.join("plugin.json").is_file() {
+        return staged_plugin_dir;
+    }
+
+    if let Some(meta_dir) = fallback_existing_meta_root {
+        return meta_dir;
     }
 
     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
@@ -430,6 +472,11 @@ fn run() -> u8 {
         } else {
             (String::new(), None)
         };
+        let unprefixed_skills = if matches!(cmd_name, "doctor" | "preview" | "report") {
+            inspect_unprefixed_skills(&paths, Some(&plugin_root))
+        } else {
+            UnprefixedSkillsFacts::default()
+        };
 
         let facts = DoctorFacts {
             cwd: std::env::current_dir()
@@ -459,6 +506,7 @@ fn run() -> u8 {
             },
             installed_plugin_status,
             installed_plugin,
+            unprefixed_skills,
             config_path: logic_paths.config.clone(),
             heartbeat: read_heartbeat(&paths.heartbeat_path),
         };
@@ -633,6 +681,9 @@ fn run() -> u8 {
     let cached_quota = parse_cached_quota_info(&collected.probes);
     let update_info = parse_update_cache_info(&collected.probes);
     let columns = stdin_payload.terminal_width.filter(|&w| w > 0);
+    let unprefixed = detect_unprefixed_skills(&paths);
+    let use_short_hud_cmd = unprefixed.hud == "installed";
+    let use_short_update_cmd = unprefixed.hud_update == "installed";
 
     let mut lines = render_hud_lines_full(
         RenderInput {
@@ -649,11 +700,16 @@ fn run() -> u8 {
         RenderExtras {
             cost_totals: cost_totals.as_ref(),
             compaction_ceiling: learned_ceiling,
+            use_short_hud_cmd,
+            use_short_update_cmd,
         },
     );
-    if let Some(problem_line) =
-        format_config_problem_line(&loaded_cfg.problems, &loaded_cfg.config, columns)
-    {
+    if let Some(problem_line) = format_config_problem_line_with_cmd(
+        &loaded_cfg.problems,
+        &loaded_cfg.config,
+        columns,
+        use_short_hud_cmd,
+    ) {
         lines.push(problem_line);
     }
 

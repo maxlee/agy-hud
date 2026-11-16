@@ -69,7 +69,7 @@ Ctx ███████░ 89.6% │ Quota(weekly) 92% (1h 30m)
 - **🎯 Hybrid TTFT-Stripped `~tok/s` & Quota Burn-Rate (`▲`)**: Separates `thinking`/prefill latency (`TTFT`) and tool wait time from pure streaming decode throughput, displaying a speed-tier emoji (`🐢` `<50`, `🛵` `50–99`, `🚗` `100–149`, `🚅` `150–199`, `✈️` `200–249`, `🚀` `250–299`, `🛰️` `300–399`, `🛸` `400–499`, `👽` `500+`; hidden when `display.glyphMode=ascii`) and session `(min~max)` range from completed steps / native `stdin` rates (preserved across model switches, shown once two distinct rounded speeds exist; toggled via `display.showSpeed`). Meanwhile `display.quotaPace` projects `5h`/`weekly` quota burn velocity (`▲` amber/red warning before you hit 0%) and `display.showDailyCost` / `showWeeklyCost` tracks cross-session spend without double counting.
 - **🎨 Theme-Safe, Grapheme-Cluster-Accurate & Composable Layout**: Zero hardcoded white (`37m`/`97m`) or gray (`90m`) foreground codes. Full Unicode extended grapheme cluster width engine (ZWJ emoji sequences, skin-tone modifiers, regional flag pairs, CJK 2-col alignment), `display.mergeGroups` + `display.rightAlign` row composition, and 3 glyph sets (`unicode`, `nerd`, `ascii`).
 - **🌿 Hardened `git`, `jj` & `hg` Support**: Windows `CreateProcessW` `PATH`-hijack protection, scope-aware Git `[include]` filter neutralization (preserving global `git-lfs` while disarming untrusted repo filters, with zero-subprocess `.git/HEAD` fallback), clickable GitHub branch OSC 8 links, unpushed `↑N` thresholds, and FNV-1a sharded `mtime` caches.
-- **🔄 Built-in Verified Self-Update**: Non-blocking 6-hour release check surfaces a subtle header badge (`↑ vX.Y.Z · /agy-hud:hud-update`) and upgrades in one SHA-256-verified step while preserving `--stack` and user `config.json`.
+- **🔄 Built-in Verified Self-Update**: Non-blocking 6-hour release check surfaces a compact header badge (`↑ vX.Y.Z · /hud-update`, automatically falling back to `/agy-hud:hud-update` if unprefixed shortcuts are absent or conflicted) and upgrades the binary, plugin, and managed shortcuts in one SHA-256-verified step while preserving `--stack` and user `config.json`.
 - **🌏 Native Multilingual UI**: Auto-detects system language or switch between English (`en`), Simplified Chinese (`zh-Hans`), and Japanese (`ja`).
 
 ---
@@ -81,11 +81,22 @@ Ctx ███████░ 89.6% │ Quota(weekly) 92% (1h 30m)
 - **Antigravity CLI (`agy`)** `v1.4.5+` (fully aligned with `v1.5.4+` schemas)
 - **Zero Rust / Node.js / npm required** for the one-line installer, GitHub plugin, or prebuilt installations (`rustc 1.85+` only if compiling from source)
 
-> **Marketplace status**: Submitted to the Antigravity Marketplace and currently under review. Once approved, you'll also be able to add **AGY HUD** directly from **Customizations → Marketplace** in Antigravity Desktop and click the **"Set up the HUD status line in Antigravity CLI"** starter prompt chip.
+> **Marketplace status**: Submitted to the Antigravity Marketplace and currently under review. Once approved, you'll also be able to add **AGY HUD** directly from **Customizations → Marketplace** in Antigravity Desktop and click the **"Set up the HUD status line in Antigravity CLI"** starter prompt chip to activate both the status line and global `/hud` & `/hud-update` shortcuts.
+
+### Dual-Compatible Slash Commands (`/hud` + `/agy-hud:hud`)
+
+`agy-hud` is engineered to work seamlessly as **both** a full Antigravity plugin and short, ergonomic slash commands across **Antigravity CLI (`agy`)** and **Antigravity App**:
+
+- **Full Plugin Bundle**: Retains the standard `agy-hud` v1 plugin manifest (Marketplace & `agy plugin install` compatible), exposing `/agy-hud:hud` and `/agy-hud:hud-update`.
+- **Conflict-Safe Unprefixed Shortcuts**: Whenever `install.sh`, `agy-hud install`, or `agy-hud update` runs, it also deploys managed standalone copies to `~/.gemini/config/skills/hud` and `~/.gemini/config/skills/hud-update` (tagged with `.agy-hud-managed.json`), enabling `/hud` and `/hud-update` everywhere in both `agy` CLI and Antigravity App.
+- **Zero Overwrite Guarantee**: Before deploying each shortcut, `agy-hud` inspects existing paths/symlinks and reads `~/.gemini/config/skills.json` strictly read-only. If you already maintain your own custom `/hud` or `/hud-update` skill (or matching `skills.json` entry), `agy-hud` leaves it untouched without mutating `skills.json` and keeps using `/agy-hud:hud` / `/agy-hud:hud-update`.
+- **Immediate vs. One-Time Activation**:
+  - **One-line `install.sh` users** get `/hud` and `/hud-update` (alongside `/agy-hud:hud` and `/agy-hud:hud-update`) immediately.
+  - **`agy plugin install` / Marketplace users** run `/agy-hud:hud` (or click the starter prompt chip / ask in natural language) once to activate; after that, `/hud` and `/hud-update` work everywhere too.
 
 ### Method 1: One-Line SHA-256 Verified Installer (Recommended — macOS & Linux)
 
-Detects your OS/CPU (`darwin-arm64`, `darwin-x64`, `linux-x64`, `linux-arm64`), verifies the archive against `SHA256SUMS`, registers `/agy-hud:hud` & `/agy-hud:hud-update`, deploys `~/.gemini/antigravity-cli/agy-hud/bin/agy-hud`, and atomically updates `settings.json`:
+Detects your OS/CPU (`darwin-arm64`, `darwin-x64`, `linux-x64`, `linux-arm64`), verifies the archive against `SHA256SUMS`, registers the `agy-hud` plugin (`/agy-hud:hud` & `/agy-hud:hud-update`), deploys conflict-safe managed shortcuts (`/hud` & `/hud-update`) to `~/.gemini/config/skills/`, installs `~/.gemini/antigravity-cli/agy-hud/bin/agy-hud`, and atomically updates `settings.json`:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/maxlee/agy-hud/main/install.sh | sh
@@ -105,7 +116,7 @@ Install the plugin directly from the GitHub repository (no Marketplace listing r
 agy plugin install https://github.com/maxlee/agy-hud
 ```
 
-Then launch `agy` and run `/agy-hud:hud` (or click the **"Set up the HUD status line in Antigravity CLI"** starter prompt chip if installed via Antigravity Desktop) to activate the status line in `~/.gemini/antigravity-cli/settings.json` *(if `agy` was already open, run `/skills reload` first)*.
+Then launch `agy` and run `/agy-hud:hud` (or click the **"Set up the HUD status line in Antigravity CLI"** starter prompt chip if installed via Antigravity Desktop, or ask in natural language) once to activate the status line in `~/.gemini/antigravity-cli/settings.json` and deploy the managed `/hud` & `/hud-update` shortcuts to `~/.gemini/config/skills/` *(after activation, `/hud` and `/hud-update` work in both Antigravity CLI and Antigravity App; if `agy` was already open, run `/skills reload` first)*.
 
 ### Method 3: Prebuilt Release Archives (macOS / Linux / Windows)
 
@@ -118,6 +129,8 @@ Download prebuilt binaries and `SHA256SUMS` from [**GitHub Releases**](https://g
 | **Linux (x64)** | `agy-hud-linux-x64.tar.gz` | `x86_64-unknown-linux-musl` | Fully static `musl` (zero `glibc` issues) |
 | **Linux (ARM64)** | `agy-hud-linux-arm64.tar.gz` | `aarch64-unknown-linux-musl` | Fully static `musl` |
 | **Windows (x64)** | `agy-hud-windows-x64.zip` | `x86_64-pc-windows-msvc` | Native `agy-hud.exe` (quote-safe path handling) |
+
+After extracting the archive, run `agy-hud/scripts/bin/<platform>/agy-hud install` (or `agy-hud\scripts\bin\windows-x64\agy-hud.exe install` on Windows) to wire `settings.json` and deploy the managed `/hud` & `/hud-update` shortcuts globally.
 
 ### Method 4: Build from Source
 
@@ -133,12 +146,12 @@ agy plugin install .
 
 ## 🛠️ CLI & Configuration
 
-### In-Session Slash Commands (inside `agy`)
+### In-Session Slash Commands (`agy` CLI & Antigravity App)
 
 | Command | Description |
 | :--- | :--- |
-| `/agy-hud:hud` | Interactively install, diagnose, preview, or customize layout, language, and badges in natural language |
-| `/agy-hud:hud-update` | Check GitHub Releases and perform a SHA-256-verified binary + plugin self-upgrade in one step |
+| `/hud` · `/agy-hud:hud` | Interactively install, diagnose, preview, or customize layout, language, and badges in natural language (`/hud` works globally in CLI & App after `agy-hud install`; `/agy-hud:hud` is always available via the plugin) |
+| `/hud-update` · `/agy-hud:hud-update` | Check GitHub Releases and perform a SHA-256-verified binary, plugin, and managed shortcut self-upgrade in one step |
 | `/statusline` | Built-in `agy` command to toggle the status bar on or off |
 
 ### Native CLI Subcommands
@@ -147,13 +160,13 @@ Invoke via `~/.gemini/antigravity-cli/agy-hud/bin/agy-hud` (or `./scripts/agy-hu
 
 | Subcommand | Purpose |
 | :--- | :--- |
-| `install [--stack] [--replace]` | Deploy native binary and configure `statusLine` in `settings.json` (creates timestamped backup) |
-| `uninstall [--plugin] [--keep-config]` | Remove `statusLine`, clean backups & HUD directory, and restore official `agy` default |
-| `doctor [--pretty]` | Inspect runtime, plugin enablement, `statusLine` wiring, config validity, and glyph alignment |
+| `install [--stack] [--replace]` | Deploy native binary, configure `statusLine` in `settings.json` (with timestamped backup), and install conflict-safe `/hud` & `/hud-update` shortcuts to `~/.gemini/config/skills/` |
+| `uninstall [--plugin] [--keep-config]` | Remove `statusLine`, clean backups, remove only `agy-hud`-managed shortcuts & HUD directory, and restore official `agy` default |
+| `doctor [--pretty]` | Inspect runtime, plugin enablement, unprefixed shortcut status, `statusLine` wiring, config validity, and glyph alignment |
 | `preview [--state <name>] [--last] [--set k=v]` | Render `showcase`, `idle`, `tool_use`, `confirm`, `high-context`, inline JSON, or last live snapshot |
 | `schema [query]` | Browse all validated configuration keys, types, defaults, and descriptions |
 | `set <key>=<value> ...` / `set --undo` | Atomically update `~/.gemini/antigravity-cli/agy-hud/config.json` or revert the previous change |
-| `update [--check] [--force]` | Check for or apply the latest SHA-256-verified release from GitHub |
+| `update [--check] [--force]` | Check for or apply the latest SHA-256-verified release from GitHub (binary, plugin, and managed shortcuts) |
 | `quota refresh` | Run an isolated one-shot `agy -p /usage` sync to reconcile local quota cache |
 | `report [--note "..."]` | Export a width-preserving privacy-scrubbed diagnostic JSON bundle + replayable `.case` regression fixture |
 
@@ -207,7 +220,7 @@ Invoke via `~/.gemini/antigravity-cli/agy-hud/bin/agy-hud` (or `./scripts/agy-hu
 
 ## 🧹 Clean Uninstall (Zero Residue)
 
-Uninstall at any time with a single command — removes `"statusLine"` from `settings.json` (restoring Antigravity CLI's official default status bar while keeping all your other settings intact), cleans tracked backups, unregisters the plugin, and deletes `~/.gemini/antigravity-cli/agy-hud`:
+Uninstall at any time with a single command — removes `"statusLine"` from `settings.json` (restoring Antigravity CLI's official default status bar while keeping all your other settings intact), cleans tracked backups, unregisters the plugin, removes **only** `agy-hud`-managed shortcuts under `~/.gemini/config/skills/{hud,hud-update}` (verified via `.agy-hud-managed.json` so any custom `/hud` skill or `skills.json` is never touched), and deletes `~/.gemini/antigravity-cli/agy-hud`:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/maxlee/agy-hud/main/uninstall.sh | sh
@@ -232,7 +245,7 @@ agy-hud/
 ├── crates/
 │   ├── hud-core/   # Pure deterministic logic & layout crate (#![forbid(unsafe_code)], ZERO I/O)
 │   └── hud-cli/    # Thin capability shell: bounded file seeks, hardened VCS probes, atomic cache I/O
-├── skills/         # Antigravity slash-command skills (/agy-hud:hud & /agy-hud:hud-update)
+├── skills/         # Antigravity slash-command skills (/hud & /agy-hud:hud, /hud-update & /agy-hud:hud-update)
 ├── scripts/        # POSIX platform router & SHA-256 Marketplace binary sync tooling
 └── plugin.json     # Strict Antigravity v1 plugin manifest
 ```

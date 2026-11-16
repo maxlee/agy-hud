@@ -12,6 +12,7 @@ pub struct AgyPaths {
     pub home: PathBuf,
     pub cli_dir: PathBuf,
     pub hud_home: PathBuf,
+    pub gemini_config_dir: PathBuf,
     pub cli_settings_path: PathBuf,
     pub bin_dir: PathBuf,
     pub installed_bin_path: PathBuf,
@@ -73,6 +74,13 @@ impl AgyPaths {
             .map(|s| resolve_abs(expand_tilde(s, &home)))
             .unwrap_or_else(|| cli_dir.join("agy-hud"));
 
+        let gemini_config_dir = env
+            .get("AGY_CONFIG_DIR")
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| resolve_abs(expand_tilde(s, &home)))
+            .unwrap_or_else(|| home.join(".gemini").join("config"));
+
         let bin_name = if cfg!(windows) {
             "agy-hud.exe"
         } else {
@@ -100,6 +108,7 @@ impl AgyPaths {
             previous_statusline_path: hud_home.join("previous-statusline.json"),
             cli_dir,
             hud_home,
+            gemini_config_dir,
         }
     }
 
@@ -144,6 +153,32 @@ pub fn canonical_or_parent(path: &Path) -> PathBuf {
         && let Ok(real_parent) = fs::canonicalize(parent)
     {
         return real_parent.join(name);
+    }
+    path.to_path_buf()
+}
+
+/// Canonicalizes the deepest existing ancestor of `path` and re-attaches any non-existent
+/// trailing components (ensuring home abbreviation works before nested dirs exist on macOS).
+pub fn canonicalize_with_tail(path: &Path) -> PathBuf {
+    if let Ok(real) = fs::canonicalize(path) {
+        return real;
+    }
+    let mut tail = Vec::new();
+    let mut cur = Some(path);
+    while let Some(p) = cur {
+        if let Ok(real) = fs::canonicalize(p) {
+            let mut out = real;
+            for part in tail.into_iter().rev() {
+                out.push(part);
+            }
+            return out;
+        }
+        if let Some(name) = p.file_name() {
+            tail.push(name.to_os_string());
+        } else {
+            break;
+        }
+        cur = p.parent();
     }
     path.to_path_buf()
 }
@@ -406,9 +441,18 @@ pub fn build_logic_paths(
     }
 }
 
-pub fn atomic_write_bytes(target: &Path, bytes: &[u8], mode_octal: u32) -> std::io::Result<()> {
+fn atomic_write_bytes_inner(
+    target: &Path,
+    bytes: &[u8],
+    mode_octal: u32,
+    private_parent: bool,
+) -> std::io::Result<()> {
     if let Some(parent) = target.parent() {
-        create_private_dir_all(parent)?;
+        if private_parent {
+            create_private_dir_all(parent)?;
+        } else {
+            fs::create_dir_all(parent)?;
+        }
     }
     let pid = std::process::id();
     let nanos = SystemTime::now()
@@ -446,6 +490,19 @@ pub fn atomic_write_bytes(target: &Path, bytes: &[u8], mode_octal: u32) -> std::
         return Err(err);
     }
     Ok(())
+}
+
+pub fn atomic_write_bytes(target: &Path, bytes: &[u8], mode_octal: u32) -> std::io::Result<()> {
+    atomic_write_bytes_inner(target, bytes, mode_octal, true)
+}
+
+/// Atomically writes `bytes` to `target` without forcing `0700` permissions on parent directories.
+pub fn atomic_write_public_bytes(
+    target: &Path,
+    bytes: &[u8],
+    mode_octal: u32,
+) -> std::io::Result<()> {
+    atomic_write_bytes_inner(target, bytes, mode_octal, false)
 }
 
 pub fn write_config_with_undo(
