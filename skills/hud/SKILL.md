@@ -56,7 +56,7 @@ Use `sh scripts/hud-cli.sh` (relative to this skill directory) to inspect, previ
      ```
 
 4. **Apply or Undo configuration changes (`set`)**
-   - Save validated `key=value` pairs across all 53 schema keys (automatically backs up undo state):
+   - Save validated `key=value` pairs across all schema keys (automatically backs up undo state):
      ```bash
      sh scripts/hud-cli.sh set language=zh-Hans vcs.showFileStats=true
      sh scripts/hud-cli.sh set display.contextScale=compaction
@@ -65,8 +65,10 @@ Use `sh scripts/hud-cli.sh` (relative to this skill directory) to inspect, previ
      sh scripts/hud-cli.sh set display.quotaPace=true display.quotaThreshold=25 vcs.pushWarningThreshold=5
      sh scripts/hud-cli.sh set 'display.mergeGroups=[["context","quota"]]' 'display.rightAlign=["quota"]'
      sh scripts/hud-cli.sh set quota.backgroundRefresh=true
+     sh scripts/hud-cli.sh set display.showArtifacts=true
      ```
    - Speed badge (`display.showSpeed`): shows speed-tier emoji + `~tok/s` + session `(min~max)` range (`display.glyphMode=ascii` omits the emoji).
+   - Artifact count (`display.showArtifacts`): shows upstream `agy` `stdin.artifact_count` (`art`, or `产物` in `zh-Hans`) inside inline counts when `display.showCounts` is `true`. Off by default because `agy` can report `1` on fresh sessions before any user Markdown artifact exists.
    - Manually refresh the official `/usage` quota cache on demand:
      ```bash
      sh scripts/hud-cli.sh quota refresh

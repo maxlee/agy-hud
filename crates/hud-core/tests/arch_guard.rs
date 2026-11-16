@@ -571,3 +571,135 @@ fn github_workflows_enforce_node24_actions_and_permissions() {
         );
     }
 }
+
+fn validate_config_key_token(token: &str, schema_keys: &BTreeSet<&str>, rel: &str, line_no: usize) {
+    let trimmed =
+        token.trim_matches(|c: char| matches!(c, '\'' | '"' | ',' | '.' | ';' | ':' | '(' | ')'));
+    let key = trimmed.split('=').next().unwrap_or("");
+    let has_prefix = ["quota.", "updates.", "vcs.", "display."]
+        .iter()
+        .any(|p| key.starts_with(p));
+    if has_prefix && !key.contains('*') && !key.contains('<') {
+        assert!(
+            schema_keys.contains(key),
+            "Documented config key `{key}` in {rel}:{line_no} does not exist in CONFIG_SCHEMA"
+        );
+    }
+}
+
+fn check_doc_schema_counts(line: &str, expected_len: usize, rel: &str, line_no: usize) {
+    let lower = line.to_ascii_lowercase();
+    let has_schema_context = lower.contains("config_schema")
+        || lower.contains("schema")
+        || lower.contains("configuration key")
+        || lower.contains("config key")
+        || line.contains("配置项");
+    if !has_schema_context {
+        return;
+    }
+
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if !bytes[i].is_ascii_digit() {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+        let end = i;
+        let prev_ok = start == 0
+            || !matches!(
+                bytes[start - 1],
+                b'.' | b'_' | b'-' | b'/' | b'0'..=b'9' | b'a'..=b'z' | b'A'..=b'Z'
+            );
+        let next_ok = end == bytes.len()
+            || !matches!(
+                bytes[end],
+                b'.' | b'_' | b'-' | b'+' | b'/' | b'0'..=b'9' | b'a'..=b'z' | b'A'..=b'Z'
+            );
+        if !prev_ok || !next_ok {
+            continue;
+        }
+        let n: usize = line[start..end].parse().expect("ascii digits parse");
+        assert_ne!(
+            n, 53,
+            "Stale hardcoded schema key count 53 in {rel}:{line_no}: {line}"
+        );
+        let after_end = line[end..]
+            .char_indices()
+            .nth(48)
+            .map(|(offset, _)| &line[end..end + offset])
+            .unwrap_or(&line[end..]);
+        let after_lower = after_end.to_ascii_lowercase();
+        if after_lower.contains("keys") || after_end.contains("配置项") {
+            assert_eq!(
+                n, expected_len,
+                "Mismatched schema key count {n} (expected {expected_len}) in {rel}:{line_no}: {line}"
+            );
+        }
+    }
+}
+
+#[test]
+fn docs_schema_counts_and_keys_stay_in_sync() {
+    let root = workspace_root();
+    let schema_keys: BTreeSet<&str> = hud_core::config::CONFIG_SCHEMA
+        .iter()
+        .map(|entry| entry.key)
+        .collect();
+    let expected_len = schema_keys.len();
+
+    for rel in [
+        "README.md",
+        "README.zh-CN.md",
+        "ARCHITECTURE.md",
+        "skills/hud/SKILL.md",
+    ] {
+        let content =
+            fs::read_to_string(root.join(rel)).unwrap_or_else(|e| panic!("read {rel}: {e}"));
+        let mut fence_lang: Option<String> = None;
+
+        for (idx, line) in content.lines().enumerate() {
+            let line_no = idx + 1;
+            let trimmed = line.trim_start();
+            if let Some(rest) = trimmed.strip_prefix("```") {
+                if fence_lang.is_some() {
+                    fence_lang = None;
+                } else {
+                    fence_lang = Some(rest.trim().to_ascii_lowercase());
+                }
+                continue;
+            }
+
+            check_doc_schema_counts(line, expected_len, rel, line_no);
+
+            match fence_lang.as_deref() {
+                None => {
+                    let mut rest = line;
+                    while let Some(open) = rest.find('`') {
+                        let after_open = &rest[open + 1..];
+                        let Some(close) = after_open.find('`') else {
+                            break;
+                        };
+                        let span = &after_open[..close];
+                        for word in span.split_whitespace() {
+                            validate_config_key_token(word, &schema_keys, rel, line_no);
+                        }
+                        rest = &after_open[close + 1..];
+                    }
+                }
+                Some(lang) if lang.contains("bash") => {
+                    if !trimmed.starts_with('#') {
+                        for word in line.split_whitespace() {
+                            validate_config_key_token(word, &schema_keys, rel, line_no);
+                        }
+                    }
+                }
+                Some(_) => {}
+            }
+        }
+    }
+}

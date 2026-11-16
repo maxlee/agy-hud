@@ -30,7 +30,7 @@
 
 ```text
 ╭─ 🔧 调用工具 │ [自动] │ [Gemini 4 Argon · med] Pro · 🚗 ~118 tok/s (64~142) │ agy-hud git:(feat/rust-hud* ↑2) │ ⏱ 12m
-├─ 上下文 ████▓··· 59.3% (152k/256k · ↻2) · ⚡ 75% 缓存 │ ~$0.38 · 子代理 1/2 · 后台 1 · 产物 2 · 🛡 沙箱开启
+├─ 上下文 ████▓··· 59.3% (152k/256k · ↻2) · ⚡ 75% 缓存 │ ~$0.38 · 子代理 1/2 · 后台 1 · 🛡 沙箱开启
 ├─ 配额(weekly) ▓···· 16% (4d 18h)
 ├─ ◐ run_command: Cargo test execution · ✓ edit_file ×2: render.rs · ✓ read_file ×5: SKILL.md
 ├─ 技能: hud, agy-customizations │ MCP: context7
@@ -57,7 +57,7 @@
 | **运行状态与模式** | 实时 `空闲` / `思考中` / `调用工具` / `等待确认` 状态，`[计划]` / `[自动]` / `[接受]` 模式（自动识别 `/plan` 与 `VIM` 模式徽章） | `display.showState`, `display.showMode` |
 | **模型、档位与速率** | 模型简称、推理强度（`low`/`med`/`high`）、订阅档位（`Pro`/`Ultra`），以及剥离 `TTFT` 的真实生成速率 `~tok/s`、速度分档图标（`🐢`/`🛵`/`🚗`/`🚅`/`✈️`/`🚀`/`🛰️`/`🛸`/`👽`，`ascii` 模式下自动隐藏）与会话 `(min~max)` 速率区间 | `display.showModel`, `display.showPlanTier`, `display.showSpeed`, `display.glyphMode` |
 | **项目路径与 VCS** | 支持点击跳转的 `file://` OSC 8 目录链接（含可选 `项目根 › 子目录` 面包屑）、GitHub 分支点击跳转、`git`（含 Worktree、脏标记、`↑N` 未推送阈值变色、文件增删）、`jj` 与 `hg` | `display.showProject`, `display.showLaunchDir`, `vcs.pushWarningThreshold`, `vcs.showFileStats` |
-| **上下文与跨会话账本** | 按模型跨会话自动学习压缩水位线（`256k`、`512k` 等）的 1/8 精细进度条 + `↻N` 会话压缩计数徽章、Prompt `Cache` 命中率、当前/今日/本周累计花费（`今日` / `本周`）、子代理/后台任务/产物计数、沙箱徽章 | `display.contextScale`, `display.showContextBar`, `display.showDailyCost`, `display.showWeeklyCost` |
+| **上下文与跨会话账本** | 按模型跨会话自动学习压缩水位线（`256k`、`512k` 等）的 1/8 精细进度条 + `↻N` 会话压缩计数徽章、Prompt `Cache` 命中率、当前/今日/本周累计花费（`今日` / `本周`）、内联计数（`子代理`、`后台`、`+N 排队`，以及默认关闭、来自上游 `agy` `stdin.artifact_count` 的可选 `产物` 计数）、沙箱徽章 | `display.contextScale`, `display.showContextBar`, `display.showDailyCost`, `display.showWeeklyCost`, `display.showCounts`, `display.showArtifacts` |
 | **配额消耗速率（Pace）** | 按当前模型智能路由配额桶（`5h` / `weekly`），实时预测重置前耗尽风险（`▲` 增速预警）、低占用自动隐藏阈值及重置倒计时 | `display.showQuota`, `display.quotaPace`, `display.quotaThreshold`, `quota.backgroundRefresh` |
 | **活动明细与可组合行** | 同名工具调用折叠计数（`×N`）、`Skills` 与 `MCP` 服务（异常标红 `!`）、四态 `Subagents`（完成满 60 秒自动退场）、`task.md` 进度，以及自由并排合并与右对齐 | `display.mergeGroups`, `display.rightAlign`, `display.showTools`, `display.showSubagents`, `display.showTodos` |
 
@@ -150,7 +150,7 @@ agy plugin install .
 | `uninstall [--plugin] [--keep-config]` | 移除 `statusLine`、清理备份与数据目录，无损恢复 `agy` 官方默认状态栏 |
 | `doctor [--pretty]` | 检查运行引擎、插件启用状态、`statusLine` 挂载、配置合法性及终端图标对齐情况 |
 | `preview [--state <name>] [--last] [--set k=v]` | 预览 `showcase`（5 大场景）、`idle`、`tool_use`、`confirm`、`high-context` 或最近一次真实快照 |
-| `schema [关键词]` | 检索全部 **53** 个受强类型校验的配置项、类型、默认值与说明 |
+| `schema [关键词]` | 检索全部受强类型校验的配置项、类型、默认值与说明 |
 | `set <key>=<value> ...` / `set --undo` | 原子修改 `~/.gemini/antigravity-cli/agy-hud/config.json` 或一键回滚上一次修改 |
 | `update [--check] [--force]` | 检查或执行经过 SHA-256 校验的自升级 |
 | `quota refresh` | 在隔离临时目录执行一次 `agy -p /usage` 官方配额缓存校准 |
@@ -183,6 +183,12 @@ agy plugin install .
 # 独立隐藏目录名但保留 Git 分支显示，或自定义顶栏标题与 ~tok/s 速率徽章（分档图标 + min~max 区间）
 ~/.gemini/antigravity-cli/agy-hud/bin/agy-hud set display.showProject=false vcs.enabled=true
 ~/.gemini/antigravity-cli/agy-hud/bin/agy-hud set display.showTitle=true display.showSpeed=true
+
+# 开启上游 `agy` `stdin.artifact_count` 计数（`产物`，英文界面为 `art`；因新会话常上报 1 而默认关闭）
+~/.gemini/antigravity-cli/agy-hud/bin/agy-hud set display.showArtifacts=true
+
+# 隐藏全部内联计数（子代理、后台任务、产物与排队输入）
+~/.gemini/antigravity-cli/agy-hud/bin/agy-hud set display.showCounts=false
 
 # 一键撤销上一次配置变更
 ~/.gemini/antigravity-cli/agy-hud/bin/agy-hud set --undo
