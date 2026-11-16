@@ -46,7 +46,7 @@
 
 # 窄终端分屏（< 76 列，高上下文预警）—— 渐进式优雅降级，绝不折行错乱：
 ⚡ 思考中 │ [自动] │ [Argon · M] │ agy-hud git:(main*)
-上下文 ███████░ 89.6% !200k │ 配额(weekly) 92% (1h 30m)
+上下文 ███████░ 89.6% │ 配额(weekly) 92% (1h 30m)
 ◐ run_command: Cargo test execution
 ```
 
@@ -57,7 +57,7 @@
 | **运行状态与模式** | 实时 `空闲` / `思考中` / `调用工具` / `等待确认` 状态，`[计划]` / `[自动]` / `[接受]` 模式（自动识别 `/plan` 与 `VIM` 模式徽章） | `display.showState`, `display.showMode` |
 | **模型、档位与速率** | 模型简称、推理强度（`low`/`med`/`high`）、订阅档位（`Pro`/`Ultra`），以及剥离 `TTFT` 的真实生成速率 `~tok/s`、速度分档图标（`🐢`/`🛵`/`🚗`/`🚅`/`✈️`/`🚀`/`🛰️`/`🛸`/`👽`，`ascii` 模式下自动隐藏）与会话 `(min~max)` 速率区间 | `display.showModel`, `display.showPlanTier`, `display.showSpeed`, `display.glyphMode` |
 | **项目路径与 VCS** | 支持点击跳转的 `file://` OSC 8 目录链接（含可选 `项目根 › 子目录` 面包屑）、GitHub 分支点击跳转、`git`（含 Worktree、脏标记、`↑N` 未推送阈值变色、文件增删）、`jj` 与 `hg` | `display.showProject`, `display.showLaunchDir`, `vcs.pushWarningThreshold`, `vcs.showFileStats` |
-| **上下文与跨会话账本** | 对齐 `256k` 自动会话压缩水位线的 1/8 精细进度条 + `↻N` 会话压缩计数徽章、`200k+` 阈值告警、Prompt `Cache` 命中率、当前/今日/本周累计花费（`今日` / `本周`）、子代理/后台任务/产物计数、沙箱徽章 | `display.contextScale`, `display.showContextBar`, `display.showDailyCost`, `display.showWeeklyCost` |
+| **上下文与跨会话账本** | 按模型跨会话自动学习压缩水位线（`256k`、`512k` 等）的 1/8 精细进度条 + `↻N` 会话压缩计数徽章、Prompt `Cache` 命中率、当前/今日/本周累计花费（`今日` / `本周`）、子代理/后台任务/产物计数、沙箱徽章 | `display.contextScale`, `display.showContextBar`, `display.showDailyCost`, `display.showWeeklyCost` |
 | **配额消耗速率（Pace）** | 按当前模型智能路由配额桶（`5h` / `weekly`），实时预测重置前耗尽风险（`▲` 增速预警）、低占用自动隐藏阈值及重置倒计时 | `display.showQuota`, `display.quotaPace`, `display.quotaThreshold`, `quota.backgroundRefresh` |
 | **活动明细与可组合行** | 同名工具调用折叠计数（`×N`）、`Skills` 与 `MCP` 服务（异常标红 `!`）、四态 `Subagents`（完成满 60 秒自动退场）、`task.md` 进度，以及自由并排合并与右对齐 | `display.mergeGroups`, `display.rightAlign`, `display.showTools`, `display.showSubagents`, `display.showTodos` |
 
@@ -174,7 +174,7 @@ agy plugin install .
 # 配额低于 25% 时静默隐藏（若消耗增速过快触发 `▲` 预警则自动提前浮现）
 ~/.gemini/antigravity-cli/agy-hud/bin/agy-hud set display.quotaThreshold=25 display.quotaPace=true
 
-# 切换上下文分母刻度：compaction（默认，对齐 256k 自动压缩水位线）| window（展示 1.0M 模型物理总上限）
+# 切换上下文分母刻度：compaction（默认，自动学习并记忆各模型压缩水位线）| window（展示模型物理总上限）
 ~/.gemini/antigravity-cli/agy-hud/bin/agy-hud set display.contextScale=compaction
 
 # 切换图标字符集：unicode（默认）| nerd（Nerd Fonts）| ascii（纯 7-bit 安全字符）
