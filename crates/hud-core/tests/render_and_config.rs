@@ -8,30 +8,30 @@ use hud_core::config::{
 };
 use hud_core::probes::{
     apply_speed_cache, is_newer_semver, normalize_github_repo_url, parse_compaction_ceiling_info,
-    parse_compaction_ceiling_record, parse_cost_ledger_info, parse_github_latest_release,
-    parse_usage_command_output, parse_vcs_info, reconcile_compaction_ceiling,
-    reconcile_cost_ledger,
+    parse_compaction_ceiling_record, parse_cost_ledger_info, parse_db_ceiling_info,
+    parse_db_ceiling_record, parse_github_latest_release, parse_usage_command_output,
+    parse_vcs_info, reconcile_compaction_ceiling, reconcile_cost_ledger,
 };
 use hud_core::render::{
     RenderExtras, RenderInput, format_config_problem_line, format_config_problem_line_with_cmd,
     render_hud_lines, render_hud_lines_full,
 };
 use hud_core::stdin::{
-    CeilingSource, CompactionInputs, CompactionScope, EffectiveCeiling, compute_quota_pace,
-    extract_context_metrics_scaled, extract_quota_buckets_reconciled, format_session_cost,
-    format_workspace_breadcrumb, normalize_model_family, normalize_plan_tier,
-    resolve_compaction_ceiling, snap_compaction_ceiling,
+    CeilingSource, CompactionInputs, CompactionScope, EffectiveCeiling, SENTINEL_RESET_CUTOFF_MS,
+    compute_quota_pace, extract_context_metrics_scaled, extract_quota_buckets_reconciled,
+    format_session_cost, format_workspace_breadcrumb, normalize_model_family, normalize_plan_tier,
+    resolve_compaction_ceiling, resolve_compaction_ceiling_with_db, snap_compaction_ceiling,
 };
 use hud_core::transcript::{parse_transcript_and_tasks, parse_transcript_with_cursor};
 use hud_core::types::{
     AgyStdinData, COMPACTION_CEILING_VERSION, CachedQuotaSnapshot, CompactionCeilingRecord,
     CompactionCeilingState, ContextScaleMode, ContextValueMode, ContextWindowStdin, CostStdin,
-    CurrentUsageStdin, DoctorFacts, EffortFormatMode, GlyphMode, InstalledPluginFacts, Language,
-    LearnedCompactionState, LineLayout, LogicPaths, ModelStdin, PathLevels, PluginFacts,
-    ProbeAnswers, QuotaBucketView, QuotaPace, RawQuotaBucket, RuntimeFacts, SandboxStdin,
-    SubagentEntry, SubagentStatus, SubagentStdin, TodoItem, TodoStatus, ToolEntry, ToolStatus,
-    TranscriptCursor, TranscriptSummary, UnprefixedSkillsFacts, UpdateCacheSnapshot, VimStdin,
-    WorkspaceStdin,
+    CurrentUsageStdin, DbCeilingInfo, DbCeilingSource, DoctorFacts, EffortFormatMode, GlyphMode,
+    InstalledPluginFacts, Language, LearnedCompactionState, LineLayout, LogicPaths, ModelStdin,
+    PathLevels, PluginFacts, ProbeAnswers, QuotaBucketView, QuotaPace, RawQuotaBucket,
+    RuntimeFacts, SandboxStdin, SubagentEntry, SubagentStatus, SubagentStdin, TodoItem, TodoStatus,
+    ToolEntry, ToolStatus, TranscriptCursor, TranscriptSummary, UnprefixedSkillsFacts,
+    UpdateCacheSnapshot, VimStdin, WorkspaceStdin,
 };
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
@@ -2009,17 +2009,29 @@ fn composable_merge_groups_cjk_bar_alignment_and_right_align() {
     // so it auto-stacks AND aligns bar start columns across CJK `上下文` (6 cols) and `配额(weekly)` (12 cols)!
     cfg.language = Language::ZhHans;
     cfg.line_layout = hud_core::types::LineLayout::Expanded;
-    let narrow_zh = render_hud_lines(RenderInput {
-        stdin: Some(&stdin),
-        config: &cfg,
-        transcript: &TranscriptSummary::default(),
-        vcs: None,
-        memory: None,
-        cached_quota: None,
-        update_info: None,
-        columns: Some(84),
-        now_ms: 1_700_000_000_000,
-    });
+    let db_1m = DbCeilingInfo::new(
+        1_048_576,
+        DbCeilingSource::GenMetadata,
+        Some("Gemini 4 Argon (Medium)".to_string()),
+        Some("gemini 4 argon".to_string()),
+    );
+    let narrow_zh = render_hud_lines_full(
+        RenderInput {
+            stdin: Some(&stdin),
+            config: &cfg,
+            transcript: &TranscriptSummary::default(),
+            vcs: None,
+            memory: None,
+            cached_quota: None,
+            update_info: None,
+            columns: Some(84),
+            now_ms: 1_700_000_000_000,
+        },
+        RenderExtras {
+            db_ceiling: Some(&db_1m),
+            ..RenderExtras::default()
+        },
+    );
     let ctx_plain = strip_ansi(&narrow_zh[1]);
     let qta_plain = strip_ansi(&narrow_zh[2]);
     let ctx_bar_col = text_width(&ctx_plain[..ctx_plain.find('█').unwrap()]);
@@ -2574,13 +2586,7 @@ fn tier_snapping_window_thresholds_and_current_usage_absence_behave_accurately()
 
     let large_cold =
         resolve_compaction_ceiling(1_048_576, 0, None, None, Some(128_000), Some(128_000));
-    assert_eq!(
-        large_cold.effective,
-        EffectiveCeiling::Scaled {
-            ceiling_tokens: 256_000,
-            source: CeilingSource::ColdStartDefault
-        }
-    );
+    assert_eq!(large_cold.effective, EffectiveCeiling::Unknown);
 
     let cumulative_only_stdin: AgyStdinData = serde_json::from_value(json!({
         "exceeds_200k_tokens": true,
@@ -2600,7 +2606,8 @@ fn tier_snapping_window_thresholds_and_current_usage_absence_behave_accurately()
         CompactionInputs::default(),
     );
     assert_eq!(scaled.current_usage_tokens, None);
-    assert_eq!(scaled.window_size, Some(1_048_576));
+    assert!(!scaled.ceiling_known);
+    assert_eq!(scaled.window_size, None);
 
     let scope = CompactionScope::from_stdin(Some(&cumulative_only_stdin)).unwrap();
     let (learned_state, write_rec) = reconcile_compaction_ceiling(
@@ -3081,17 +3088,29 @@ fn artifact_count_visibility_defaults_i18n_compact_meta_and_config_overrides() {
     overflow_cfg.display.show_daily_cost = true;
     let mut overflow_stdin = art2_stdin.clone();
     overflow_stdin.pending_input_count = None;
-    let overflow_lines = render_hud_lines(RenderInput {
-        stdin: Some(&overflow_stdin),
-        config: &overflow_cfg,
-        transcript: &TranscriptSummary::default(),
-        vcs: None,
-        memory: None,
-        cached_quota: None,
-        update_info: None,
-        columns: Some(88),
-        now_ms: 1_700_000_000_000,
-    });
+    let overflow_db = DbCeilingInfo::new(
+        1_048_576,
+        DbCeilingSource::GenMetadata,
+        Some("Gemini 4 Argon (Medium)".to_string()),
+        Some("gemini 4 argon".to_string()),
+    );
+    let overflow_lines = render_hud_lines_full(
+        RenderInput {
+            stdin: Some(&overflow_stdin),
+            config: &overflow_cfg,
+            transcript: &TranscriptSummary::default(),
+            vcs: None,
+            memory: None,
+            cached_quota: None,
+            update_info: None,
+            columns: Some(88),
+            now_ms: 1_700_000_000_000,
+        },
+        RenderExtras {
+            db_ceiling: Some(&overflow_db),
+            ..RenderExtras::default()
+        },
+    );
     let overflow_ctx = overflow_lines
         .iter()
         .map(|l| strip_ansi(l))
@@ -3787,4 +3806,418 @@ fn doctor_reports_unprefixed_skills_installed_conflict_and_not_installed() {
         .join("\n");
     assert!(findings_no_sl.contains("No statusLine is configured"));
     assert!(!findings_no_sl.contains("shortcut skill is not installed"));
+}
+
+#[test]
+fn quota_zero_percent_render_sentinel_filtering_and_cache_reconciliation() {
+    let now_ms = 1_794_218_400_000i64;
+    let future_reset = "2099-01-01T00:00:00Z".to_string();
+
+    let mut quota = BTreeMap::new();
+    // Sentinel and empty buckets must be dropped before canonical/argon routing
+    quota.insert(
+        "gemini-argon-wtu-weekly".to_string(),
+        RawQuotaBucket::default(),
+    );
+    quota.insert(
+        "3p-5h".to_string(),
+        RawQuotaBucket {
+            remaining_fraction: Some(0.9),
+            reset_time: Some("1970-01-01T00:00:00Z".to_string()),
+            ..Default::default()
+        },
+    );
+    // Live exhausted bucket (Proto3 omitted `remaining_fraction` -> 0.0 remaining = 100% used)
+    quota.insert(
+        "gemini-5h".to_string(),
+        RawQuotaBucket {
+            remaining_fraction: None,
+            remaining_amount: None,
+            reset_time: Some(future_reset.clone()),
+            reset_in_seconds: None,
+            disabled: None,
+        },
+    );
+
+    let mut stdin = sample_stdin(120);
+    stdin.quota = Some(quota);
+
+    // Stale cached 35% remaining must NOT resurrect live exhausted 0% remaining
+    let mut cached_map = BTreeMap::new();
+    cached_map.insert(
+        "gemini-5h".to_string(),
+        RawQuotaBucket {
+            remaining_fraction: Some(0.35),
+            reset_time: Some(future_reset),
+            ..Default::default()
+        },
+    );
+    let cached = CachedQuotaSnapshot {
+        at: now_ms - 60_000,
+        source: "agy-usage".to_string(),
+        quota: cached_map,
+    };
+
+    let used_lines = render_hud_lines(RenderInput {
+        stdin: Some(&stdin),
+        config: &HudConfig::default(),
+        transcript: &TranscriptSummary::default(),
+        vcs: None,
+        memory: None,
+        cached_quota: Some(&cached),
+        update_info: None,
+        columns: Some(120),
+        now_ms,
+    });
+    let quota_row = used_lines
+        .iter()
+        .find(|l| strip_ansi(l).contains("Quota(5h)"))
+        .expect("exhausted quota row");
+    assert!(
+        quota_row.contains("\x1b[31m"),
+        "100% used must style critical red: {quota_row:?}"
+    );
+    let quota_plain = strip_ansi(quota_row);
+    assert!(
+        quota_plain.contains("100%") && !quota_plain.contains("65%"),
+        "expected 100% used without stale cache resurrection: {quota_plain}"
+    );
+
+    let mut rem_cfg = HudConfig::default();
+    rem_cfg.display.quota_value = hud_core::types::QuotaValueMode::Remaining;
+    let rem_lines = render_hud_lines(RenderInput {
+        stdin: Some(&stdin),
+        config: &rem_cfg,
+        transcript: &TranscriptSummary::default(),
+        vcs: None,
+        memory: None,
+        cached_quota: Some(&cached),
+        update_info: None,
+        columns: Some(120),
+        now_ms,
+    });
+    let rem_plain = rem_lines
+        .iter()
+        .map(|l| strip_ansi(l))
+        .find(|l| l.contains("Quota(5h)"))
+        .unwrap();
+    assert!(rem_plain.contains("0% left"), "{rem_plain}");
+    assert_eq!(SENTINEL_RESET_CUTOFF_MS, 946_684_800_000);
+}
+
+#[test]
+fn honest_cold_start_ui_showcase_and_db_ceiling_report_scrub() {
+    assert!(hud_core::is_shadow_or_utility_model("M50"));
+    assert!(!hud_core::is_shadow_or_utility_model("m500"));
+
+    // 1. Cold start on 1M window with high token count (`940k` -> would be critical if 1M or 256k guessed!)
+    //    must render neutral `940k/?` with ZERO bar, ZERO percentage, ZERO yellow/red alerts across all 4 modes.
+    let cold_stdin = AgyStdinData {
+        model: Some(ModelStdin {
+            id: Some("Gemini 4 Argon (High)".to_string()),
+            display_name: Some("Gemini 4 Argon (High)".to_string()),
+            effort: Some("high".to_string()),
+        }),
+        context_window: Some(ContextWindowStdin {
+            context_window_size: Some(1_048_576),
+            used_percentage: Some(89.6),
+            current_usage: Some(CurrentUsageStdin {
+                input_tokens: Some(840_000),
+                output_tokens: Some(0),
+                cache_creation_input_tokens: Some(0),
+                cache_read_input_tokens: Some(100_000),
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    for cv in [
+        ContextValueMode::Both,
+        ContextValueMode::Tokens,
+        ContextValueMode::Percent,
+        ContextValueMode::Remaining,
+    ] {
+        let mut cfg = HudConfig::default();
+        cfg.display.context_value = cv;
+        let lines = render_hud_lines(RenderInput {
+            stdin: Some(&cold_stdin),
+            config: &cfg,
+            transcript: &TranscriptSummary::default(),
+            vcs: None,
+            memory: None,
+            cached_quota: None,
+            update_info: None,
+            columns: Some(120),
+            now_ms: 1_700_000_000_000,
+        });
+        let ctx_raw = lines
+            .iter()
+            .find(|l| strip_ansi(l).contains("Ctx"))
+            .expect("context line");
+        let ctx_plain = strip_ansi(ctx_raw);
+        let before_cache = ctx_plain.split('·').next().unwrap_or("");
+        assert!(
+            before_cache.contains("940k/?")
+                && !before_cache.contains('%')
+                && !ctx_plain.contains("256k")
+                && !ctx_plain.contains('█')
+                && ctx_plain.contains("11% Cache"),
+            "mode {cv:?} should show honest cold start with cache hit: {ctx_plain}"
+        );
+        assert!(
+            !ctx_raw.contains("\x1b[31m") && !ctx_raw.contains("\x1b[33m"),
+            "cold-start must never trigger yellow/red warnings: {ctx_raw:?}"
+        );
+        assert!(
+            ctx_raw.contains("\x1b[1m940k\x1b[0m\x1b[2m/?\x1b[0m"),
+            "expected neutral BOLD+DIM `940k/?`: {ctx_raw:?}"
+        );
+    }
+
+    // Compaction badge stays preserved on honest cold start when `last_compaction_tokens` is None
+    let badge_tx = TranscriptSummary {
+        compaction_count: 1,
+        ..TranscriptSummary::default()
+    };
+    let badge_cold = render_hud_lines(RenderInput {
+        stdin: Some(&cold_stdin),
+        config: &HudConfig::default(),
+        transcript: &badge_tx,
+        vcs: None,
+        memory: None,
+        cached_quota: None,
+        update_info: None,
+        columns: Some(120),
+        now_ms: 1_700_000_000_000,
+    });
+    let badge_plain = strip_ansi(
+        badge_cold
+            .iter()
+            .find(|l| strip_ansi(l).contains("Ctx"))
+            .unwrap(),
+    );
+    assert!(badge_plain.contains("940k/? (↻1)"), "{badge_plain}");
+
+    let mut tok_cfg = HudConfig::default();
+    tok_cfg.display.context_value = ContextValueMode::Tokens;
+    let tok_cold = render_hud_lines(RenderInput {
+        stdin: Some(&cold_stdin),
+        config: &tok_cfg,
+        transcript: &badge_tx,
+        vcs: None,
+        memory: None,
+        cached_quota: None,
+        update_info: None,
+        columns: Some(120),
+        now_ms: 1_700_000_000_000,
+    });
+    let tok_plain = strip_ansi(
+        tok_cold
+            .iter()
+            .find(|l| strip_ansi(l).contains("Ctx"))
+            .unwrap(),
+    );
+    assert!(tok_plain.contains("940k/? · ↻1"), "{tok_plain}");
+
+    // Narrow width budget check for cold-start UI
+    for width in [48usize, 68, 90] {
+        let lines = render_hud_lines(RenderInput {
+            stdin: Some(&cold_stdin),
+            config: &HudConfig::default(),
+            transcript: &TranscriptSummary::default(),
+            vcs: None,
+            memory: None,
+            cached_quota: None,
+            update_info: None,
+            columns: Some(width),
+            now_ms: 1_700_000_000_000,
+        });
+        for line in lines {
+            assert!(text_width(&line) <= width, "overflow at {width}: {line}");
+        }
+    }
+
+    // 2. Providing matching DbCeilingInfo unlocks exact percentage & bar, whereas model switch mismatch falls back to `?`
+    let db_256 = DbCeilingInfo::new(
+        256_000,
+        DbCeilingSource::GenMetadata,
+        Some("Gemini 4 Argon (High)".to_string()),
+        Some("gemini 4 argon".to_string()),
+    );
+    let mut mid_stdin = cold_stdin.clone();
+    mid_stdin
+        .context_window
+        .as_mut()
+        .unwrap()
+        .current_usage
+        .as_mut()
+        .unwrap()
+        .input_tokens = Some(52_000); // 152k total
+    let matching_lines = render_hud_lines_full(
+        RenderInput {
+            stdin: Some(&mid_stdin),
+            config: &HudConfig::default(),
+            transcript: &TranscriptSummary::default(),
+            vcs: None,
+            memory: None,
+            cached_quota: None,
+            update_info: None,
+            columns: Some(120),
+            now_ms: 1_700_000_000_000,
+        },
+        RenderExtras {
+            db_ceiling: Some(&db_256),
+            ..RenderExtras::default()
+        },
+    );
+    let matching_plain = strip_ansi(&matching_lines[1]);
+    assert!(
+        matching_plain.contains("59.4% (152k/256k)"),
+        "{matching_plain}"
+    );
+
+    let mut switched_stdin = mid_stdin.clone();
+    switched_stdin.model = Some(ModelStdin {
+        id: Some("Gemini 3 Flash".to_string()),
+        display_name: Some("Gemini 3 Flash".to_string()),
+        effort: None,
+    });
+    let mismatched_lines = render_hud_lines_full(
+        RenderInput {
+            stdin: Some(&switched_stdin),
+            config: &HudConfig::default(),
+            transcript: &TranscriptSummary::default(),
+            vcs: None,
+            memory: None,
+            cached_quota: None,
+            update_info: None,
+            columns: Some(120),
+            now_ms: 1_700_000_000_000,
+        },
+        RenderExtras {
+            db_ceiling: Some(&db_256),
+            ..RenderExtras::default()
+        },
+    );
+    let mismatched_plain = strip_ansi(&mismatched_lines[1]);
+    assert!(
+        mismatched_plain.contains("152k/?") && !mismatched_plain.contains("256k"),
+        "mismatched DB ceiling must fall back to honest cold start: {mismatched_plain}"
+    );
+
+    // 3. Showcase Scenarios 3 (`idle` -> `152k/?`) & 4 (`high-context` -> `89.6%` critical alert) + `report` db_ceiling scrub
+    let facts = DoctorFacts {
+        cwd: "/Users/alice/app".to_string(),
+        home_dir: "/Users/alice".to_string(),
+        platform: "macos".to_string(),
+        terminal: "Ghostty".to_string(),
+        remote_session: false,
+        locale: None,
+        runtime: RuntimeFacts {
+            engine: "rust-native".to_string(),
+            version: hud_core::types::HUD_VERSION.to_string(),
+            exec_path: "/Users/alice/.gemini/antigravity-cli/agy-hud/bin/agy-hud".to_string(),
+            supported: true,
+        },
+        plugin: PluginFacts {
+            root: "/Users/alice/.gemini/config/plugins/agy-hud".to_string(),
+            version: hud_core::types::HUD_VERSION.to_string(),
+        },
+        installed_plugin_status: "installed".to_string(),
+        installed_plugin: None,
+        config_path: "/Users/alice/.gemini/antigravity-cli/agy-hud/config.json".to_string(),
+        heartbeat: None,
+        ..DoctorFacts::default()
+    };
+    let showcase = execute_subcommand(
+        "preview",
+        &["--state".to_string(), "showcase".to_string()],
+        &CommandContext {
+            facts: &facts,
+            paths: &LogicPaths::default(),
+            now_ms: 1_700_000_000_000,
+            config_text: None,
+            cli_settings_text: None,
+            last_snapshot_text: None,
+            update_cache_text: None,
+            transcript_head: None,
+            transcript_tail: None,
+            task_md_text: None,
+        },
+    );
+    let showcase_plain = showcase
+        .lines
+        .iter()
+        .map(|l| strip_ansi(l))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(showcase_plain.contains("152k/?"), "{showcase_plain}");
+    assert!(showcase_plain.contains("89.6%"), "{showcase_plain}");
+
+    let raw_db_json = json!({
+        "version": 1,
+        "ceilingTokens": 256_000,
+        "source": "gen_metadata",
+        "modelId": "Gemini 4 Argon (High)",
+        "secretLeak": "/Users/alice/conversations/secret.db"
+    })
+    .to_string();
+    let snap = json!({
+        "stdin": &mid_stdin,
+        "probes": { "db_ceiling": raw_db_json }
+    })
+    .to_string();
+    let rep = execute_subcommand(
+        "report",
+        &["db-ceiling-check".to_string()],
+        &CommandContext {
+            facts: &facts,
+            paths: &LogicPaths::default(),
+            now_ms: 1_700_000_000_000,
+            config_text: None,
+            cli_settings_text: None,
+            last_snapshot_text: Some(&snap),
+            update_cache_text: None,
+            transcript_head: None,
+            transcript_tail: None,
+            task_md_text: None,
+        },
+    );
+    let rep_val: Value = serde_json::from_str(&rep.lines.join("\n")).unwrap();
+    let scrubbed_db_str = rep_val["case"]["probes"]["db_ceiling"]
+        .as_str()
+        .expect("valid db_ceiling survives report");
+    assert!(!scrubbed_db_str.contains("secretLeak"));
+    assert!(!scrubbed_db_str.contains("/Users/alice"));
+    let parsed_scrubbed = parse_db_ceiling_info(&ProbeAnswers {
+        db_ceiling: Some(scrubbed_db_str.to_string()),
+        ..Default::default()
+    })
+    .expect("scrubbed db_ceiling parses");
+    assert_eq!(parsed_scrubbed.ceiling_tokens, 256_000);
+    assert!(
+        rep_val["renderedPlainLines"]
+            .to_string()
+            .contains("59.4% (152k/256k)")
+    );
+
+    // Ensure `resolve_compaction_ceiling_with_db` and `parse_db_ceiling_record` are exercised cleanly
+    let direct_res = resolve_compaction_ceiling_with_db(
+        1_048_576,
+        &CompactionInputs {
+            db_ceiling: parse_db_ceiling_record(scrubbed_db_str),
+            ..Default::default()
+        },
+        Some(152_000),
+        Some(152_000),
+        Some("gemini 4 argon"),
+    );
+    assert_eq!(
+        direct_res.effective,
+        EffectiveCeiling::Scaled {
+            ceiling_tokens: 256_000,
+            source: CeilingSource::DbGenMetadata
+        }
+    );
 }

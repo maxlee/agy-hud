@@ -181,11 +181,79 @@ pub struct AgentStdin {
     pub name: Option<String>,
 }
 
+/// Parses a JSON number or Proto3 JSON numeric string (`0`, `42.5`, `"0"`, `"100"`) into a finite `f64`.
+pub(crate) fn parse_json_num_or_str(v: &serde_json::Value) -> Option<f64> {
+    v.as_f64()
+        .or_else(|| {
+            v.as_str()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .and_then(|s| s.parse::<f64>().ok())
+        })
+        .filter(|n| n.is_finite())
+}
+
+fn deserialize_opt_num_or_str<'de, D>(deserializer: D) -> Result<Option<f64>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct OptNumOrStrVisitor;
+
+    impl<'de> serde::de::Visitor<'de> for OptNumOrStrVisitor {
+        type Value = Option<f64>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("null, a number, or a numeric string")
+        }
+
+        fn visit_none<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_some<D2: Deserializer<'de>>(self, d: D2) -> Result<Self::Value, D2::Error> {
+            d.deserialize_any(self)
+        }
+
+        fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<Self::Value, E> {
+            Ok(Some(v as f64))
+        }
+
+        fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<Self::Value, E> {
+            Ok(Some(v as f64))
+        }
+
+        fn visit_f64<E: serde::de::Error>(self, v: f64) -> Result<Self::Value, E> {
+            Ok(v.is_finite().then_some(v))
+        }
+
+        fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+            let trimmed = v.trim();
+            if trimmed.is_empty() {
+                return Ok(None);
+            }
+            let parsed = trimmed
+                .parse::<f64>()
+                .map_err(|_| E::custom("invalid numeric string"))?;
+            Ok(parsed.is_finite().then_some(parsed))
+        }
+    }
+
+    deserializer.deserialize_option(OptNumOrStrVisitor)
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RawQuotaBucket {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub remaining_fraction: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_opt_num_or_str"
+    )]
     pub remaining_amount: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reset_time: Option<String>,
@@ -552,7 +620,7 @@ pub struct CostTotals {
     pub estimated: bool,
 }
 
-pub const TRANSCRIPT_CURSOR_VERSION: u32 = 2;
+pub const TRANSCRIPT_CURSOR_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -593,6 +661,10 @@ pub struct TranscriptCursor {
     pub last_compaction_tokens: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub last_compaction_at_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub prev_prompt_tokens: Option<u64>,
+    #[serde(default)]
+    pub last_planner_step_next: usize,
     #[serde(default)]
     pub folded_tools: Vec<ToolEntry>,
     #[serde(default)]
@@ -642,6 +714,48 @@ pub struct SpeedCacheSnapshot {
     pub active: Option<ActiveSpeedSample>,
 }
 
+/// Authoritative database origin for an extracted session compaction ceiling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DbCeilingSource {
+    GenMetadata,
+    ExecutorMetadata,
+}
+
+pub const DB_CEILING_VERSION: u32 = 1;
+
+/// Authoritative session compaction ceiling extracted read-only from `conversations/<id>.db`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DbCeilingInfo {
+    pub version: u32,
+    pub ceiling_tokens: u64,
+    pub source: DbCeilingSource,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub model_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub model_family: Option<String>,
+}
+
+impl DbCeilingInfo {
+    /// Constructs a versioned `DbCeilingInfo` payload for `ProbeAnswers::db_ceiling`.
+    #[must_use]
+    pub fn new(
+        ceiling_tokens: u64,
+        source: DbCeilingSource,
+        model_id: Option<String>,
+        model_family: Option<String>,
+    ) -> Self {
+        Self {
+            version: DB_CEILING_VERSION,
+            ceiling_tokens,
+            source,
+            model_id,
+            model_family,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ProbeAnswers {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -658,6 +772,9 @@ pub struct ProbeAnswers {
     pub cost_ledger: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub compaction_ceiling: Option<String>,
+    /// JSON-serialized [`DbCeilingInfo`] extracted from the active conversation SQLite DB.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub db_ceiling: Option<String>,
 }
 
 pub const COMPACTION_CEILING_VERSION: u32 = 1;

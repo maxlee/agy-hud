@@ -1,13 +1,21 @@
 use hud_cli::collector::{
     DetectedRepo, GIT_SAFE_PREFIX, HG_SAFE_PREFIX, JJ_PROBE_ARGS, ProbeRunner, SystemProbeRunner,
-    compute_vcs_signature, detect_vcs_repo, extract_git_filter_names, probe_git, probe_hg,
-    probe_jj, probe_vcs_cached, probe_vcs_uncached, read_and_parse_transcript_incremental,
-    resolve_executable_in_path,
+    collect_render_inputs, compute_vcs_signature, detect_vcs_repo, extract_git_filter_names,
+    probe_git, probe_hg, probe_jj, probe_vcs_cached, probe_vcs_uncached,
+    read_and_parse_transcript_incremental, resolve_executable_in_path,
 };
 use hud_cli::install::format_statusline_command_for_platform;
-use hud_cli::paths::{AgyPaths, build_logic_paths, derive_task_md_path};
+use hud_cli::paths::{
+    AgyPaths, build_logic_paths, db_ceiling_cache_path, derive_task_md_path, prepare_data_dir,
+};
+use hud_cli::session_db;
 use hud_core::ansi::strip_ansi;
-use hud_core::types::{AgyStdinData, VcsStdin, VcsType, WorkspaceStdin};
+use hud_core::config::HudConfig;
+use hud_core::probes::parse_db_ceiling_info;
+use hud_core::types::{
+    AgyStdinData, ContextWindowStdin, CurrentUsageStdin, DbCeilingSource, ModelStdin,
+    TRANSCRIPT_CURSOR_VERSION, TranscriptCursor, VcsStdin, VcsType, WorkspaceStdin,
+};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::fs;
@@ -16,7 +24,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 struct TempDir {
     path: PathBuf,
@@ -2878,4 +2886,1047 @@ fn live_statusline_preview_and_uninstall_sh_fallback_with_short_and_prefixed_com
         );
         assert!(sym_target.join(".agy-hud-managed.json").is_file());
     }
+}
+
+fn push_pb_varint(out: &mut Vec<u8>, mut val: u64) {
+    loop {
+        let byte = (val & 0x7f) as u8;
+        val >>= 7;
+        if val == 0 {
+            out.push(byte);
+            break;
+        }
+        out.push(byte | 0x80);
+    }
+}
+
+fn push_pb_bytes_field(out: &mut Vec<u8>, field_num: u64, data: &[u8]) {
+    push_pb_varint(out, (field_num << 3) | 2);
+    push_pb_varint(out, data.len() as u64);
+    out.extend_from_slice(data);
+}
+
+fn push_pb_varint_field(out: &mut Vec<u8>, field_num: u64, val: u64) {
+    push_pb_varint(out, field_num << 3);
+    push_pb_varint(out, val);
+}
+
+fn fixture_gen_blob(
+    ceiling: Option<u64>,
+    model_id: Option<&str>,
+    display_name: Option<&str>,
+    subagent_type: Option<&str>,
+) -> Vec<u8> {
+    let mut chat = Vec::new();
+    if let Some(c) = ceiling {
+        let mut f10 = Vec::new();
+        push_pb_varint_field(&mut f10, 4, c);
+        let mut f9 = Vec::new();
+        push_pb_bytes_field(&mut f9, 10, &f10);
+        push_pb_bytes_field(&mut chat, 9, &f9);
+    }
+    if let Some(mid) = model_id {
+        push_pb_bytes_field(&mut chat, 19, mid.as_bytes());
+    }
+    if let Some(sub) = subagent_type {
+        let mut entry = Vec::new();
+        push_pb_bytes_field(&mut entry, 1, b"subagent_type");
+        push_pb_bytes_field(&mut entry, 2, sub.as_bytes());
+        push_pb_bytes_field(&mut chat, 20, &entry);
+    }
+    if let Some(disp) = display_name {
+        push_pb_bytes_field(&mut chat, 21, disp.as_bytes());
+    }
+    let mut top = Vec::new();
+    push_pb_bytes_field(&mut top, 1, &chat);
+    top
+}
+
+fn fixture_exec_blob(max_token_limit: u64) -> Vec<u8> {
+    let mut f2 = Vec::new();
+    push_pb_varint_field(&mut f2, 5, max_token_limit);
+    let mut f10 = Vec::new();
+    push_pb_bytes_field(&mut f10, 2, &f2);
+    let mut top = Vec::new();
+    push_pb_bytes_field(&mut top, 10, &f10);
+    top
+}
+
+fn push_sqlite_varint(out: &mut Vec<u8>, v: u64) {
+    if v <= 0x7f {
+        out.push(v as u8);
+        return;
+    }
+    let mut buf = [0u8; 9];
+    let mut len = 0usize;
+    let mut x = v;
+    while x > 0 {
+        buf[8 - len] = (x & 0x7f) as u8;
+        x >>= 7;
+        len += 1;
+    }
+    for slot in &mut buf[(9 - len)..8] {
+        *slot |= 0x80;
+    }
+    out.extend_from_slice(&buf[9 - len..9]);
+}
+
+enum FixtureCol<'a> {
+    Null,
+    Int(i64),
+    Text(&'a str),
+    Blob(&'a [u8]),
+}
+
+fn build_fixture_record(cols: &[FixtureCol<'_>]) -> Vec<u8> {
+    let mut types_bytes = Vec::new();
+    let mut body = Vec::new();
+    for c in cols {
+        match c {
+            FixtureCol::Null => push_sqlite_varint(&mut types_bytes, 0),
+            FixtureCol::Int(v) => {
+                if *v == 0 {
+                    push_sqlite_varint(&mut types_bytes, 8);
+                } else if *v == 1 {
+                    push_sqlite_varint(&mut types_bytes, 9);
+                } else if let Ok(v8) = i8::try_from(*v) {
+                    push_sqlite_varint(&mut types_bytes, 1);
+                    body.push(v8 as u8);
+                } else {
+                    push_sqlite_varint(&mut types_bytes, 4);
+                    body.extend_from_slice(&(*v as i32).to_be_bytes());
+                }
+            }
+            FixtureCol::Text(s) => {
+                push_sqlite_varint(&mut types_bytes, 13 + (s.len() as u64) * 2);
+                body.extend_from_slice(s.as_bytes());
+            }
+            FixtureCol::Blob(b) => {
+                push_sqlite_varint(&mut types_bytes, 12 + (b.len() as u64) * 2);
+                body.extend_from_slice(b);
+            }
+        }
+    }
+    let mut hdr_len = 1 + types_bytes.len();
+    if hdr_len >= 128 {
+        hdr_len += 1;
+    }
+    let mut rec = Vec::with_capacity(hdr_len + body.len());
+    push_sqlite_varint(&mut rec, hdr_len as u64);
+    rec.extend_from_slice(&types_bytes);
+    rec.extend_from_slice(&body);
+    rec
+}
+
+fn build_leaf_page(pgno: u32, rows: &[(u64, Vec<u8>)]) -> Vec<u8> {
+    const PAGE_SIZE: usize = 4096;
+    let mut page = vec![0u8; PAGE_SIZE];
+    let hdr_off = if pgno == 1 {
+        page[0..16].copy_from_slice(b"SQLite format 3\0");
+        page[16..18].copy_from_slice(&(PAGE_SIZE as u16).to_be_bytes());
+        page[18] = 2;
+        page[19] = 2;
+        100
+    } else {
+        0
+    };
+    let mut content_end = PAGE_SIZE;
+    let mut cell_ptrs = Vec::with_capacity(rows.len());
+    for (rowid, payload) in rows {
+        assert!(payload.len() <= PAGE_SIZE - 35);
+        let mut cell = Vec::new();
+        push_sqlite_varint(&mut cell, payload.len() as u64);
+        push_sqlite_varint(&mut cell, *rowid);
+        cell.extend_from_slice(payload);
+        content_end -= cell.len();
+        page[content_end..content_end + cell.len()].copy_from_slice(&cell);
+        cell_ptrs.push(content_end as u16);
+    }
+    page[hdr_off] = 0x0d;
+    page[hdr_off + 3..hdr_off + 5].copy_from_slice(&(rows.len() as u16).to_be_bytes());
+    page[hdr_off + 5..hdr_off + 7].copy_from_slice(&(content_end as u16).to_be_bytes());
+    for (i, ptr) in cell_ptrs.iter().enumerate() {
+        let off = hdr_off + 8 + i * 2;
+        page[off..off + 2].copy_from_slice(&ptr.to_be_bytes());
+    }
+    page
+}
+
+fn build_two_table_sqlite_db(gen_rows: &[(u64, Vec<u8>)], exec_rows: &[(u64, Vec<u8>)]) -> Vec<u8> {
+    let schema = build_leaf_page(
+        1,
+        &[
+            (
+                1,
+                build_fixture_record(&[
+                    FixtureCol::Text("table"),
+                    FixtureCol::Text("gen_metadata"),
+                    FixtureCol::Text("gen_metadata"),
+                    FixtureCol::Int(2),
+                    FixtureCol::Text("CREATE TABLE gen_metadata(idx INT, data BLOB)"),
+                ]),
+            ),
+            (
+                2,
+                build_fixture_record(&[
+                    FixtureCol::Text("table"),
+                    FixtureCol::Text("executor_metadata"),
+                    FixtureCol::Text("executor_metadata"),
+                    FixtureCol::Int(3),
+                    FixtureCol::Text("CREATE TABLE executor_metadata(idx INT, data BLOB)"),
+                ]),
+            ),
+        ],
+    );
+    let gen_page = build_leaf_page(2, gen_rows);
+    let exec_page = build_leaf_page(3, exec_rows);
+    let mut out = Vec::with_capacity(4096 * 3);
+    out.extend_from_slice(&schema);
+    out.extend_from_slice(&gen_page);
+    out.extend_from_slice(&exec_page);
+    out
+}
+
+fn wal_checksum_le(data: &[u8], mut s0: u32, mut s1: u32) -> (u32, u32) {
+    for chunk in data.as_chunks::<8>().0 {
+        let x0 = u32::from_le_bytes(chunk[0..4].try_into().unwrap());
+        let x1 = u32::from_le_bytes(chunk[4..8].try_into().unwrap());
+        s0 = s0.wrapping_add(x0).wrapping_add(s1);
+        s1 = s1.wrapping_add(x1).wrapping_add(s0);
+    }
+    (s0, s1)
+}
+
+fn build_fixture_wal(frames: &[(u32, u32, &[u8])]) -> Vec<u8> {
+    const PAGE_SIZE: usize = 4096;
+    let mut wh = [0u8; 32];
+    wh[0..4].copy_from_slice(&0x377f_0682u32.to_be_bytes());
+    wh[4..8].copy_from_slice(&3_007_000u32.to_be_bytes());
+    wh[8..12].copy_from_slice(&(PAGE_SIZE as u32).to_be_bytes());
+    let salt1 = 0x1122_3344u32;
+    let salt2 = 0x5566_7788u32;
+    wh[16..20].copy_from_slice(&salt1.to_be_bytes());
+    wh[20..24].copy_from_slice(&salt2.to_be_bytes());
+    let (mut s0, mut s1) = wal_checksum_le(&wh[0..24], 0, 0);
+    wh[24..28].copy_from_slice(&s0.to_be_bytes());
+    wh[28..32].copy_from_slice(&s1.to_be_bytes());
+
+    let mut out = Vec::from(wh);
+    for &(pgno, db_size, page_data) in frames {
+        assert_eq!(page_data.len(), PAGE_SIZE);
+        let mut fh = [0u8; 24];
+        fh[0..4].copy_from_slice(&pgno.to_be_bytes());
+        fh[4..8].copy_from_slice(&db_size.to_be_bytes());
+        fh[8..12].copy_from_slice(&salt1.to_be_bytes());
+        fh[12..16].copy_from_slice(&salt2.to_be_bytes());
+        (s0, s1) = wal_checksum_le(&fh[0..8], s0, s1);
+        (s0, s1) = wal_checksum_le(page_data, s0, s1);
+        fh[16..20].copy_from_slice(&s0.to_be_bytes());
+        fh[20..24].copy_from_slice(&s1.to_be_bytes());
+        out.extend_from_slice(&fh);
+        out.extend_from_slice(page_data);
+    }
+    out
+}
+
+#[test]
+fn route_a_db_ceiling_wal_override_switch_guard_snapshot_preview_and_report_e2e() {
+    let tmp = TempDir::new("route-a-e2e");
+    let fake_home = tmp.path.join("home");
+    let gemini_cfg = fake_home.join(".gemini/config");
+    let cli_dir = tmp.path.join("cli");
+    let hud_home = cli_dir.join("agy-hud");
+    let conv_dir = cli_dir.join("conversations");
+    fs::create_dir_all(&conv_dir).unwrap();
+
+    let env_vars: [(&str, &Path); 5] = [
+        ("HOME", &fake_home),
+        ("USERPROFILE", &fake_home),
+        ("AGY_CONFIG_DIR", &gemini_cfg),
+        ("AGY_CLI_DIR", &cli_dir),
+        ("AGY_HUD_HOME", &hud_home),
+    ];
+
+    // Pre-seed a STALE cross-session `compaction-ceilings/` cache (512k) for `gemini 4 hydrogen`.
+    let ceilings_dir = hud_home.join("data/compaction-ceilings");
+    fs::create_dir_all(&ceilings_dir).unwrap();
+    let stale_scope_key = "gemini 4 hydrogen\n1048576";
+    let stale_hash = hud_cli::paths::fnv1a_64_hex(stale_scope_key);
+    let stale_shard = ceilings_dir.join(format!("{stale_hash}.json"));
+    let stale_json = json!({
+        "version": 1,
+        "modelFamily": "gemini 4 hydrogen",
+        "physWin": 1_048_576,
+        "kind": "learned",
+        "ceiling_tokens": 512_000,
+        "observed_tokens": 510_000,
+        "updatedAtMs": 1_700_000_000_000i64
+    })
+    .to_string();
+    fs::write(&stale_shard, &stale_json).unwrap();
+
+    // 1. Turn-1 SQLite .db with `gen_metadata = 256_000` + trailing shadow row (`1_048_576`)
+    //    MUST override stale `512k` cache, skip shadow row, never create `-shm`, and never pollute `compaction-ceilings/`.
+    let db_256 = conv_dir.join("conv-route-256.db");
+    let row_256 = fixture_gen_blob(
+        Some(256_000),
+        Some("gemini-4-hydrogen"),
+        Some("Gemini 4 Hydrogen (XHigh)"),
+        None,
+    );
+    let row_shadow = fixture_gen_blob(
+        Some(1_048_576),
+        Some("gemini-2.5-flash-lite"),
+        Some("Gemini 2.5 Flash Lite"),
+        None,
+    );
+    let db_bytes_256 = build_two_table_sqlite_db(
+        &[
+            (
+                1,
+                build_fixture_record(&[FixtureCol::Null, FixtureCol::Blob(&row_256)]),
+            ),
+            (
+                2,
+                build_fixture_record(&[FixtureCol::Null, FixtureCol::Blob(&row_shadow)]),
+            ),
+        ],
+        &[],
+    );
+    fs::write(&db_256, &db_bytes_256).unwrap();
+
+    let payload_256 = json!({
+        "cwd": tmp.path,
+        "conversation_id": "conv-route-256",
+        "agent_state": "idle",
+        "terminal_width": 130,
+        "model": { "id": "Gemini 4 Hydrogen (XHigh)", "display_name": "Gemini 4 Hydrogen (XHigh)", "effort": "xhigh" },
+        "context_window": {
+            "context_window_size": 1_048_576,
+            "current_usage": { "input_tokens": 128_000, "output_tokens": 0 }
+        }
+    })
+    .to_string();
+
+    let (ok1, out1) = run_bin(&[], &env_vars, Some(&payload_256));
+    assert!(ok1, "Turn-1 256k render failed: {out1}");
+    let plain1 = strip_ansi(&out1);
+    assert!(
+        plain1.contains("50.0% (128k/256k)"),
+        "expected DB 256k overriding stale 512k cache: {plain1}"
+    );
+    assert!(
+        !conv_dir.join("conv-route-256.db-shm").exists(),
+        "read-only DB probe must never create -shm"
+    );
+    assert_eq!(
+        fs::read_to_string(&stale_shard).unwrap(),
+        stale_json,
+        "Route A DB ceiling must never overwrite compaction-ceilings/"
+    );
+    assert!(
+        fs::read_dir(hud_home.join("data/db-ceilings"))
+            .unwrap()
+            .flatten()
+            .any(|e| e.path().extension().and_then(|s| s.to_str()) == Some("json")),
+        "expected db-ceilings/*.json cache file"
+    );
+
+    // 2. WAL commit frame updates `gen_metadata` to `512_000` (while trailing uncommitted frame says `1_048_576`)
+    let row_512 = fixture_gen_blob(
+        Some(512_000),
+        Some("gemini-4-hydrogen"),
+        Some("Gemini 4 Hydrogen (XHigh)"),
+        None,
+    );
+    let row_uncommitted = fixture_gen_blob(
+        Some(1_048_576),
+        Some("gemini-4-hydrogen"),
+        Some("Gemini 4 Hydrogen (XHigh)"),
+        None,
+    );
+    let wal_page_512 = build_leaf_page(
+        2,
+        &[(
+            1,
+            build_fixture_record(&[FixtureCol::Null, FixtureCol::Blob(&row_512)]),
+        )],
+    );
+    let wal_page_uncommitted = build_leaf_page(
+        2,
+        &[(
+            1,
+            build_fixture_record(&[FixtureCol::Null, FixtureCol::Blob(&row_uncommitted)]),
+        )],
+    );
+    let wal_bytes = build_fixture_wal(&[(2, 3, &wal_page_512), (2, 0, &wal_page_uncommitted)]);
+    fs::write(conv_dir.join("conv-route-256.db-wal"), &wal_bytes).unwrap();
+
+    let (ok_wal, out_wal) = run_bin(&[], &env_vars, Some(&payload_256));
+    assert!(ok_wal, "WAL 512k render failed: {out_wal}");
+    let plain_wal = strip_ansi(&out_wal);
+    assert!(
+        plain_wal.contains("25.0% (128k/512k)"),
+        "expected committed WAL 512k (ignoring uncommitted 1M): {plain_wal}"
+    );
+    // Repeat unchanged tick -> db-ceilings cache hit still returns 512k and never creates `-shm`
+    let (ok_wal_cached, out_wal_cached) = run_bin(&[], &env_vars, Some(&payload_256));
+    assert!(ok_wal_cached);
+    assert!(strip_ansi(&out_wal_cached).contains("25.0% (128k/512k)"));
+    assert!(!conv_dir.join("conv-route-256.db-shm").exists());
+
+    // 3. `840k` DB ceiling (`claude-opus-5-5-medium`) + `last-snapshot.json` + `preview --last` + `report`
+    let db_840 = conv_dir.join("conv-route-840.db");
+    let row_840 = fixture_gen_blob(
+        Some(840_000),
+        Some("claude-opus-5-5-medium"),
+        Some("Claude Opus 5.5 (Medium)"),
+        None,
+    );
+    fs::write(
+        &db_840,
+        build_two_table_sqlite_db(
+            &[(
+                1,
+                build_fixture_record(&[FixtureCol::Null, FixtureCol::Blob(&row_840)]),
+            )],
+            &[],
+        ),
+    )
+    .unwrap();
+
+    let payload_840 = json!({
+        "cwd": tmp.path,
+        "conversation_id": "conv-route-840",
+        "agent_state": "idle",
+        "terminal_width": 130,
+        "model": { "id": "Claude Opus 5.5 (Medium)", "display_name": "Claude Opus 5.5 (Medium)", "effort": "medium" },
+        "context_window": {
+            "context_window_size": 1_048_576,
+            "current_usage": { "input_tokens": 420_000, "output_tokens": 0 }
+        }
+    })
+    .to_string();
+
+    let (ok_840, out_840) = run_bin(&[], &env_vars, Some(&payload_840));
+    assert!(ok_840, "840k render failed: {out_840}");
+    let plain_840 = strip_ansi(&out_840);
+    assert!(
+        plain_840.contains("50.0% (420k/840k)"),
+        "expected DB 840k ceiling: {plain_840}"
+    );
+    assert_eq!(
+        fs::read_dir(&ceilings_dir).unwrap().count(),
+        1,
+        "DB 840k must NOT create a compaction-ceilings shard"
+    );
+
+    let snap_raw = fs::read_to_string(hud_home.join("data/last-snapshot.json")).unwrap();
+    let snap_json: Value = serde_json::from_str(&snap_raw).unwrap();
+    assert!(
+        snap_json["probes"]["db_ceiling"].as_str().is_some(),
+        "last-snapshot.json must persist probes.db_ceiling: {snap_raw}"
+    );
+
+    let (ok_prev, out_prev) = run_bin(&["preview", "--last"], &env_vars, None);
+    assert!(ok_prev, "preview --last failed: {out_prev}");
+    assert!(
+        strip_ansi(&out_prev).contains("50.0% (420k/840k)"),
+        "preview --last must preserve db_ceiling: {}",
+        strip_ansi(&out_prev)
+    );
+
+    let (ok_rep, out_rep) = run_bin(&["report", "--note", "route-a"], &env_vars, None);
+    assert!(ok_rep, "report failed: {out_rep}");
+    let rep_json: Value = serde_json::from_str(&out_rep).unwrap();
+    let rep_db = rep_json["case"]["probes"]["db_ceiling"]
+        .as_str()
+        .expect("report preserves scrubbed db_ceiling");
+    assert!(!rep_db.contains("conv-route-840.db"));
+    assert!(
+        rep_json["renderedPlainLines"]
+            .to_string()
+            .contains("50.0% (420k/840k)"),
+        "report rendered lines must reflect 840k DB ceiling: {rep_json}"
+    );
+
+    // 4. Mid-session model switch guard: switching `stdin.model` to `Gemini 3 Flash` while DB still has `claude-opus-5-5-medium`
+    //    must reject the stale DB ceiling and render honest `420k/?` with zero false warnings!
+    let payload_switch = json!({
+        "cwd": tmp.path,
+        "conversation_id": "conv-route-840",
+        "agent_state": "idle",
+        "terminal_width": 130,
+        "model": { "id": "Gemini 3 Flash", "display_name": "Gemini 3 Flash" },
+        "context_window": {
+            "context_window_size": 1_048_576,
+            "current_usage": { "input_tokens": 420_000, "output_tokens": 0 }
+        }
+    })
+    .to_string();
+    let (ok_sw, out_sw) = run_bin(&[], &env_vars, Some(&payload_switch));
+    assert!(ok_sw, "model switch render failed: {out_sw}");
+    let plain_sw = strip_ansi(&out_sw);
+    assert!(
+        plain_sw.contains("420k/?") && !plain_sw.contains("840k") && !plain_sw.contains("256k"),
+        "mid-session model switch must reject stale DB ceiling: {plain_sw}"
+    );
+    assert!(!out_sw.contains("\x1b[31m") && !out_sw.contains("\x1b[33m"));
+
+    // 5. `executor_metadata` fallback when `gen_metadata` has only shadow rows
+    let db_exec = conv_dir.join("conv-exec-512.db");
+    let exec_blob = fixture_exec_blob(512_000);
+    fs::write(
+        &db_exec,
+        build_two_table_sqlite_db(
+            &[(
+                1,
+                build_fixture_record(&[FixtureCol::Null, FixtureCol::Blob(&row_shadow)]),
+            )],
+            &[(
+                1,
+                build_fixture_record(&[FixtureCol::Null, FixtureCol::Blob(&exec_blob)]),
+            )],
+        ),
+    )
+    .unwrap();
+    let payload_exec = json!({
+        "cwd": tmp.path,
+        "conversation_id": "conv-exec-512",
+        "agent_state": "idle",
+        "terminal_width": 130,
+        "model": { "id": "Gemini 3 Flash", "display_name": "Gemini 3 Flash" },
+        "context_window": {
+            "context_window_size": 1_048_576,
+            "current_usage": { "input_tokens": 128_000, "output_tokens": 0 }
+        }
+    })
+    .to_string();
+    let (ok_exec, out_exec) = run_bin(&[], &env_vars, Some(&payload_exec));
+    assert!(ok_exec, "executor_metadata fallback failed: {out_exec}");
+    assert!(
+        strip_ansi(&out_exec).contains("25.0% (128k/512k)"),
+        "expected executor_metadata 512k fallback: {}",
+        strip_ansi(&out_exec)
+    );
+}
+
+#[test]
+fn honest_cold_start_large_window_renders_unknown_without_false_warnings_e2e() {
+    let tmp = TempDir::new("cold-start-unknown");
+    let fake_home = tmp.path.join("home");
+    let gemini_cfg = fake_home.join(".gemini/config");
+    let cli_dir = tmp.path.join("cli");
+    let hud_home = cli_dir.join("agy-hud");
+    fs::create_dir_all(&hud_home).unwrap();
+
+    let env_vars: [(&str, &Path); 5] = [
+        ("HOME", &fake_home),
+        ("USERPROFILE", &fake_home),
+        ("AGY_CONFIG_DIR", &gemini_cfg),
+        ("AGY_CLI_DIR", &cli_dir),
+        ("AGY_HUD_HOME", &hud_home),
+    ];
+
+    let payload = json!({
+        "cwd": tmp.path,
+        "conversation_id": "conv-honest-cold-start",
+        "agent_state": "idle",
+        "terminal_width": 130,
+        "model": { "id": "Gemini 4 Argon (High)", "display_name": "Gemini 4 Argon (High)", "effort": "high" },
+        "context_window": {
+            "context_window_size": 1_048_576,
+            "used_percentage": 89.6,
+            "current_usage": {
+                "input_tokens": 840_000,
+                "output_tokens": 0,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 100_000
+            }
+        }
+    })
+    .to_string();
+
+    for mode in ["both", "tokens", "percent", "remaining"] {
+        let (ok_set, set_out) = run_bin(
+            &["set", &format!("display.contextValue={mode}")],
+            &env_vars,
+            None,
+        );
+        assert!(ok_set, "set {mode} failed: {set_out}");
+
+        let (ok, out) = run_bin(&[], &env_vars, Some(&payload));
+        assert!(ok, "cold start failed for {mode}: {out}");
+        let plain = strip_ansi(&out);
+        let ctx_line = plain.lines().find(|l| l.contains("Ctx")).unwrap_or(&plain);
+        let before_cache = ctx_line.split('·').next().unwrap_or("");
+        assert!(
+            before_cache.contains("940k/?")
+                && !before_cache.contains('%')
+                && !ctx_line.contains("256k")
+                && !ctx_line.contains('█')
+                && ctx_line.contains("11% Cache"),
+            "mode {mode} expected neutral `940k/?` without 256k or bar: {ctx_line}"
+        );
+        assert!(
+            !out.contains("\x1b[31m") && !out.contains("\x1b[33m"),
+            "cold-start on >=900k window must never emit yellow/red warning ANSI styles: {out:?}"
+        );
+    }
+}
+
+#[test]
+fn quota_zero_percent_omitted_fraction_and_sentinel_resets_e2e() {
+    let tmp = TempDir::new("quota-zero-sentinel");
+    let fake_home = tmp.path.join("home");
+    let gemini_cfg = fake_home.join(".gemini/config");
+    let cli_dir = tmp.path.join("cli");
+    let hud_home = cli_dir.join("agy-hud");
+    fs::create_dir_all(hud_home.join("data")).unwrap();
+
+    // Stale quota cache says `gemini-5h` still has 0.35 remaining using genuine `CachedQuotaSnapshot` schema.
+    fs::write(
+        hud_home.join("data/quota-cache.json"),
+        serde_json::to_string(&json!({
+            "at": 1_700_000_000_000i64,
+            "source": "/usage",
+            "quota": {
+                "gemini-5h": {
+                    "remaining_fraction": 0.35,
+                    "reset_time": "2099-01-01T00:00:00Z"
+                }
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let env_vars: [(&str, &Path); 5] = [
+        ("HOME", &fake_home),
+        ("USERPROFILE", &fake_home),
+        ("AGY_CONFIG_DIR", &gemini_cfg),
+        ("AGY_CLI_DIR", &cli_dir),
+        ("AGY_HUD_HOME", &hud_home),
+    ];
+
+    // Confirm `quota-cache.json` actually loads and reconciles higher official 0.80 down to cached 0.35 (65% used)
+    let baseline_payload = json!({
+        "cwd": tmp.path,
+        "conversation_id": "conv-quota-cache-check",
+        "agent_state": "idle",
+        "terminal_width": 140,
+        "model": { "id": "Gemini 4 Argon", "display_name": "Gemini 4 Argon" },
+        "context_window": { "used_percentage": 15.0 },
+        "quota": {
+            "gemini-5h": {
+                "remaining_fraction": 0.80,
+                "reset_time": "2099-01-01T00:00:00Z"
+            }
+        }
+    })
+    .to_string();
+    let (ok_base, out_base) = run_bin(&[], &env_vars, Some(&baseline_payload));
+    assert!(ok_base, "baseline cache reconciliation failed: {out_base}");
+    let plain_base = strip_ansi(&out_base);
+    assert!(
+        plain_base.contains("Quota(5h)") && plain_base.contains("65%"),
+        "expected cached 0.35 (65% used) to override live 0.80: {plain_base}"
+    );
+
+    // Live omitted `remaining_fraction` (`0%` remaining) must beat stale cached `0.35` (`65%` used)!
+    let payload = json!({
+        "cwd": tmp.path,
+        "conversation_id": "conv-quota-zero",
+        "agent_state": "idle",
+        "terminal_width": 140,
+        "model": { "id": "Gemini 4 Argon", "display_name": "Gemini 4 Argon" },
+        "context_window": { "used_percentage": 15.0 },
+        "quota": {
+            "gemini-5h": {
+                "reset_time": "2099-01-01T00:00:00Z"
+            },
+            "gemini-weekly": {
+                "remaining_fraction": 0.25,
+                "reset_time": "1970-01-01T00:00:00Z"
+            },
+            "3p-weekly": {
+                "remaining_fraction": 0.40,
+                "reset_time": "0001-01-01T00:00:00Z"
+            },
+            "gemini-argon-wtu-weekly": {}
+        }
+    })
+    .to_string();
+
+    let (ok, out) = run_bin(&[], &env_vars, Some(&payload));
+    assert!(ok, "quota 0% render failed: {out}");
+    let plain = strip_ansi(&out);
+    assert!(
+        plain.contains("Quota(5h)") && plain.contains("100%") && plain.contains('d'),
+        "expected depleted Quota(5h) 100% with future countdown: {plain}"
+    );
+    assert!(
+        !plain.contains("65%")
+            && !plain.contains("Quota(weekly)")
+            && !plain.contains("75%")
+            && !plain.contains("60%")
+            && !plain.contains("argon-weekly"),
+        "sentinel <= 2000-01-01, empty argon placeholder, and stale 65% must be dropped: {plain}"
+    );
+}
+
+#[test]
+fn implicit_compaction_dual_threshold_undo_immunity_and_cursor_shrink_e2e() {
+    let tmp = TempDir::new("implicit-compaction-undo");
+    let fake_home = tmp.path.join("home");
+    let gemini_cfg = fake_home.join(".gemini/config");
+    let cli_dir = tmp.path.join("cli");
+    let hud_home = cli_dir.join("agy-hud");
+    let log_dir = cli_dir
+        .join("brain")
+        .join("conv-implicit-undo")
+        .join(".system_generated/logs");
+    fs::create_dir_all(&log_dir).unwrap();
+    let tx_path = log_dir.join("transcript.jsonl");
+
+    let env_vars: [(&str, &Path); 5] = [
+        ("HOME", &fake_home),
+        ("USERPROFILE", &fake_home),
+        ("AGY_CONFIG_DIR", &gemini_cfg),
+        ("AGY_CLI_DIR", &cli_dir),
+        ("AGY_HUD_HOME", &hud_home),
+    ];
+
+    let step_lines = [
+        json!({"step_index": 0, "type": "USER_INPUT", "status": "DONE", "created_at": "2026-11-10T01:00:00Z", "content": "Init"}),
+        json!({"step_index": 1, "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": "2026-11-10T01:00:05Z", "model": "gemini-4-argon", "input_tokens": 20_000, "cache_read_tokens": 180_000}),
+        // Shadow models must be skipped completely
+        json!({"step_index": 2, "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": "2026-11-10T01:00:06Z", "model": "gemini-2.5-flash-lite", "input_tokens": 3_000}),
+        json!({"step_index": 3, "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": "2026-11-10T01:00:07Z", "model": "MODEL_PLACEHOLDER_M50", "input_tokens": 2_000}),
+        // 20% drop (200k -> 160k): >5k but <25%, must NOT trigger
+        json!({"step_index": 4, "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": "2026-11-10T01:00:10Z", "model": "gemini-4-argon", "input_tokens": 160_000}),
+        // 4.5k drop (160k -> 155.5k): <=5k, must NOT trigger
+        json!({"step_index": 5, "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": "2026-11-10T01:00:12Z", "model": "gemini-4-argon", "input_tokens": 155_500}),
+    ];
+    let body1 = step_lines
+        .iter()
+        .map(serde_json::to_string)
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+        .join("\n")
+        + "\n";
+    fs::write(&tx_path, &body1).unwrap();
+
+    let payload = json!({
+        "cwd": tmp.path,
+        "conversation_id": "conv-implicit-undo",
+        "transcript_path": tx_path,
+        "agent_state": "idle",
+        "terminal_width": 140,
+        "model": { "id": "Gemini 4 Argon (High)", "display_name": "Gemini 4 Argon (High)", "effort": "high" },
+        "context_window": {
+            "context_window_size": 1_048_576,
+            "current_usage": { "input_tokens": 128_000, "output_tokens": 0 }
+        }
+    })
+    .to_string();
+
+    // Tick 1: 0 compactions
+    let (ok1, out1) = run_bin(&[], &env_vars, Some(&payload));
+    assert!(ok1, "tick 1 failed: {out1}");
+    let plain1 = strip_ansi(&out1);
+    assert!(
+        !plain1.contains('↻'),
+        "no false compaction expected: {plain1}"
+    );
+    assert!(
+        plain1.contains("128k/?"),
+        "cold start before compaction: {plain1}"
+    );
+
+    // Tick 2: grow to 210_000 -> incremental cursor commits previous step state cleanly
+    let mut f = fs::OpenOptions::new().append(true).open(&tx_path).unwrap();
+    writeln!(
+        f,
+        "{}",
+        json!({"step_index": 6, "type": "USER_INPUT", "status": "DONE", "created_at": "2026-11-10T01:01:00Z", "content": "Continue"})
+    )
+    .unwrap();
+    writeln!(
+        f,
+        "{}",
+        json!({"step_index": 7, "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": "2026-11-10T01:01:05Z", "model": "gemini-4-argon", "input_tokens": 210_000})
+    )
+    .unwrap();
+    f.flush().unwrap();
+
+    let (ok2, out2) = run_bin(&[], &env_vars, Some(&payload));
+    assert!(ok2);
+    assert!(!strip_ansi(&out2).contains('↻'));
+
+    // Tick 3: dual-threshold implicit compaction (210_000 -> 120_000: drop 90k > 5k && 42.9% >= 25%)
+    writeln!(
+        f,
+        "{}",
+        json!({"step_index": 8, "type": "USER_INPUT", "status": "DONE", "created_at": "2026-11-10T01:02:00Z", "content": "Next"})
+    )
+    .unwrap();
+    writeln!(
+        f,
+        "{}",
+        json!({"step_index": 9, "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": "2026-11-10T01:02:05Z", "model": "gemini-4-argon", "input_tokens": 120_000})
+    )
+    .unwrap();
+    f.flush().unwrap();
+
+    let (ok3, out3) = run_bin(&[], &env_vars, Some(&payload));
+    assert!(ok3, "tick 3 failed: {out3}");
+    let plain3 = strip_ansi(&out3);
+    assert!(
+        plain3.contains("50.0% (128k/256k · ↻1)"),
+        "expected implicit compaction ↻1 + snapped 256k: {plain3}"
+    );
+    let snap3: Value = serde_json::from_str(
+        &fs::read_to_string(hud_home.join("data/last-snapshot.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(snap3["compactionCount"], 1);
+    assert_eq!(snap3["lastCompactionTokens"], 210_000);
+
+    // Tick 4: Undo/rewind appends smaller `step_index` (step 4 & 5) with large token drop (120k -> 40k) -> MUST NOT trigger!
+    writeln!(
+        f,
+        "{}",
+        json!({"step_index": 4, "type": "USER_INPUT", "status": "DONE", "created_at": "2026-11-10T01:03:00Z", "content": "Rewind"})
+    )
+    .unwrap();
+    writeln!(
+        f,
+        "{}",
+        json!({"step_index": 5, "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": "2026-11-10T01:03:05Z", "model": "gemini-4-argon", "input_tokens": 40_000})
+    )
+    .unwrap();
+    f.flush().unwrap();
+
+    let (ok4, out4) = run_bin(&[], &env_vars, Some(&payload));
+    assert!(ok4);
+    assert!(
+        strip_ansi(&out4).contains("↻1"),
+        "Undo/rewind must keep compaction_count == 1: {}",
+        strip_ansi(&out4)
+    );
+    let snap4: Value = serde_json::from_str(
+        &fs::read_to_string(hud_home.join("data/last-snapshot.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(snap4["compactionCount"], 1);
+
+    // Tick 5: File shrink (rewritten shorter than cursor offset) resets cursor cleanly & never resurrects old state!
+    drop(f);
+    let shrunk = format!(
+        "{}\n{}\n",
+        json!({"step_index": 0, "type": "USER_INPUT", "status": "DONE", "created_at": "2026-11-10T02:00:00Z", "content": "Fresh start"}),
+        json!({"step_index": 1, "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": "2026-11-10T02:00:05Z", "model": "gemini-4-argon", "input_tokens": 15_000}),
+    );
+    fs::write(&tx_path, shrunk).unwrap();
+    let (ok5, out5) = run_bin(&[], &env_vars, Some(&payload));
+    assert!(ok5);
+    assert!(!strip_ansi(&out5).contains('↻'));
+    let snap5: Value = serde_json::from_str(
+        &fs::read_to_string(hud_home.join("data/last-snapshot.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(snap5["compactionCount"], 0);
+}
+
+#[test]
+fn collector_worker4_latency_cursor_tracking_and_file_shrink_reset() {
+    let tmp = TempDir::new("collector-worker4");
+    let fake_home = tmp.path.join("home");
+    let gemini_cfg = fake_home.join(".gemini/config");
+    let cli_dir = tmp.path.join("cli");
+    let hud_home = cli_dir.join("agy-hud");
+    let conv_dir = cli_dir.join("conversations");
+    let log_dir = cli_dir
+        .join("brain")
+        .join("conv-worker4")
+        .join(".system_generated/logs");
+    fs::create_dir_all(&conv_dir).unwrap();
+    fs::create_dir_all(&log_dir).unwrap();
+
+    let mut env_map = HashMap::new();
+    env_map.insert("HOME".to_string(), fake_home.to_string_lossy().into_owned());
+    env_map.insert(
+        "USERPROFILE".to_string(),
+        fake_home.to_string_lossy().into_owned(),
+    );
+    env_map.insert(
+        "AGY_CONFIG_DIR".to_string(),
+        gemini_cfg.to_string_lossy().into_owned(),
+    );
+    env_map.insert(
+        "AGY_CLI_DIR".to_string(),
+        cli_dir.to_string_lossy().into_owned(),
+    );
+    env_map.insert(
+        "AGY_HUD_HOME".to_string(),
+        hud_home.to_string_lossy().into_owned(),
+    );
+    let paths = AgyPaths::from_env_map(&env_map);
+    let data_real = prepare_data_dir(&paths).expect("prepare data dir");
+
+    let db_path = conv_dir.join("conv-worker4.db");
+    let gen_row = fixture_gen_blob(
+        Some(512_000),
+        Some("gemini-4-hydrogen"),
+        Some("Gemini 4 Hydrogen (XHigh)"),
+        None,
+    );
+    fs::write(
+        &db_path,
+        build_two_table_sqlite_db(
+            &[(
+                1,
+                build_fixture_record(&[FixtureCol::Null, FixtureCol::Blob(&gen_row)]),
+            )],
+            &[],
+        ),
+    )
+    .unwrap();
+
+    let tx_path = log_dir.join("transcript.jsonl");
+    let tx_initial = [
+        json!({"step_index": 0, "type": "USER_INPUT", "status": "DONE", "created_at": "2026-11-10T01:00:00Z", "content": "One"}),
+        json!({"step_index": 1, "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": "2026-11-10T01:00:02Z", "model": "gemini-4-hydrogen", "input_tokens": 80_000}),
+        json!({"step_index": 2, "type": "USER_INPUT", "status": "DONE", "created_at": "2026-11-10T01:00:10Z", "content": "Two"}),
+        json!({"step_index": 3, "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": "2026-11-10T01:00:12Z", "model": "gemini-4-hydrogen", "input_tokens": 110_000}),
+    ]
+    .iter()
+    .map(serde_json::to_string)
+    .collect::<Result<Vec<_>, _>>()
+    .unwrap()
+    .join("\n")
+        + "\n";
+    fs::write(&tx_path, &tx_initial).unwrap();
+
+    let stdin = AgyStdinData {
+        cwd: Some(tmp.path.to_string_lossy().into_owned()),
+        conversation_id: Some("conv-worker4".to_string()),
+        transcript_path: Some(tx_path.to_string_lossy().into_owned()),
+        agent_state: Some("idle".to_string()),
+        model: Some(ModelStdin {
+            id: Some("Gemini 4 Hydrogen (XHigh)".to_string()),
+            display_name: Some("Gemini 4 Hydrogen (XHigh)".to_string()),
+            effort: Some("xhigh".to_string()),
+        }),
+        context_window: Some(ContextWindowStdin {
+            context_window_size: Some(1_048_576),
+            current_usage: Some(CurrentUsageStdin {
+                input_tokens: Some(110_000),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let logic_paths = build_logic_paths(&paths, Some(&stdin), Some(&data_real));
+    let mut cfg = HudConfig::default();
+    cfg.vcs.enabled = false;
+    cfg.display.show_memory = false;
+
+    // 1. Cold DB read latency + Worker 4 wiring
+    let real_db = fs::canonicalize(&db_path).unwrap();
+    let cache_path = db_ceiling_cache_path(&data_real, &real_db);
+    let t_db = Instant::now();
+    let obs = session_db::read_db_ceiling_from_path(
+        &real_db,
+        Some("Gemini 4 Hydrogen (XHigh)"),
+        hud_core::is_shadow_or_utility_model,
+    )
+    .unwrap()
+    .expect("db observation");
+    let db_elapsed = t_db.elapsed();
+    assert_eq!(obs.ceiling_tokens, 512_000);
+    assert!(
+        db_elapsed.as_millis() < 25,
+        "DB read unexpectedly slow: {db_elapsed:?}"
+    );
+
+    let collected1 = collect_render_inputs(
+        &paths,
+        &logic_paths,
+        &cfg,
+        &stdin,
+        1_700_000_000_000,
+        &SystemProbeRunner,
+    );
+    let parsed_db = parse_db_ceiling_info(&collected1.probes).expect("db_ceiling serialized");
+    assert_eq!(parsed_db.ceiling_tokens, 512_000);
+    assert_eq!(parsed_db.source, DbCeilingSource::GenMetadata);
+    assert_eq!(parsed_db.model_family.as_deref(), Some("gemini 4 hydrogen"));
+    assert!(cache_path.is_file(), "db-ceilings cache must be written");
+    assert!(!conv_dir.join("conv-worker4.db-shm").exists());
+    assert!(
+        !paths.compaction_ceilings_dir.exists(),
+        "compaction-ceilings/ must NOT be written for DB ceilings"
+    );
+
+    // 2. Warm cache hit latency
+    let t_cache = Instant::now();
+    let cached_obs = session_db::read_db_ceiling_cached(
+        &real_db,
+        Some(&cache_path),
+        Some("Gemini 4 Hydrogen (XHigh)"),
+        hud_core::is_shadow_or_utility_model,
+    )
+    .expect("cached observation");
+    let cache_elapsed = t_cache.elapsed();
+    assert_eq!(cached_obs.ceiling_tokens, 512_000);
+    assert!(
+        cache_elapsed.as_millis() < 10,
+        "cache hit unexpectedly slow: {cache_elapsed:?}"
+    );
+
+    // 3. TranscriptCursor preserves `prev_prompt_tokens` & `last_planner_step_next` and cleans up on shrink!
+    let cursor_path = PathBuf::from(logic_paths.transcript_cursor.as_deref().unwrap());
+    let cursor_v3: TranscriptCursor =
+        serde_json::from_str(&fs::read_to_string(&cursor_path).unwrap()).unwrap();
+    assert_eq!(cursor_v3.version, TRANSCRIPT_CURSOR_VERSION);
+    assert_eq!(cursor_v3.prev_prompt_tokens, Some(80_000));
+    assert_eq!(cursor_v3.last_planner_step_next, 2);
+
+    // Shrink file to a 1-turn transcript (< cursor.offset): stale cursor must be deleted so regrowth does NOT resurrect it!
+    let shrunk_1turn = format!(
+        "{}\n",
+        json!({"step_index": 0, "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": "2026-11-10T02:00:00Z", "model": "gemini-4-hydrogen", "input_tokens": 20_000})
+    );
+    fs::write(&tx_path, shrunk_1turn).unwrap();
+    let s_shrunk = read_and_parse_transcript_incremental(
+        Some(&tx_path),
+        Some(&cursor_path),
+        None,
+        Some(&stdin),
+    );
+    assert_eq!(s_shrunk.compaction_count, 0);
+    assert!(
+        !cursor_path.exists(),
+        "stale cursor must be removed when shrunk file has commit_idx == 0"
+    );
+
+    // Grow file back past old offset with padding -> no stale compaction or resurrection
+    let mut f = fs::OpenOptions::new().append(true).open(&tx_path).unwrap();
+    writeln!(
+        f,
+        "{}",
+        json!({"step_index": 1, "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": "2026-11-10T02:01:00Z", "model": "gemini-4-hydrogen", "input_tokens": 30_000, "content": "y".repeat(2048)})
+    )
+    .unwrap();
+    f.flush().unwrap();
+    let s_regrown = read_and_parse_transcript_incremental(
+        Some(&tx_path),
+        Some(&cursor_path),
+        None,
+        Some(&stdin),
+    );
+    assert_eq!(s_regrown.compaction_count, 0);
 }

@@ -1,13 +1,19 @@
-use crate::paths::{AgyPaths, atomic_write_bytes, canonical_or_parent, create_private_dir_all};
+use crate::paths::{
+    AgyPaths, atomic_write_bytes, canonical_or_parent, create_private_dir_all,
+    db_ceiling_cache_path, resolve_conversation_db_path,
+};
+use crate::session_db::{self, DbCeilingObservation, DbCeilingOrigin};
 use hud_core::config::HudConfig;
 use hud_core::probes::{
     normalize_github_repo_url, parse_git_head_text, parse_git_porcelain_v2, parse_hg_probe_output,
     parse_jj_probe_output,
 };
+use hud_core::stdin::normalize_model_family_str;
 use hud_core::transcript::{parse_transcript_and_tasks, parse_transcript_with_cursor};
 use hud_core::types::{
-    AgyStdinData, LogicPaths, MemoryProbeInfo, ProbeAnswers, TRANSCRIPT_CURSOR_VERSION,
-    TranscriptCursor, TranscriptSummary, VcsProbeInfo, VcsStdin, VcsType,
+    AgyStdinData, DbCeilingInfo, DbCeilingSource, LogicPaths, MemoryProbeInfo, ProbeAnswers,
+    TRANSCRIPT_CURSOR_VERSION, TranscriptCursor, TranscriptSummary, VcsProbeInfo, VcsStdin,
+    VcsType,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -179,19 +185,7 @@ pub fn drain_stdin_nested(timeout: Duration) {
     let _ = read_stdin_payload_bounded(timeout);
 }
 
-pub fn read_bounded_string(path: &Path, max_bytes: u64) -> Option<String> {
-    let meta = fs::symlink_metadata(path).ok()?;
-    if !meta.file_type().is_file() || meta.len() > max_bytes {
-        return None;
-    }
-    let f = File::open(path).ok()?;
-    let mut buf = Vec::with_capacity(meta.len() as usize);
-    f.take(max_bytes + 1).read_to_end(&mut buf).ok()?;
-    if (buf.len() as u64) > max_bytes {
-        return None;
-    }
-    String::from_utf8(buf).ok()
-}
+pub use crate::paths::read_bounded_string;
 
 /// Bounded `O(1)` head (`8 KB`) + tail (`256 KB`) reader for multi-megabyte `transcript.jsonl`.
 pub fn read_transcript_slices(path: &Path) -> (Option<String>, Option<String>) {
@@ -240,6 +234,23 @@ pub fn read_transcript_slices(path: &Path) -> (Option<String>, Option<String>) {
     (head_line, Some(tail_str))
 }
 
+fn persist_or_clear_cursor(
+    cursor_path: Option<&Path>,
+    next_cursor: Option<TranscriptCursor>,
+    had_stale_cursor: bool,
+) {
+    let Some(cp) = cursor_path else {
+        return;
+    };
+    if let Some(updated) = next_cursor {
+        if let Ok(bytes) = serde_json::to_vec(&updated) {
+            let _ = atomic_write_bytes(cp, &bytes, 0o600);
+        }
+    } else if had_stale_cursor {
+        let _ = fs::remove_file(cp);
+    }
+}
+
 /// Incremental `O(Δ)` transcript reader backed by `TranscriptCursor`.
 /// Seeks directly to `cursor.offset` when valid; falls back to full scan (`<= 2 MB`) or bounded
 /// `512 KB` tail slice on cold start, and atomically persists updated cursors when `cursor_path` is set.
@@ -256,6 +267,11 @@ pub fn read_and_parse_transcript_incremental(
         return parse_transcript_and_tasks(None, None, task_md_content, stdin);
     };
     if !meta.is_file() || meta.len() == 0 {
+        if let Some(cp) = cursor_path
+            && fs::symlink_metadata(cp).is_ok()
+        {
+            let _ = fs::remove_file(cp);
+        }
         return parse_transcript_and_tasks(None, None, task_md_content, stdin);
     }
     let Ok(mut f) = File::open(tp) else {
@@ -273,10 +289,14 @@ pub fn read_and_parse_transcript_incremental(
         None
     };
 
-    let existing_cursor: Option<TranscriptCursor> = cursor_path
+    let raw_cursor: Option<TranscriptCursor> = cursor_path
         .and_then(|cp| read_bounded_string(cp, 64 * 1024))
-        .and_then(|raw| serde_json::from_str::<TranscriptCursor>(&raw).ok())
-        .filter(|c| c.version == TRANSCRIPT_CURSOR_VERSION && c.offset <= file_len);
+        .and_then(|raw| serde_json::from_str::<TranscriptCursor>(&raw).ok());
+    let had_stale_cursor = raw_cursor
+        .as_ref()
+        .is_some_and(|c| c.version != TRANSCRIPT_CURSOR_VERSION || c.offset > file_len);
+    let existing_cursor =
+        raw_cursor.filter(|c| c.version == TRANSCRIPT_CURSOR_VERSION && c.offset <= file_len);
 
     let (use_cursor, read_offset) = match existing_cursor.as_ref() {
         Some(cur) if file_len.saturating_sub(cur.offset) <= MAX_CURSOR_DELTA_BYTES => {
@@ -318,11 +338,7 @@ pub fn read_and_parse_transcript_incremental(
                 task_md_content,
                 stdin,
             );
-            if let (Some(cp), Some(updated)) = (cursor_path, next_cursor)
-                && let Ok(bytes) = serde_json::to_vec(&updated)
-            {
-                let _ = atomic_write_bytes(cp, &bytes, 0o600);
-            }
+            persist_or_clear_cursor(cursor_path, next_cursor, had_stale_cursor);
             return summary;
         }
     };
@@ -348,11 +364,7 @@ pub fn read_and_parse_transcript_incremental(
         stdin,
     );
 
-    if let (Some(cp), Some(updated)) = (cursor_path, next_cursor)
-        && let Ok(bytes) = serde_json::to_vec(&updated)
-    {
-        let _ = atomic_write_bytes(cp, &bytes, 0o600);
-    }
+    persist_or_clear_cursor(cursor_path, next_cursor, had_stale_cursor);
 
     summary
 }
@@ -1155,7 +1167,50 @@ pub struct CollectedRenderData {
     pub probes: ProbeAnswers,
 }
 
-/// Collects `transcript.jsonl`, `task.md`, VCS status, and host RAM concurrently via `std::thread::scope`.
+fn extract_active_model_hint(stdin: &AgyStdinData) -> Option<&str> {
+    stdin.model.as_ref().and_then(|m| {
+        m.id.as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                m.display_name
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+            })
+    })
+}
+
+fn db_observation_to_info(obs: &DbCeilingObservation) -> DbCeilingInfo {
+    let source = match obs.origin {
+        DbCeilingOrigin::GenMetadata => DbCeilingSource::GenMetadata,
+        DbCeilingOrigin::ExecutorMetadata => DbCeilingSource::ExecutorMetadata,
+    };
+    let model_id = obs
+        .model_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            obs.display_name
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+        })
+        .map(str::to_string);
+    let model_family = obs
+        .display_name
+        .as_deref()
+        .and_then(|s| normalize_model_family_str(s, None))
+        .or_else(|| {
+            obs.model_id
+                .as_deref()
+                .and_then(|s| normalize_model_family_str(s, None))
+        });
+    DbCeilingInfo::new(obs.ceiling_tokens, source, model_id, model_family)
+}
+
+/// Collects `transcript.jsonl`, `task.md`, VCS status, host RAM, and session DB ceiling concurrently via `std::thread::scope`.
 pub fn collect_render_inputs(
     paths: &AgyPaths,
     logic_paths: &LogicPaths,
@@ -1201,6 +1256,23 @@ pub fn collect_render_inputs(
             probe_memory(runner)
         });
 
+        let db_handle = s.spawn(|| {
+            let db_path = resolve_conversation_db_path(paths, Some(stdin))?;
+            let cache_path = logic_paths
+                .data
+                .as_deref()
+                .map(|data_dir| db_ceiling_cache_path(Path::new(data_dir), &db_path));
+            let active_model_hint = extract_active_model_hint(stdin);
+            let obs = session_db::read_db_ceiling_cached(
+                &db_path,
+                cache_path.as_deref(),
+                active_model_hint,
+                hud_core::is_shadow_or_utility_model,
+            )?;
+            let info = db_observation_to_info(&obs);
+            serde_json::to_string(&info).ok()
+        });
+
         let quota_cache = logic_paths
             .quota_cache
             .as_deref()
@@ -1242,6 +1314,7 @@ pub fn collect_render_inputs(
                 speed_cache,
                 cost_ledger,
                 compaction_ceiling,
+                db_ceiling: db_handle.join().ok().flatten(),
             },
         }
     })

@@ -14,3 +14,5 @@ pub mod render;
 pub mod stdin;
 pub mod transcript;
 pub mod types;
+
+pub use stdin::is_shadow_or_utility_model;

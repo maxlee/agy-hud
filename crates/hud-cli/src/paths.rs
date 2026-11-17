@@ -2,8 +2,8 @@ use hud_core::stdin::CompactionScope;
 use hud_core::types::{AgyStdinData, LogicPaths};
 use serde_json::{Map, Value};
 use std::collections::HashMap;
-use std::fs;
-use std::io::Write;
+use std::fs::{self, File};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -22,6 +22,7 @@ pub struct AgyPaths {
     pub cost_ledger_path: PathBuf,
     pub transcript_cursor_dir: PathBuf,
     pub compaction_ceilings_dir: PathBuf,
+    pub db_ceilings_dir: PathBuf,
     pub probe_cache_dir: PathBuf,
     pub config_path: PathBuf,
     pub undo_path: PathBuf,
@@ -100,6 +101,7 @@ impl AgyPaths {
             cost_ledger_path: data_dir.join("cost-ledger.json"),
             transcript_cursor_dir: data_dir.join("transcript-cursors"),
             compaction_ceilings_dir: data_dir.join("compaction-ceilings"),
+            db_ceilings_dir: data_dir.join("db-ceilings"),
             data_dir,
             probe_cache_dir: hud_home.join("probe-cache"),
             config_path: hud_home.join("config.json"),
@@ -131,6 +133,18 @@ impl AgyPaths {
         let key = fnv1a_64_hex(&scope.storage_key());
         self.compaction_ceilings_dir.join(format!("{key}.json"))
     }
+
+    pub fn db_ceiling_file_for(&self, db_path: &Path) -> PathBuf {
+        db_ceiling_cache_path(&self.data_dir, db_path)
+    }
+}
+
+/// Returns the cache file path `<data_real_dir>/db-ceilings/<fnv64_hex(db_path)>.json`.
+pub fn db_ceiling_cache_path(data_real_dir: &Path, db_path: &Path) -> PathBuf {
+    let key = fnv1a_64_hex(&db_path.to_string_lossy());
+    data_real_dir
+        .join("db-ceilings")
+        .join(format!("{key}.json"))
 }
 
 /// Deterministic 64-bit FNV-1a hash formatted as 16 lowercase hex digits.
@@ -218,6 +232,59 @@ fn extract_conv_id_from_transcript_path(raw_path: &str) -> Option<&str> {
     is_safe_conv_id(conv_id).then_some(conv_id)
 }
 
+fn extract_transcript_root(raw_path: &str) -> Option<PathBuf> {
+    let norm = raw_path.trim();
+    let suffix = "/.system_generated/logs/transcript.jsonl";
+    let win_suffix = "\\.system_generated\\logs\\transcript.jsonl";
+    if let Some(before) = norm
+        .strip_suffix(suffix)
+        .or_else(|| norm.strip_suffix(win_suffix))
+        && let Some((brain_dir, conv_id)) = before.rsplit_once(['/', '\\'])
+        && is_safe_conv_id(conv_id)
+        && let Some((root_str, last)) = brain_dir.rsplit_once(['/', '\\'])
+        && last == "brain"
+        && !root_str.is_empty()
+    {
+        let root_path = PathBuf::from(root_str);
+        if root_path.is_absolute() {
+            return Some(root_path);
+        }
+    }
+
+    let p = Path::new(norm);
+    if !p.is_absolute() {
+        return None;
+    }
+    for ancestor in p.ancestors().take(6) {
+        if ancestor.file_name().and_then(|s| s.to_str()) == Some("brain")
+            && let Some(parent) = ancestor.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            return Some(parent.to_path_buf());
+        }
+    }
+    None
+}
+
+fn resolve_conv_id(stdin: Option<&AgyStdinData>) -> Option<&str> {
+    let raw_tp = stdin
+        .and_then(|s| s.transcript_path.as_deref())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    stdin
+        .and_then(|s| s.conversation_id.as_deref())
+        .map(str::trim)
+        .filter(|id| is_safe_conv_id(id))
+        .or_else(|| {
+            stdin
+                .and_then(|s| s.session_id.as_deref())
+                .map(str::trim)
+                .filter(|id| is_safe_conv_id(id))
+        })
+        .or_else(|| raw_tp.and_then(extract_conv_id_from_transcript_path))
+}
+
 /// Resolves the live `transcript.jsonl` path, automatically recovering when `agy` CLI reports an
 /// IDE-scoped `~/.gemini/antigravity/brain/<id>` path while storing CLI logs under `<cli_dir>/brain/<id>`.
 pub fn resolve_transcript_path(paths: &AgyPaths, stdin: Option<&AgyStdinData>) -> Option<PathBuf> {
@@ -233,17 +300,7 @@ pub fn resolve_transcript_path(paths: &AgyPaths, stdin: Option<&AgyStdinData>) -
         }
     }
 
-    let conv_id = stdin
-        .and_then(|s| s.conversation_id.as_deref())
-        .map(str::trim)
-        .filter(|id| is_safe_conv_id(id))
-        .or_else(|| {
-            stdin
-                .and_then(|s| s.session_id.as_deref())
-                .map(str::trim)
-                .filter(|id| is_safe_conv_id(id))
-        })
-        .or_else(|| raw_tp.and_then(extract_conv_id_from_transcript_path));
+    let conv_id = resolve_conv_id(stdin);
 
     if let Some(id) = conv_id {
         let rel_tail = Path::new("brain")
@@ -282,6 +339,39 @@ pub fn resolve_transcript_path(paths: &AgyPaths, stdin: Option<&AgyStdinData>) -
                 .join("transcript.jsonl"),
         )
     })
+}
+
+/// Resolves the existing SQLite conversation DB `<root>/conversations/<id>.db`, probing
+/// `<cli_dir>`, `<transcript_root>`, `~/.gemini/antigravity-cli`, and `~/.gemini/antigravity`.
+pub fn resolve_conversation_db_path(
+    paths: &AgyPaths,
+    stdin: Option<&AgyStdinData>,
+) -> Option<PathBuf> {
+    let id = resolve_conv_id(stdin)?;
+    let db_filename = format!("{id}.db");
+    let transcript_root = stdin
+        .and_then(|s| s.transcript_path.as_deref())
+        .and_then(extract_transcript_root);
+
+    let candidate_bases = [
+        Some(paths.cli_dir.clone()),
+        transcript_root,
+        Some(paths.home.join(".gemini").join("antigravity-cli")),
+        Some(paths.home.join(".gemini").join("antigravity")),
+    ];
+
+    let mut checked: Vec<PathBuf> = Vec::with_capacity(4);
+    for base in candidate_bases.into_iter().flatten() {
+        let candidate = base.join("conversations").join(&db_filename);
+        if checked.iter().any(|p| p == &candidate) {
+            continue;
+        }
+        checked.push(candidate.clone());
+        if fs::metadata(&candidate).is_ok_and(|m| m.is_file()) {
+            return Some(canonical_or_parent(&candidate));
+        }
+    }
+    None
 }
 
 pub fn create_private_dir_all(dir: &Path) -> std::io::Result<()> {
@@ -505,6 +595,21 @@ pub fn atomic_write_public_bytes(
     atomic_write_bytes_inner(target, bytes, mode_octal, false)
 }
 
+/// Reads a regular non-symlink UTF-8 file strictly bounded by `max_bytes`.
+pub fn read_bounded_string(path: &Path, max_bytes: u64) -> Option<String> {
+    let meta = fs::symlink_metadata(path).ok()?;
+    if !meta.file_type().is_file() || meta.len() > max_bytes {
+        return None;
+    }
+    let f = File::open(path).ok()?;
+    let mut buf = Vec::with_capacity(meta.len() as usize);
+    f.take(max_bytes + 1).read_to_end(&mut buf).ok()?;
+    if (buf.len() as u64) > max_bytes {
+        return None;
+    }
+    String::from_utf8(buf).ok()
+}
+
 pub fn write_config_with_undo(
     paths: &AgyPaths,
     next_raw_config: &Map<String, Value>,
@@ -590,4 +695,190 @@ pub fn with_exclusive_lock_file<T, F: FnOnce() -> T>(
     }
     let _guard = ExclusiveFileLock(lock_path);
     Some(f())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct TempDirGuard(PathBuf);
+
+    impl TempDirGuard {
+        fn new(label: &str) -> Self {
+            let pid = std::process::id();
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let dir = std::env::temp_dir().join(format!("agy-hud-paths-{label}-{pid}-{nanos}"));
+            fs::create_dir_all(&dir).expect("create temp dir");
+            Self(dir)
+        }
+    }
+
+    impl Drop for TempDirGuard {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn paths_for(home: &Path, cli_dir: &Path) -> AgyPaths {
+        let mut env = HashMap::new();
+        env.insert("HOME".to_string(), home.to_string_lossy().into_owned());
+        env.insert(
+            "USERPROFILE".to_string(),
+            home.to_string_lossy().into_owned(),
+        );
+        env.insert(
+            "AGY_CLI_DIR".to_string(),
+            cli_dir.to_string_lossy().into_owned(),
+        );
+        AgyPaths::from_env_map(&env)
+    }
+
+    #[test]
+    fn resolve_conversation_db_path_probes_in_priority_order() {
+        let tmp = TempDirGuard::new("priority");
+        let home = tmp.0.join("home");
+        let custom_cli = tmp.0.join("custom-cli");
+        let tx_root = tmp.0.join("tx-root");
+        let def_cli = home.join(".gemini").join("antigravity-cli");
+        let def_ide = home.join(".gemini").join("antigravity");
+
+        let paths = paths_for(&home, &custom_cli);
+        let id = "4db069b0-b004-4f77-97d5-39bd836acc12";
+        let stdin = AgyStdinData {
+            conversation_id: Some(id.to_string()),
+            transcript_path: Some(
+                tx_root
+                    .join("brain")
+                    .join(id)
+                    .join(".system_generated")
+                    .join("logs")
+                    .join("transcript.jsonl")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+            ..Default::default()
+        };
+
+        assert_eq!(resolve_conversation_db_path(&paths, Some(&stdin)), None);
+
+        // 4. Fallback: ~/.gemini/antigravity/conversations/<id>.db
+        let ide_db = def_ide.join("conversations").join(format!("{id}.db"));
+        fs::create_dir_all(ide_db.parent().unwrap()).unwrap();
+        fs::write(&ide_db, b"ide").unwrap();
+        assert_eq!(
+            resolve_conversation_db_path(&paths, Some(&stdin)),
+            Some(canonical_or_parent(&ide_db))
+        );
+
+        // 3. Overrides IDE: ~/.gemini/antigravity-cli/conversations/<id>.db
+        let def_cli_db = def_cli.join("conversations").join(format!("{id}.db"));
+        fs::create_dir_all(def_cli_db.parent().unwrap()).unwrap();
+        fs::write(&def_cli_db, b"def-cli").unwrap();
+        assert_eq!(
+            resolve_conversation_db_path(&paths, Some(&stdin)),
+            Some(canonical_or_parent(&def_cli_db))
+        );
+
+        // 2. Overrides defaults: <transcript_root>/conversations/<id>.db
+        let tx_db = tx_root.join("conversations").join(format!("{id}.db"));
+        fs::create_dir_all(tx_db.parent().unwrap()).unwrap();
+        fs::write(&tx_db, b"tx").unwrap();
+        assert_eq!(
+            resolve_conversation_db_path(&paths, Some(&stdin)),
+            Some(canonical_or_parent(&tx_db))
+        );
+
+        // 1. Highest priority: <cli_dir>/conversations/<id>.db
+        let cli_db = custom_cli.join("conversations").join(format!("{id}.db"));
+        fs::create_dir_all(cli_db.parent().unwrap()).unwrap();
+        fs::write(&cli_db, b"cli").unwrap();
+        assert_eq!(
+            resolve_conversation_db_path(&paths, Some(&stdin)),
+            Some(canonical_or_parent(&cli_db))
+        );
+    }
+
+    #[test]
+    fn resolve_conversation_db_path_rejects_unsafe_ids_and_recovers_from_session_or_transcript() {
+        let tmp = TempDirGuard::new("ids");
+        let home = tmp.0.join("home");
+        let cli_dir = home.join(".gemini").join("antigravity-cli");
+        let paths = paths_for(&home, &cli_dir);
+
+        let safe_id = "c5ae584c-f578-47cf-96fb-3485852537e4";
+        let db = cli_dir.join("conversations").join(format!("{safe_id}.db"));
+        fs::create_dir_all(db.parent().unwrap()).unwrap();
+        fs::write(&db, b"db").unwrap();
+
+        // Unsafe conversation_id falls back to session_id
+        let via_session = AgyStdinData {
+            conversation_id: Some("../escape".to_string()),
+            session_id: Some(safe_id.to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_conversation_db_path(&paths, Some(&via_session)),
+            Some(canonical_or_parent(&db))
+        );
+
+        // Extracted strictly from transcript_path when conversation_id and session_id are absent
+        let via_tx = AgyStdinData {
+            transcript_path: Some(
+                home.join(".gemini")
+                    .join("antigravity")
+                    .join("brain")
+                    .join(safe_id)
+                    .join(".system_generated")
+                    .join("logs")
+                    .join("transcript.jsonl")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_conversation_db_path(&paths, Some(&via_tx)),
+            Some(canonical_or_parent(&db))
+        );
+
+        // Unsafe everywhere yields None
+        let unsafe_only = AgyStdinData {
+            conversation_id: Some("..".to_string()),
+            session_id: Some("a/b".to_string()),
+            transcript_path: Some(
+                "/tmp/brain/../.system_generated/logs/transcript.jsonl".to_string(),
+            ),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_conversation_db_path(&paths, Some(&unsafe_only)),
+            None
+        );
+    }
+
+    #[test]
+    fn db_ceiling_cache_path_uses_fnv64_hex_under_data_dir() {
+        let data_real = Path::new("/tmp/agy-hud-data");
+        let db_path = Path::new("/Users/alice/.gemini/antigravity-cli/conversations/abc.db");
+        let expected_hash = fnv1a_64_hex(&db_path.to_string_lossy());
+        let cache_path = db_ceiling_cache_path(data_real, db_path);
+        assert_eq!(
+            cache_path,
+            data_real
+                .join("db-ceilings")
+                .join(format!("{expected_hash}.json"))
+        );
+
+        let paths = paths_for(Path::new("/Users/alice"), Path::new("/Users/alice/.cli"));
+        assert_eq!(
+            paths.db_ceiling_file_for(db_path),
+            paths
+                .data_dir
+                .join("db-ceilings")
+                .join(format!("{expected_hash}.json"))
+        );
+    }
 }

@@ -1,9 +1,9 @@
 use crate::ansi::sanitize_text;
 use crate::transcript::parse_iso_ms;
 use crate::types::{
-    AgyStdinData, CachedQuotaSnapshot, ContextScaleMode, EffortFormatMode, GlyphMode,
-    LearnedCompactionState, ModelFormatMode, ModelStdin, PathLevels, QuotaBucketView, QuotaPace,
-    RawQuotaBucket,
+    AgyStdinData, CachedQuotaSnapshot, ContextScaleMode, DB_CEILING_VERSION, DbCeilingInfo,
+    EffortFormatMode, GlyphMode, LearnedCompactionState, ModelFormatMode, ModelStdin, PathLevels,
+    QuotaBucketView, QuotaPace, RawQuotaBucket,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -18,6 +18,7 @@ const KNOWN_CANONICAL_BUCKETS: &[&str] = &[
 #[derive(Debug, Clone, PartialEq)]
 pub struct ContextMetrics {
     pub has_data: bool,
+    pub ceiling_known: bool,
     pub used_percent: f64,
     pub remaining_percent: f64,
     pub used_tokens: Option<u64>,
@@ -75,11 +76,79 @@ fn extract_trailing_paren_effort(raw_name: &str) -> Option<&str> {
 
 const MAX_MODEL_FAMILY_BYTES: usize = 160;
 
-pub(crate) fn normalize_model_family_str(
-    raw_name: &str,
+const EFFORT_SUFFIXES_LONGEST_FIRST: [&str; 9] = [
+    "x-high", "xhigh", "medium", "thinking", "minimal", "high", "med", "low", "max",
+];
+
+fn strip_effort_suffix_once(s: &str, eff: &str, allow_underscore: bool) -> Option<usize> {
+    if s.len() <= eff.len() {
+        return None;
+    }
+    let split_idx = s.len() - eff.len();
+    if !s.is_char_boundary(split_idx) || !s[split_idx..].eq_ignore_ascii_case(eff) {
+        return None;
+    }
+    let sep = s.as_bytes()[split_idx - 1];
+    let sep_ok = sep == b'-' || sep.is_ascii_whitespace() || (allow_underscore && sep == b'_');
+    if sep_ok && !s[..split_idx - 1].trim().is_empty() {
+        Some(split_idx - 1)
+    } else {
+        None
+    }
+}
+
+fn strip_trailing_efforts(
+    mut s: String,
     explicit_effort: Option<&str>,
-) -> Option<String> {
-    let mut s = sanitize_text(raw_name).trim().to_string();
+    strip_any_known: bool,
+) -> String {
+    loop {
+        if s.ends_with(')')
+            && let Some(open) = s.rfind('(')
+        {
+            let inside = &s[open + 1..s.len() - 1];
+            let matches_effort = is_effort_token(inside)
+                || explicit_effort.is_some_and(|eff| inside.trim().eq_ignore_ascii_case(eff));
+            if !inside.contains('(') && matches_effort {
+                s.truncate(open);
+                s = s.trim_end().to_string();
+                continue;
+            }
+        }
+
+        if let Some(eff) = explicit_effort
+            && is_effort_token(eff)
+            && let Some(cut) = strip_effort_suffix_once(&s, eff, false)
+        {
+            s.truncate(cut);
+            s = s.trim_end().to_string();
+            continue;
+        }
+
+        if strip_any_known {
+            let mut cut_at = None;
+            for eff in EFFORT_SUFFIXES_LONGEST_FIRST {
+                if let Some(cut) = strip_effort_suffix_once(&s, eff, true) {
+                    cut_at = Some(cut);
+                    break;
+                }
+            }
+            if let Some(cut) = cut_at {
+                s.truncate(cut);
+                s = s.trim_end().to_string();
+                continue;
+            }
+        }
+
+        break;
+    }
+    s
+}
+
+/// Normalizes a raw model identifier or display name into a lowercase model-family string,
+/// stripping optional effort suffixes while preserving architectural qualifiers such as `(1M)`.
+pub fn normalize_model_family_str(raw_name: &str, explicit_effort: Option<&str>) -> Option<String> {
+    let s = sanitize_text(raw_name).trim().to_string();
     if s.is_empty() {
         return None;
     }
@@ -88,41 +157,7 @@ pub(crate) fn normalize_model_family_str(
         .map(|e| e.trim().to_ascii_lowercase())
         .filter(|e| !e.is_empty());
 
-    loop {
-        if s.ends_with(')')
-            && let Some(open) = s.rfind('(')
-        {
-            let inside = &s[open + 1..s.len() - 1];
-            let matches_effort = is_effort_token(inside)
-                || effort_clean
-                    .as_deref()
-                    .is_some_and(|eff| inside.trim().eq_ignore_ascii_case(eff));
-            if !inside.contains('(') && matches_effort {
-                s.truncate(open);
-                s = s.trim_end().to_string();
-                continue;
-            }
-        }
-
-        if let Some(ref eff) = effort_clean
-            && is_effort_token(eff)
-            && s.len() > eff.len()
-        {
-            let split_idx = s.len() - eff.len();
-            if s.is_char_boundary(split_idx) && s[split_idx..].eq_ignore_ascii_case(eff) {
-                let sep_b = s.as_bytes()[split_idx - 1];
-                if (sep_b == b'-' || sep_b.is_ascii_whitespace())
-                    && !s[..split_idx - 1].trim().is_empty()
-                {
-                    s.truncate(split_idx - 1);
-                    s = s.trim_end().to_string();
-                    continue;
-                }
-            }
-        }
-
-        break;
-    }
+    let s = strip_trailing_efforts(s, effort_clean.as_deref(), false);
 
     let mut normalized = s
         .split_whitespace()
@@ -160,6 +195,24 @@ pub fn normalize_model_family(model: Option<&ModelStdin>) -> Option<String> {
                 .filter(|s| !sanitize_text(s).trim().is_empty())
         })?;
     normalize_model_family_str(raw_candidate, model.effort.as_deref())
+}
+
+/// Returns `true` for shadow, utility, or image-generation models (`flash-lite`, `flash_lite`,
+/// `banana`, `image`, and non-digit-followed `m50` such as `M50` but not `m500`).
+#[must_use]
+pub fn is_shadow_or_utility_model(s: &str) -> bool {
+    let lower = s.to_ascii_lowercase();
+    if lower.contains("flash-lite")
+        || lower.contains("flash_lite")
+        || lower.contains("banana")
+        || lower.contains("image")
+    {
+        return true;
+    }
+    let bytes = lower.as_bytes();
+    lower
+        .match_indices("m50")
+        .any(|(idx, _)| !bytes.get(idx + 3).is_some_and(u8::is_ascii_digit))
 }
 
 /// Non-empty normalized `model_family` paired with `phys_win > 0`.
@@ -343,6 +396,7 @@ pub fn extract_context_metrics(stdin: Option<&AgyStdinData>) -> ContextMetrics {
     let Some(cw) = stdin.and_then(|s| s.context_window.as_ref()) else {
         return ContextMetrics {
             has_data: false,
+            ceiling_known: true,
             used_percent: 0.0,
             remaining_percent: 100.0,
             used_tokens: None,
@@ -406,6 +460,7 @@ pub fn extract_context_metrics(stdin: Option<&AgyStdinData>) -> ContextMetrics {
 
     ContextMetrics {
         has_data,
+        ceiling_known: true,
         used_percent,
         remaining_percent,
         used_tokens,
@@ -415,7 +470,6 @@ pub fn extract_context_metrics(stdin: Option<&AgyStdinData>) -> ContextMetrics {
     }
 }
 
-pub const DEFAULT_COMPACTION_CEILING_TOKENS: u64 = 256_000;
 pub const MIN_COMPACTION_OBSERVATION_TOKENS: u64 = 32_000;
 pub const COLD_START_LARGE_WINDOW_MIN_TOKENS: u64 = 900_000;
 
@@ -441,18 +495,19 @@ pub fn bypass_threshold_for(ceiling_tokens: u64, compaction_count: u32) -> u64 {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CompactionInputs {
     pub compaction_count: u32,
     pub last_compaction_tokens: Option<u64>,
     pub learned: Option<LearnedCompactionState>,
+    pub db_ceiling: Option<DbCeilingInfo>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CeilingSource {
+    DbGenMetadata,
     SessionCheckpoint,
     LearnedModelCache,
-    ColdStartDefault,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -462,6 +517,7 @@ pub enum EffectiveCeiling {
         source: CeilingSource,
     },
     PhysicalWindow,
+    Unknown,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -470,11 +526,151 @@ pub struct CompactionResolution {
     pub stale_bypass: Option<(u64, Option<u64>)>,
 }
 
-const _: () = assert!(COLD_START_LARGE_WINDOW_MIN_TOKENS > DEFAULT_COMPACTION_CEILING_TOKENS);
+/// Normalizes a model identifier or display name into a space-delimited, effort-stripped
+/// canonical key for cross-format equality matching (`claude-opus-5-5-medium` == `Claude Opus 5.5 (Medium)`).
+pub fn canonical_db_family_key(raw_name: &str) -> Option<String> {
+    let raw = sanitize_text(raw_name).trim().to_ascii_lowercase();
+    if raw.is_empty() {
+        return None;
+    }
+    let s = strip_trailing_efforts(raw, None, true);
 
-/// Precedence: `SessionCheckpoint` > `LearnedModelCache` > `Invalidated` > `ColdStartDefault` (`>= 900k`).
+    let mut out = String::with_capacity(s.len());
+    let mut prev_space = true;
+    for ch in s.chars() {
+        if matches!(ch, '-' | '_' | '.') || ch.is_ascii_whitespace() {
+            if !prev_space {
+                out.push(' ');
+                prev_space = true;
+            }
+        } else {
+            out.push(ch);
+            prev_space = false;
+        }
+    }
+    let trimmed = out.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+fn db_ceiling_matches_family(db: &DbCeilingInfo, active_model_family: Option<&str>) -> bool {
+    let active_family = active_model_family.and_then(|f| normalize_model_family_str(f, None));
+    let db_family = db
+        .model_family
+        .as_deref()
+        .and_then(|f| normalize_model_family_str(f, None))
+        .or_else(|| {
+            db.model_id
+                .as_deref()
+                .and_then(|id| normalize_model_family_str(id, None))
+        });
+    let (Some(act), Some(dbf)) = (active_family.as_deref(), db_family.as_deref()) else {
+        return true;
+    };
+    if act == dbf {
+        return true;
+    }
+    match (canonical_db_family_key(act), canonical_db_family_key(dbf)) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// Precedence: `DbGenMetadata`, then `SessionCheckpoint` (`1.25x` bypass), then
+/// `PhysWindowSmall` (`< 900k`), then `LearnedModelCache` (`1.15x` bypass to `PhysicalWindow`),
+/// and finally `EffectiveCeiling::Unknown`.
 /// `stale_bypass` fires only when `authoritative_current_usage_tokens` exceeds the threshold so
 /// cumulative session token fallbacks never poison cross-session model caches.
+pub fn resolve_compaction_ceiling_with_db(
+    phys_win: u64,
+    compaction: &CompactionInputs,
+    used_tokens: Option<u64>,
+    authoritative_current_usage_tokens: Option<u64>,
+    active_model_family: Option<&str>,
+) -> CompactionResolution {
+    if let Some(ref db) = compaction.db_ceiling
+        && db.version == DB_CEILING_VERSION
+        && (MIN_COMPACTION_OBSERVATION_TOKENS..=phys_win).contains(&db.ceiling_tokens)
+        && db_ceiling_matches_family(db, active_model_family)
+        && used_tokens.is_none_or(|u| {
+            u <= bypass_threshold_for(db.ceiling_tokens, compaction.compaction_count)
+        })
+    {
+        return CompactionResolution {
+            effective: EffectiveCeiling::Scaled {
+                ceiling_tokens: db.ceiling_tokens,
+                source: CeilingSource::DbGenMetadata,
+            },
+            stale_bypass: None,
+        };
+    }
+
+    let session_ceiling = compaction
+        .last_compaction_tokens
+        .and_then(snap_compaction_ceiling)
+        .filter(|&c| c < phys_win);
+
+    if let Some(c) = session_ceiling {
+        let threshold = bypass_threshold_for(c, compaction.compaction_count);
+        if used_tokens.is_some_and(|u| u > threshold) {
+            return CompactionResolution {
+                effective: EffectiveCeiling::PhysicalWindow,
+                stale_bypass: None,
+            };
+        }
+        return CompactionResolution {
+            effective: EffectiveCeiling::Scaled {
+                ceiling_tokens: c,
+                source: CeilingSource::SessionCheckpoint,
+            },
+            stale_bypass: None,
+        };
+    }
+
+    if phys_win < COLD_START_LARGE_WINDOW_MIN_TOKENS {
+        return CompactionResolution {
+            effective: EffectiveCeiling::PhysicalWindow,
+            stale_bypass: None,
+        };
+    }
+
+    match compaction.learned {
+        Some(LearnedCompactionState::Ceiling(c)) if c > 0 && c < phys_win => {
+            let threshold = bypass_threshold_for(c, compaction.compaction_count);
+            if used_tokens.is_some_and(|u| u > threshold) {
+                let stale_bypass = if compaction.compaction_count == 0
+                    && let Some(au) = authoritative_current_usage_tokens
+                    && au > threshold
+                {
+                    Some((au, Some(c)))
+                } else {
+                    None
+                };
+                CompactionResolution {
+                    effective: EffectiveCeiling::PhysicalWindow,
+                    stale_bypass,
+                }
+            } else {
+                CompactionResolution {
+                    effective: EffectiveCeiling::Scaled {
+                        ceiling_tokens: c,
+                        source: CeilingSource::LearnedModelCache,
+                    },
+                    stale_bypass: None,
+                }
+            }
+        }
+        Some(LearnedCompactionState::Invalidated) => CompactionResolution {
+            effective: EffectiveCeiling::PhysicalWindow,
+            stale_bypass: None,
+        },
+        _ => CompactionResolution {
+            effective: EffectiveCeiling::Unknown,
+            stale_bypass: None,
+        },
+    }
+}
+
+/// Precedence without DB metadata (`SessionCheckpoint`, `PhysWindowSmall`, `LearnedModelCache`, `Unknown`).
 pub fn resolve_compaction_ceiling(
     phys_win: u64,
     compaction_count: u32,
@@ -483,59 +679,19 @@ pub fn resolve_compaction_ceiling(
     used_tokens: Option<u64>,
     authoritative_current_usage_tokens: Option<u64>,
 ) -> CompactionResolution {
-    let session_ceiling = last_compaction_tokens
-        .and_then(snap_compaction_ceiling)
-        .filter(|&c| c < phys_win);
-
-    let (cand_ceiling, source, prev_learned_opt) = if let Some(c) = session_ceiling {
-        (c, CeilingSource::SessionCheckpoint, None)
-    } else if let Some(LearnedCompactionState::Ceiling(c)) = learned
-        && c > 0
-        && c < phys_win
-    {
-        (c, CeilingSource::LearnedModelCache, Some(c))
-    } else if matches!(learned, Some(LearnedCompactionState::Invalidated)) {
-        return CompactionResolution {
-            effective: EffectiveCeiling::PhysicalWindow,
-            stale_bypass: None,
-        };
-    } else if phys_win >= COLD_START_LARGE_WINDOW_MIN_TOKENS {
-        (
-            DEFAULT_COMPACTION_CEILING_TOKENS,
-            CeilingSource::ColdStartDefault,
-            None,
-        )
-    } else {
-        return CompactionResolution {
-            effective: EffectiveCeiling::PhysicalWindow,
-            stale_bypass: None,
-        };
+    let inputs = CompactionInputs {
+        compaction_count,
+        last_compaction_tokens,
+        learned,
+        db_ceiling: None,
     };
-
-    let threshold = bypass_threshold_for(cand_ceiling, compaction_count);
-    if used_tokens.is_some_and(|u| u > threshold) {
-        let stale_bypass = if compaction_count == 0
-            && source != CeilingSource::SessionCheckpoint
-            && let Some(au) = authoritative_current_usage_tokens
-            && au > threshold
-        {
-            Some((au, prev_learned_opt))
-        } else {
-            None
-        };
-        return CompactionResolution {
-            effective: EffectiveCeiling::PhysicalWindow,
-            stale_bypass,
-        };
-    }
-
-    CompactionResolution {
-        effective: EffectiveCeiling::Scaled {
-            ceiling_tokens: cand_ceiling,
-            source,
-        },
-        stale_bypass: None,
-    }
+    resolve_compaction_ceiling_with_db(
+        phys_win,
+        &inputs,
+        used_tokens,
+        authoritative_current_usage_tokens,
+        None,
+    )
 }
 
 pub fn extract_context_metrics_scaled(
@@ -551,28 +707,41 @@ pub fn extract_context_metrics_scaled(
         return raw;
     };
 
-    let resolution = resolve_compaction_ceiling(
+    let active_family = normalize_model_family(stdin.and_then(|s| s.model.as_ref()));
+    let resolution = resolve_compaction_ceiling_with_db(
         phys_win,
-        compaction.compaction_count,
-        compaction.last_compaction_tokens,
-        compaction.learned,
+        &compaction,
         Some(used_tok),
         raw.current_usage_tokens,
+        active_family.as_deref(),
     );
-    let EffectiveCeiling::Scaled { ceiling_tokens, .. } = resolution.effective else {
-        return raw;
-    };
-
-    let used_percent = ((used_tok as f64 / ceiling_tokens as f64) * 100.0).clamp(0.0, 100.0);
-    let remaining_percent = (100.0 - used_percent).max(0.0);
-
-    ContextMetrics {
-        used_percent,
-        remaining_percent,
-        window_size: Some(ceiling_tokens),
-        ..raw
+    match resolution.effective {
+        EffectiveCeiling::Scaled { ceiling_tokens, .. } => {
+            let used_percent =
+                ((used_tok as f64 / ceiling_tokens as f64) * 100.0).clamp(0.0, 100.0);
+            let remaining_percent = (100.0 - used_percent).max(0.0);
+            ContextMetrics {
+                ceiling_known: true,
+                used_percent,
+                remaining_percent,
+                window_size: Some(ceiling_tokens),
+                ..raw
+            }
+        }
+        EffectiveCeiling::PhysicalWindow => raw,
+        EffectiveCeiling::Unknown => ContextMetrics {
+            ceiling_known: false,
+            used_percent: 0.0,
+            remaining_percent: 100.0,
+            window_size: None,
+            ..raw
+        },
     }
 }
+
+/// Timestamps on or before `2000-01-01T00:00:00Z` (e.g. `1970-01-01`, `0001-01-01`) are
+/// sentinel placeholders emitted by uninitialized API fields and treated as invalid.
+pub const SENTINEL_RESET_CUTOFF_MS: i64 = 946_684_800_000;
 
 fn clean_quota_label(bucket_id: &str) -> String {
     let clean = sanitize_text(bucket_id);
@@ -599,18 +768,59 @@ fn clean_quota_label(bucket_id: &str) -> String {
     }
 }
 
+fn is_nonneg_finite(v: f64) -> bool {
+    v.is_finite() && v >= 0.0
+}
+
+/// Normalizes remaining fraction for a quota bucket, inferring `0.0` (100% used) when Proto3
+/// omits `remaining_fraction` (`None`) and `remaining_amount` (`None`) on an active non-disabled
+/// bucket with a valid non-sentinel future `reset_time`.
+pub(crate) fn effective_remaining_fraction(raw: &RawQuotaBucket, now_ms: i64) -> Option<f64> {
+    if raw.disabled == Some(true) {
+        return None;
+    }
+    let parsed_rt = raw.reset_time.as_deref().and_then(parse_iso_ms);
+    if let Some(rt_ms) = parsed_rt
+        && (rt_ms <= SENTINEL_RESET_CUTOFF_MS || (now_ms > 0 && rt_ms <= now_ms))
+    {
+        return None;
+    }
+    if let Some(frac) = raw.remaining_fraction {
+        return is_nonneg_finite(frac).then(|| frac.clamp(0.0, 1.0));
+    }
+    if raw.remaining_amount.is_some() {
+        return None;
+    }
+    parsed_rt.map(|_| 0.0)
+}
+
 fn is_bucket_active(raw: &RawQuotaBucket, now_ms: i64) -> bool {
     if raw.disabled.unwrap_or(false) {
         return false;
     }
-    if now_ms > 0
-        && let Some(rt_str) = raw.reset_time.as_deref()
+    if let Some(rt_str) = raw.reset_time.as_deref()
         && let Some(rt_ms) = parse_iso_ms(rt_str)
-        && rt_ms <= now_ms
     {
-        return false;
+        if rt_ms <= SENTINEL_RESET_CUTOFF_MS {
+            return false;
+        }
+        if now_ms > 0 && rt_ms <= now_ms {
+            return false;
+        }
     }
-    true
+    let has_rem_frac = effective_remaining_fraction(raw, now_ms).is_some();
+    let has_rem_amt = raw.remaining_amount.is_some_and(is_nonneg_finite);
+    has_rem_frac || has_rem_amt
+}
+
+fn normalize_active_bucket(raw: &RawQuotaBucket, now_ms: i64) -> RawQuotaBucket {
+    RawQuotaBucket {
+        remaining_fraction: effective_remaining_fraction(raw, now_ms),
+        remaining_amount: raw.remaining_amount.filter(|&v| is_nonneg_finite(v)),
+        reset_time: raw.reset_time.clone(),
+        reset_in_seconds: raw.reset_in_seconds,
+        disabled: raw.disabled,
+    }
 }
 
 fn merge_active_buckets(
@@ -626,23 +836,25 @@ fn merge_active_buckets(
             let o_rt = o.reset_time.as_deref().and_then(parse_iso_ms);
             let c_rt = c.reset_time.as_deref().and_then(parse_iso_ms);
             if let (Some(o_ms), Some(c_ms)) = (o_rt, c_rt) {
-                if o_ms > c_ms + 60_000 {
-                    return Some(o.clone());
+                if o_ms > c_ms.saturating_add(60_000) {
+                    return Some(normalize_active_bucket(o, now_ms));
                 }
-                if c_ms > o_ms + 60_000 {
-                    return Some(c.clone());
+                if c_ms > o_ms.saturating_add(60_000) {
+                    return Some(normalize_active_bucket(c, now_ms));
                 }
             }
-            let remaining_fraction = match (o.remaining_fraction, c.remaining_fraction) {
-                (Some(a), Some(b)) if a.is_finite() && b.is_finite() => Some(a.min(b)),
-                (Some(a), _) if a.is_finite() => Some(a),
-                (_, Some(b)) if b.is_finite() => Some(b),
-                _ => None,
+            let o_frac = effective_remaining_fraction(o, now_ms);
+            let c_frac = effective_remaining_fraction(c, now_ms);
+            let remaining_fraction = match (o_frac, c_frac) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (Some(a), None) => Some(a),
+                (None, Some(b)) => Some(b),
+                (None, None) => None,
             };
             let remaining_amount = match (o.remaining_amount, c.remaining_amount) {
-                (Some(a), Some(b)) if a.is_finite() && b.is_finite() => Some(a.min(b)),
-                (Some(a), _) if a.is_finite() => Some(a),
-                (_, Some(b)) if b.is_finite() => Some(b),
+                (Some(a), Some(b)) if is_nonneg_finite(a) && is_nonneg_finite(b) => Some(a.min(b)),
+                (Some(a), _) if is_nonneg_finite(a) => Some(a),
+                (_, Some(b)) if is_nonneg_finite(b) => Some(b),
                 _ => None,
             };
             Some(RawQuotaBucket {
@@ -653,28 +865,32 @@ fn merge_active_buckets(
                 disabled: Some(false),
             })
         }
-        (Some(o), None) => Some(o.clone()),
-        (None, Some(c)) => Some(c.clone()),
+        (Some(o), None) => Some(normalize_active_bucket(o, now_ms)),
+        (None, Some(c)) => Some(normalize_active_bucket(c, now_ms)),
         (None, None) => None,
     }
 }
 
 fn bucket_to_view(id: &str, raw: &RawQuotaBucket, now_ms: i64) -> Option<QuotaBucketView> {
+    if !is_bucket_active(raw, now_ms) {
+        return None;
+    }
     let mut remaining_percent = None;
     let mut used_percent = None;
-    if let Some(frac_raw) = raw.remaining_fraction
-        && frac_raw.is_finite()
-    {
-        let frac = frac_raw.clamp(0.0, 1.0);
+    if let Some(frac) = effective_remaining_fraction(raw, now_ms) {
         remaining_percent = Some((frac * 1000.0).round() / 10.0);
         used_percent = Some(((1.0 - frac) * 1000.0).round() / 10.0);
     }
-    let remaining_amount = raw.remaining_amount.filter(|v| v.is_finite());
+    let remaining_amount = raw.remaining_amount.filter(|&v| is_nonneg_finite(v));
+    let parsed_rt_ms = raw.reset_time.as_deref().and_then(parse_iso_ms);
     let reset_in_seconds = if now_ms > 0
-        && let Some(rt_ms) = raw.reset_time.as_deref().and_then(parse_iso_ms)
+        && let Some(rt_ms) = parsed_rt_ms
+        && rt_ms > SENTINEL_RESET_CUTOFF_MS
         && rt_ms > now_ms
     {
         Some(((rt_ms - now_ms) as f64) / 1000.0)
+    } else if parsed_rt_ms.is_some_and(|rt_ms| rt_ms <= SENTINEL_RESET_CUTOFF_MS) {
+        None
     } else {
         raw.reset_in_seconds.filter(|v| v.is_finite() && *v >= 0.0)
     };
@@ -696,8 +912,9 @@ pub fn extract_quota_buckets(stdin: Option<&AgyStdinData>) -> Vec<QuotaBucketVie
     extract_quota_buckets_reconciled(stdin, None, 0)
 }
 
-/// Extracts model-appropriate quota buckets while filtering expired windows (`reset_time <= now_ms`)
-/// and monotonically reconciling optional cached `/usage` snapshots within the same active window.
+/// Extracts model-appropriate quota buckets while filtering empty, sentinel, or expired windows
+/// (`reset_time <= SENTINEL_RESET_CUTOFF_MS` or `reset_time <= now_ms`) and monotonically
+/// reconciling optional cached `/usage` snapshots within the same active window.
 pub fn extract_quota_buckets_reconciled(
     stdin: Option<&AgyStdinData>,
     cached: Option<&CachedQuotaSnapshot>,
@@ -709,28 +926,34 @@ pub fn extract_quota_buckets_reconciled(
         return Vec::new();
     }
 
-    let mut all_ids = BTreeSet::new();
+    let mut candidate_ids = BTreeSet::new();
     if let Some(m) = official_map {
-        all_ids.extend(m.keys().cloned());
+        candidate_ids.extend(m.keys().cloned());
     }
     if let Some(m) = cached_map {
-        all_ids.extend(m.keys().cloned());
+        candidate_ids.extend(m.keys().cloned());
     }
-    if all_ids.is_empty() {
+    if candidate_ids.is_empty() {
         return Vec::new();
     }
 
-    let has_canonical_source = KNOWN_CANONICAL_BUCKETS.iter().any(|k| all_ids.contains(*k));
-    let source_has_argon = all_ids.contains("gemini-argon-wtu-weekly");
-
+    // Filter out empty, sentinel, disabled, and expired buckets BEFORE canonical/argon routing.
     let mut merged: BTreeMap<String, RawQuotaBucket> = BTreeMap::new();
-    for id in &all_ids {
+    for id in &candidate_ids {
         let off = official_map.and_then(|m| m.get(id));
         let cac = cached_map.and_then(|m| m.get(id));
         if let Some(reconciled) = merge_active_buckets(off, cac, now_ms) {
             merged.insert(id.clone(), reconciled);
         }
     }
+    if merged.is_empty() {
+        return Vec::new();
+    }
+
+    let has_canonical_source = KNOWN_CANONICAL_BUCKETS
+        .iter()
+        .any(|k| merged.contains_key(*k));
+    let source_has_argon = merged.contains_key("gemini-argon-wtu-weekly");
 
     if !has_canonical_source {
         return merged
@@ -945,4 +1168,357 @@ pub fn format_workspace_breadcrumb(
         GlyphMode::Unicode | GlyphMode::Nerd => "›",
     };
     format!("{proj_name} {sep} {short_cur}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{ContextWindowStdin, CurrentUsageStdin, DbCeilingSource};
+
+    #[test]
+    fn sentinel_cutoff_is_exact_2000_01_01_utc() {
+        assert_eq!(
+            parse_iso_ms("2000-01-01T00:00:00Z"),
+            Some(SENTINEL_RESET_CUTOFF_MS)
+        );
+        assert_eq!(SENTINEL_RESET_CUTOFF_MS, 946_684_800_000);
+    }
+
+    #[test]
+    fn quota_zero_percent_resilience_and_sentinel_filtering() {
+        let now_ms = 1_794_218_400_000i64; // 2026-11-09T10:00:00Z
+        let future_reset = "2099-01-01T00:00:00Z".to_string();
+
+        // 1. Proto3 omitted `remaining_fraction` with valid future `reset_time` -> 0.0 remaining (100% used)
+        let exhausted = RawQuotaBucket {
+            remaining_fraction: None,
+            remaining_amount: None,
+            reset_time: Some(future_reset.clone()),
+            reset_in_seconds: None,
+            disabled: None,
+        };
+        assert_eq!(effective_remaining_fraction(&exhausted, now_ms), Some(0.0));
+        assert_eq!(effective_remaining_fraction(&exhausted, 0), Some(0.0));
+        assert!(is_bucket_active(&exhausted, now_ms));
+
+        // 2. Sentinel timestamps (<= 2000-01-01) and empty/disabled buckets are dropped
+        for bad in [
+            RawQuotaBucket::default(),
+            RawQuotaBucket {
+                remaining_fraction: None,
+                remaining_amount: None,
+                reset_time: Some("1970-01-01T00:00:00Z".to_string()),
+                reset_in_seconds: None,
+                disabled: None,
+            },
+            RawQuotaBucket {
+                remaining_fraction: Some(0.8),
+                remaining_amount: None,
+                reset_time: Some("0001-01-01T00:00:00Z".to_string()),
+                reset_in_seconds: None,
+                disabled: None,
+            },
+            RawQuotaBucket {
+                remaining_fraction: None,
+                remaining_amount: None,
+                reset_time: Some("2000-01-01T00:00:00Z".to_string()),
+                reset_in_seconds: None,
+                disabled: None,
+            },
+            RawQuotaBucket {
+                remaining_fraction: None,
+                remaining_amount: None,
+                reset_time: Some(future_reset.clone()),
+                reset_in_seconds: None,
+                disabled: Some(true),
+            },
+            RawQuotaBucket {
+                remaining_fraction: None,
+                remaining_amount: None,
+                reset_time: Some("2020-01-01T00:00:00Z".to_string()),
+                reset_in_seconds: None,
+                disabled: None,
+            },
+        ] {
+            assert!(!is_bucket_active(&bad, now_ms), "should drop {bad:?}");
+            assert_eq!(effective_remaining_fraction(&bad, now_ms), None);
+        }
+
+        // 3. `remaining_amount` present without `remaining_fraction` does NOT synthesize 0.0
+        let amt_only = RawQuotaBucket {
+            remaining_fraction: None,
+            remaining_amount: Some(12.0),
+            reset_time: Some(future_reset.clone()),
+            reset_in_seconds: None,
+            disabled: None,
+        };
+        assert_eq!(effective_remaining_fraction(&amt_only, now_ms), None);
+        assert!(is_bucket_active(&amt_only, now_ms));
+
+        // 4. Live exhausted (`None -> 0.0`) beats stale cached `0.35` in `merge_active_buckets`
+        let stale_cached = RawQuotaBucket {
+            remaining_fraction: Some(0.35),
+            remaining_amount: None,
+            reset_time: Some(future_reset.clone()),
+            reset_in_seconds: None,
+            disabled: None,
+        };
+        let merged = merge_active_buckets(Some(&exhausted), Some(&stale_cached), now_ms)
+            .expect("merged active bucket");
+        assert_eq!(merged.remaining_fraction, Some(0.0));
+
+        // 5. Empty argon placeholder is dropped BEFORE `source_has_argon` routing
+        let mut quota_map = BTreeMap::new();
+        quota_map.insert(
+            "gemini-argon-wtu-weekly".to_string(),
+            RawQuotaBucket::default(),
+        );
+        quota_map.insert(
+            "gemini-5h".to_string(),
+            RawQuotaBucket {
+                remaining_fraction: None,
+                remaining_amount: None,
+                reset_time: Some(future_reset),
+                reset_in_seconds: None,
+                disabled: None,
+            },
+        );
+        let stdin = AgyStdinData {
+            model: Some(ModelStdin {
+                id: Some("Gemini 4 Argon".to_string()),
+                display_name: Some("Gemini 4 Argon".to_string()),
+                effort: None,
+            }),
+            quota: Some(quota_map),
+            ..Default::default()
+        };
+        let views = extract_quota_buckets_reconciled(Some(&stdin), None, now_ms);
+        assert_eq!(views.len(), 1);
+        assert_eq!(views[0].id, "gemini-5h");
+        assert_eq!(views[0].used_percent, Some(100.0));
+        assert_eq!(views[0].remaining_percent, Some(0.0));
+
+        // 6. Proto3 string `remaining_amount: "0"` deserializes cleanly and negative fraction/amount are rejected
+        let proto3_stdin: AgyStdinData = serde_json::from_str(&format!(
+            r#"{{
+                "quota": {{
+                    "credits-str": {{"remaining_amount": "0", "reset_time": "{}"}},
+                    "neg-frac": {{"remaining_fraction": -0.25, "reset_time": "{}"}},
+                    "neg-amt": {{"remaining_amount": "-5", "reset_time": "{}"}},
+                    "neg-amt-num": {{"remaining_amount": -1.0}}
+                }}
+            }}"#,
+            "2099-01-01T00:00:00Z", "2099-01-01T00:00:00Z", "2099-01-01T00:00:00Z"
+        ))
+        .expect("deserializes Proto3 string remaining_amount");
+        let str_views = extract_quota_buckets_reconciled(Some(&proto3_stdin), None, now_ms);
+        assert_eq!(str_views.len(), 1);
+        assert_eq!(str_views[0].id, "credits-str");
+        assert_eq!(str_views[0].remaining_amount, Some(0.0));
+        assert_eq!(str_views[0].used_percent, None);
+    }
+
+    #[test]
+    fn db_ceiling_precedence_family_validation_and_unknown_cold_start() {
+        let argon_db = DbCeilingInfo::new(
+            840_000,
+            DbCeilingSource::GenMetadata,
+            Some("gemini-4-argon".to_string()),
+            Some("gemini 4 argon".to_string()),
+        );
+        let exec_db = DbCeilingInfo::new(512_000, DbCeilingSource::ExecutorMetadata, None, None);
+
+        // 1. DbGenMetadata beats SessionCheckpoint and LearnedModelCache when valid & family matches
+        let res_db = resolve_compaction_ceiling_with_db(
+            1_048_576,
+            &CompactionInputs {
+                compaction_count: 1,
+                last_compaction_tokens: Some(256_500),
+                learned: Some(LearnedCompactionState::Ceiling(256_000)),
+                db_ceiling: Some(argon_db.clone()),
+            },
+            Some(152_000),
+            Some(152_000),
+            Some("gemini 4 argon"),
+        );
+        assert_eq!(
+            res_db.effective,
+            EffectiveCeiling::Scaled {
+                ceiling_tokens: 840_000,
+                source: CeilingSource::DbGenMetadata,
+            }
+        );
+
+        // 2. Family mismatch rejects DbGenMetadata and falls through to SessionCheckpoint / Unknown
+        let res_mismatch = resolve_compaction_ceiling_with_db(
+            1_048_576,
+            &CompactionInputs {
+                db_ceiling: Some(argon_db),
+                ..Default::default()
+            },
+            Some(152_000),
+            Some(152_000),
+            Some("gemini 3 flash"),
+        );
+        assert_eq!(res_mismatch.effective, EffectiveCeiling::Unknown);
+
+        // 3. ExecutorMetadata with unknown DB model family is still accepted
+        let res_exec = resolve_compaction_ceiling_with_db(
+            1_048_576,
+            &CompactionInputs {
+                db_ceiling: Some(exec_db),
+                ..Default::default()
+            },
+            Some(152_000),
+            Some(152_000),
+            Some("gemini 4 argon"),
+        );
+        assert_eq!(
+            res_exec.effective,
+            EffectiveCeiling::Scaled {
+                ceiling_tokens: 512_000,
+                source: CeilingSource::DbGenMetadata,
+            }
+        );
+
+        // 4. PhysWindowSmall (< 900k) beats LearnedModelCache
+        let res_small = resolve_compaction_ceiling_with_db(
+            524_288,
+            &CompactionInputs {
+                learned: Some(LearnedCompactionState::Ceiling(256_000)),
+                ..Default::default()
+            },
+            Some(152_000),
+            Some(152_000),
+            Some("gemini 4 argon"),
+        );
+        assert_eq!(res_small.effective, EffectiveCeiling::PhysicalWindow);
+
+        // 5. Out-of-range DbGenMetadata (< 32k or > phys_win) is rejected
+        let tiny_db = DbCeilingInfo::new(16_000, DbCeilingSource::GenMetadata, None, None);
+        let huge_db = DbCeilingInfo::new(2_000_000, DbCeilingSource::GenMetadata, None, None);
+        for bad in [tiny_db, huge_db] {
+            let res_bad = resolve_compaction_ceiling_with_db(
+                1_048_576,
+                &CompactionInputs {
+                    db_ceiling: Some(bad),
+                    ..Default::default()
+                },
+                Some(152_000),
+                Some(152_000),
+                Some("gemini 4 argon"),
+            );
+            assert_eq!(res_bad.effective, EffectiveCeiling::Unknown);
+        }
+
+        // 6. `ceiling_known` is false ONLY for EffectiveCeiling::Unknown
+        let cold_stdin = AgyStdinData {
+            model: Some(ModelStdin {
+                id: Some("Gemini 4 Argon".to_string()),
+                display_name: Some("Gemini 4 Argon".to_string()),
+                effort: None,
+            }),
+            context_window: Some(ContextWindowStdin {
+                context_window_size: Some(1_048_576),
+                used_percentage: Some(14.5),
+                current_usage: Some(CurrentUsageStdin {
+                    input_tokens: Some(152_000),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let unknown_metrics = extract_context_metrics_scaled(
+            Some(&cold_stdin),
+            ContextScaleMode::Compaction,
+            CompactionInputs::default(),
+        );
+        assert!(!unknown_metrics.ceiling_known);
+        assert_eq!(unknown_metrics.window_size, None);
+        assert_eq!(unknown_metrics.used_tokens, Some(152_000));
+
+        let window_mode_metrics = extract_context_metrics_scaled(
+            Some(&cold_stdin),
+            ContextScaleMode::Window,
+            CompactionInputs::default(),
+        );
+        assert!(window_mode_metrics.ceiling_known);
+        assert_eq!(window_mode_metrics.window_size, Some(1_048_576));
+    }
+
+    #[test]
+    fn shadow_model_filter_matches_expected_tokens_only() {
+        for matched in [
+            "gemini-2.5-flash-lite",
+            "GEMINI_FLASH_LITE",
+            "nano-banana",
+            "gemini-2.5-flash-image",
+            "image-generator",
+            "M50",
+            "m50",
+            "MODEL_PLACEHOLDER_M50",
+            "m50-preview",
+        ] {
+            assert!(
+                is_shadow_or_utility_model(matched),
+                "expected match: {matched}"
+            );
+        }
+        for unmatched in [
+            "",
+            "m500",
+            "M500",
+            "gemini-m500",
+            "Gemini 4 Argon",
+            "gemini-3-flash",
+            "claude-sonnet-4.6",
+        ] {
+            assert!(
+                !is_shadow_or_utility_model(unmatched),
+                "unexpected match: {unmatched}"
+            );
+        }
+    }
+
+    #[test]
+    fn db_ceiling_matches_slug_and_display_name_while_rejecting_qualifiers_and_switches() {
+        let slug_only_db = DbCeilingInfo::new(
+            840_000,
+            DbCeilingSource::GenMetadata,
+            Some("claude-opus-5-5-medium".to_string()),
+            None,
+        );
+        assert!(db_ceiling_matches_family(
+            &slug_only_db,
+            Some("claude opus 5.5")
+        ));
+        assert!(!db_ceiling_matches_family(
+            &slug_only_db,
+            Some("claude sonnet 4.6")
+        ));
+
+        let display_db = DbCeilingInfo::new(
+            512_000,
+            DbCeilingSource::GenMetadata,
+            Some("gemini-4-hydrogen".to_string()),
+            Some("gemini 4 hydrogen".to_string()),
+        );
+        assert!(db_ceiling_matches_family(
+            &display_db,
+            Some("gemini-4-hydrogen-x-high")
+        ));
+        assert!(!db_ceiling_matches_family(
+            &display_db,
+            Some("gemini 4 argon (1m)")
+        ));
+
+        let qual_db = DbCeilingInfo::new(
+            1_048_576,
+            DbCeilingSource::GenMetadata,
+            Some("Gemini 4 Argon (1M)".to_string()),
+            Some("gemini 4 argon (1m)".to_string()),
+        );
+        assert!(!db_ceiling_matches_family(&qual_db, Some("gemini 4 argon")));
+    }
 }

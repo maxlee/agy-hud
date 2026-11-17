@@ -57,8 +57,8 @@
 | **运行状态与模式** | 实时 `空闲` / `思考中` / `调用工具` / `等待确认` 状态，`[计划]` / `[自动]` / `[接受]` 模式（自动识别 `/plan` 与 `VIM` 模式徽章） | `display.showState`, `display.showMode` |
 | **模型、档位与速率** | 模型简称、推理强度（`low`/`med`/`high`）、订阅档位（`Pro`/`Ultra`），以及剥离 `TTFT` 的真实生成速率 `~tok/s`、速度分档图标（`🐢`/`🛵`/`🚗`/`🚅`/`✈️`/`🚀`/`🛰️`/`🛸`/`👽`，`ascii` 模式下自动隐藏）与会话 `(min~max)` 速率区间 | `display.showModel`, `display.showPlanTier`, `display.showSpeed`, `display.glyphMode` |
 | **项目路径与 VCS** | 支持点击跳转的 `file://` OSC 8 目录链接（含可选 `项目根 › 子目录` 面包屑）、GitHub 分支点击跳转、`git`（含 Worktree、脏标记、`↑N` 未推送阈值变色、文件增删）、`jj` 与 `hg` | `display.showProject`, `display.showLaunchDir`, `vcs.pushWarningThreshold`, `vcs.showFileStats` |
-| **上下文与跨会话账本** | 按模型跨会话自动学习压缩水位线（`256k`、`512k` 等）的 1/8 精细进度条 + `↻N` 会话压缩计数徽章、Prompt `Cache` 命中率、当前/今日/本周累计花费（`今日` / `本周`）、内联计数（`子代理`、`后台`、`+N 排队`，以及默认关闭、来自上游 `agy` `stdin.artifact_count` 的可选 `产物` 计数）、沙箱徽章 | `display.contextScale`, `display.showContextBar`, `display.showDailyCost`, `display.showWeeklyCost`, `display.showCounts`, `display.showArtifacts` |
-| **配额消耗速率（Pace）** | 按当前模型智能路由配额桶（`5h` / `weekly`），实时预测重置前耗尽风险（`▲` 增速预警）、低占用自动隐藏阈值及重置倒计时 | `display.showQuota`, `display.quotaPace`, `display.quotaThreshold`, `quota.backgroundRefresh` |
+| **上下文与跨会话账本** | 首轮自动读取会话 DB 与按模型记忆压缩水位线（`256k`、`512k` 等；未确认大窗口诚实显示 `<used>/?`）的 1/8 精细进度条 + 显式/隐式 `↻N` 会话压缩计数徽章、Prompt `Cache` 命中率、当前/今日/本周累计花费（`今日` / `本周`）、内联计数（`子代理`、`后台`、`+N 排队`，以及默认关闭、来自上游 `agy` `stdin.artifact_count` 的可选 `产物` 计数）、沙箱徽章 | `display.contextScale`, `display.showContextBar`, `display.showDailyCost`, `display.showWeeklyCost`, `display.showCounts`, `display.showArtifacts` |
+| **配额消耗速率（Pace）** | 按当前模型智能路由配额桶（`5h` / `weekly`），支持耗尽 `0%` 桶识别与哨兵时间戳（`<= 2000-01-01`）过滤、耗尽速率预测（`▲` 增速预警）、低占用自动隐藏阈值及重置倒计时 | `display.showQuota`, `display.quotaPace`, `display.quotaThreshold`, `quota.backgroundRefresh` |
 | **活动明细与可组合行** | 同名工具调用折叠计数（`×N`）、`Skills` 与 `MCP` 服务（异常标红 `!`）、四态 `Subagents`（完成满 60 秒自动退场）、`task.md` 进度，以及自由并排合并与右对齐 | `display.mergeGroups`, `display.rightAlign`, `display.showTools`, `display.showSubagents`, `display.showTodos` |
 
 ---
@@ -66,6 +66,7 @@
 ## ✨ 核心特性
 
 - **⚡ 原生 ~1–3 ms 极致性能 + `O(Δ)` 增量游标**：LTO 裁剪后单二进制体积仅 `~930 KB`，无任何虚拟机冷启动开销；`std::thread::scope` 多线程并行采集，`transcript.jsonl` 支持增量字节偏移游标（`transcript-cursors/<fnv64>.json`），超长多 MB 会话依然完整保留早期激活的技能、MCP 与工具累计计数。
+- **📐 首轮会话 DB 上限、诚实冷启动与配额 `0%` 容错**：纯 Rust 严格只读解析当前会话 SQLite B-Tree 与已提交 `-wal` 页（零 C/SQLite 依赖，不创建 `-shm` 锁文件），在首轮对话即获取真实模型压缩上限；未确认 `>= 900k` 大窗口时如实展示中性 `<used>/?` 而不盲猜 `256k`；通过双阈值（下降 `> 5k` 且 `>= 25%`）精确识别隐式压缩并免疫影子模型与撤回/回退；同时还原 Proto3 省略的 `0%` 耗尽配额桶并过滤哨兵时间戳（`<= 2000-01-01`）。
 - **🎯 混合毫秒级 `~tok/s` 测速与配额增速预警（`▲`）**：精确剥离 `thinking`/Prefill 首字延迟（`TTFT`）与工具等待时间，并受 `display.showSpeed` 控制展示速度分档图标（`🐢` `<50`、`🛵` `50–99`、`🚗` `100–149`、`🚅` `150–199`、`✈️` `200–249`、`🚀` `250–299`、`🛰️` `300–399`、`🛸` `400–499`、`👽` `500+`；`display.glyphMode=ascii` 时隐藏）与会话 `(min~max)` 速率区间（由已完成步骤或原生 `stdin` 速率累积、跨模型切换保留、出现两个不同取整速率后展示）；同时 `display.quotaPace` 根据时间窗口剩余比例智能预测配额耗尽速度（提前亮起琥珀/红色 `▲`），`display.showDailyCost` / `showWeeklyCost` 跨会话幂等汇总今日/本周开销。
 - **🎨 完整字素簇宽度引擎与可组合布局**：零硬编码黑白灰前景色，深浅色主题通吃；纯 Rust 完整支持 Unicode Extended Grapheme Clusters（ZWJ 组合 Emoji、肤色修饰符、国旗双区域指示符、CJK 双列对齐），支持 `display.mergeGroups` 多行自由合并（窄屏自动堆叠并对齐中文进度条起始列）与 `display.rightAlign` 右对齐。
 - **🌿 纵深安全加固的 `git` / `jj` / `hg` 探针**：内置 Windows `CreateProcessW` 工作目录可执行劫持防御、作用域感知的 Git `[include]` 过滤器精准拆弹（保留全局 `git-lfs`，仅清空不可信仓库过滤器，异常过滤器名自动降级至零子进程 `.git/HEAD`）、GitHub 分支点击跳转与 `↑N` 未推送阈值变色提醒。
@@ -188,7 +189,7 @@ agy plugin install .
 # 配额低于 25% 时静默隐藏（若消耗增速过快触发 `▲` 预警则自动提前浮现）
 ~/.gemini/antigravity-cli/agy-hud/bin/agy-hud set display.quotaThreshold=25 display.quotaPace=true
 
-# 切换上下文分母刻度：compaction（默认，自动学习并记忆各模型压缩水位线）| window（展示模型物理总上限）
+# 切换上下文分母刻度：compaction（默认，优先读取会话 DB 与自动学习的压缩水位线）| window（展示模型物理总上限）
 ~/.gemini/antigravity-cli/agy-hud/bin/agy-hud set display.contextScale=compaction
 
 # 切换图标字符集：unicode（默认）| nerd（Nerd Fonts）| ascii（纯 7-bit 安全字符）

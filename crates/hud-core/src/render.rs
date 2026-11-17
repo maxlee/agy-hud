@@ -12,10 +12,10 @@ use crate::stdin::{
     normalize_plan_tier,
 };
 use crate::types::{
-    AgyStdinData, CachedQuotaSnapshot, ContextValueMode, CostTotals, GlyphMode, HUD_VERSION,
-    LearnedCompactionState, LineLayout, MemoryProbeInfo, ModelFormatMode, PathLevels, QuotaPace,
-    QuotaValueMode, SubagentEntry, SubagentStatus, TodoStatus, ToolStatus, TranscriptSummary,
-    UpdateCacheSnapshot, VcsProbeInfo,
+    AgyStdinData, CachedQuotaSnapshot, ContextValueMode, CostTotals, DbCeilingInfo, GlyphMode,
+    HUD_VERSION, LearnedCompactionState, LineLayout, MemoryProbeInfo, ModelFormatMode, PathLevels,
+    QuotaPace, QuotaValueMode, SubagentEntry, SubagentStatus, TodoStatus, ToolStatus,
+    TranscriptSummary, UpdateCacheSnapshot, VcsProbeInfo,
 };
 
 pub struct RenderInput<'a> {
@@ -34,6 +34,8 @@ pub struct RenderInput<'a> {
 pub struct RenderExtras<'a> {
     pub cost_totals: Option<&'a CostTotals>,
     pub compaction_ceiling: Option<LearnedCompactionState>,
+    /// Authoritative session compaction ceiling from `conversations/<id>.db` (parsed from `ProbeAnswers::db_ceiling`).
+    pub db_ceiling: Option<&'a DbCeilingInfo>,
     pub use_short_hud_cmd: bool,
     pub use_short_update_cmd: bool,
 }
@@ -351,7 +353,7 @@ struct MetricsOpts {
 fn render_context_segment(
     stdin: Option<&AgyStdinData>,
     transcript: &TranscriptSummary,
-    compaction_ceiling: Option<LearnedCompactionState>,
+    extras: RenderExtras<'_>,
     config: &HudConfig,
     labels: &Labels,
     effective_width: Option<usize>,
@@ -364,23 +366,10 @@ fn render_context_segment(
         CompactionInputs {
             compaction_count: transcript.compaction_count,
             last_compaction_tokens: transcript.last_compaction_tokens,
-            learned: compaction_ceiling,
+            learned: extras.compaction_ceiling,
+            db_ceiling: extras.db_ceiling.cloned(),
         },
     );
-    let pct_str = format!("{:.1}%", metrics.used_percent);
-    let rem_str = format!(
-        "{:.1}% {}",
-        metrics.remaining_percent, labels.metrics.remaining
-    );
-    let tok_str = match (metrics.used_tokens, metrics.window_size) {
-        (Some(u), Some(w)) => Some(format!(
-            "{}/{}",
-            format_compact_tokens(u),
-            format_compact_tokens(w)
-        )),
-        (Some(u), None) => Some(format_compact_tokens(u)),
-        _ => None,
-    };
 
     let compaction_badge = if opts.show_compactions && transcript.compaction_count > 0 {
         let raw_badge = match gm {
@@ -400,6 +389,62 @@ fn render_context_segment(
         GlyphMode::Ascii => " . ",
         GlyphMode::Unicode | GlyphMode::Nerd => " · ",
     };
+    let cache_part = match (opts.show_cache_hit_rate, metrics.cache_hit_percent) {
+        (true, Some(hit)) => {
+            let prefix = if gm == GlyphMode::Ascii { "" } else { "⚡ " };
+            format!(
+                "{}{}",
+                dot(gm),
+                paint(
+                    &format!("{prefix}{hit}% {}", labels.metrics.cache),
+                    &[colors::CYAN]
+                )
+            )
+        }
+        _ => String::new(),
+    };
+
+    if !metrics.ceiling_known {
+        let used_str = metrics
+            .used_tokens
+            .map(format_compact_tokens)
+            .unwrap_or_else(|| "?".to_string());
+        let ratio = format!("{}{}", paint(&used_str, &[BOLD]), paint("/?", &[DIM]));
+        let value_text = match (opts.context_value, compaction_badge) {
+            (ContextValueMode::Tokens, Some(badge)) => {
+                format!("{ratio}{}{badge}", paint(mid_dot, &[DIM]))
+            }
+            (_, Some(badge)) => {
+                format!(
+                    "{ratio} {}{}{}",
+                    paint("(", &[DIM]),
+                    badge,
+                    paint(")", &[DIM])
+                )
+            }
+            (_, None) => ratio,
+        };
+        return format!(
+            "{} {value_text}{cache_part}",
+            paint(labels.metrics.context, &[DIM]),
+        );
+    }
+
+    let pct_str = format!("{:.1}%", metrics.used_percent);
+    let rem_str = format!(
+        "{:.1}% {}",
+        metrics.remaining_percent, labels.metrics.remaining
+    );
+    let tok_str = match (metrics.used_tokens, metrics.window_size) {
+        (Some(u), Some(w)) => Some(format!(
+            "{}/{}",
+            format_compact_tokens(u),
+            format_compact_tokens(w)
+        )),
+        (Some(u), None) => Some(format_compact_tokens(u)),
+        _ => None,
+    };
+
     let num_styles: &[&str] =
         if metrics.used_percent >= (config.display.context_critical_threshold as f64) {
             &[colors::RED, BOLD]
@@ -489,21 +534,6 @@ fn render_context_segment(
         )
     } else {
         String::new()
-    };
-
-    let cache_part = match (opts.show_cache_hit_rate, metrics.cache_hit_percent) {
-        (true, Some(hit)) => {
-            let prefix = if gm == GlyphMode::Ascii { "" } else { "⚡ " };
-            format!(
-                "{}{}",
-                dot(gm),
-                paint(
-                    &format!("{prefix}{hit}% {}", labels.metrics.cache),
-                    &[colors::CYAN]
-                )
-            )
-        }
-        _ => String::new(),
     };
 
     format!(
@@ -1531,7 +1561,7 @@ fn build_context_meta_line(
     let ctx_seg = render_context_segment(
         stdin,
         transcript,
-        extras.compaction_ceiling,
+        extras,
         config,
         labels,
         effective_width,
@@ -1618,7 +1648,7 @@ fn build_metrics_line(
     metrics_parts.push(render_context_segment(
         stdin,
         transcript,
-        extras.compaction_ceiling,
+        extras,
         config,
         labels,
         effective_width,

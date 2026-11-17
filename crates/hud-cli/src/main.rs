@@ -17,9 +17,9 @@ use hud_core::commands::{CommandContext, execute_subcommand};
 use hud_core::config::{MAX_CONFIG_BYTES, parse_config_str};
 use hud_core::probes::{
     apply_speed_cache, parse_cached_quota_info, parse_compaction_ceiling_info,
-    parse_compaction_ceiling_record, parse_cost_ledger_info, parse_memory_info,
-    parse_speed_cache_info, parse_update_cache_info, parse_vcs_info, reconcile_compaction_ceiling,
-    reconcile_cost_ledger,
+    parse_compaction_ceiling_record, parse_cost_ledger_info, parse_db_ceiling_info,
+    parse_memory_info, parse_speed_cache_info, parse_update_cache_info, parse_vcs_info,
+    reconcile_compaction_ceiling, reconcile_cost_ledger,
 };
 use hud_core::render::{
     RenderExtras, RenderInput, format_config_problem_line_with_cmd, render_hud_lines_full,
@@ -680,6 +680,7 @@ fn run() -> u8 {
     let memory = parse_memory_info(&collected.probes);
     let cached_quota = parse_cached_quota_info(&collected.probes);
     let update_info = parse_update_cache_info(&collected.probes);
+    let db_ceiling = parse_db_ceiling_info(&collected.probes);
     let columns = stdin_payload.terminal_width.filter(|&w| w > 0);
     let unprefixed = detect_unprefixed_skills(&paths);
     let use_short_hud_cmd = unprefixed.hud == "installed";
@@ -700,6 +701,7 @@ fn run() -> u8 {
         RenderExtras {
             cost_totals: cost_totals.as_ref(),
             compaction_ceiling: learned_ceiling,
+            db_ceiling: db_ceiling.as_ref(),
             use_short_hud_cmd,
             use_short_update_cmd,
         },

@@ -3,7 +3,8 @@ use hud_core::commands::{CommandContext, execute_subcommand};
 use hud_core::config::parse_config_str;
 use hud_core::probes::{
     parse_cached_quota_info, parse_compaction_ceiling_info, parse_cost_ledger_info,
-    parse_memory_info, parse_vcs_info, reconcile_compaction_ceiling, reconcile_cost_ledger,
+    parse_db_ceiling_info, parse_memory_info, parse_vcs_info, reconcile_compaction_ceiling,
+    reconcile_cost_ledger,
 };
 use hud_core::render::{RenderExtras, RenderInput, render_hud_lines_full};
 use hud_core::stdin::CompactionScope;
@@ -64,6 +65,8 @@ fn evaluate_corpus_case(case: &CorpusCase) -> Result<(), String> {
         .0
     });
 
+    let db_ceiling = parse_db_ceiling_info(&case.probes);
+
     let live_cols = case
         .columns
         .or_else(|| case.stdin.as_ref().and_then(|s| s.terminal_width));
@@ -82,6 +85,7 @@ fn evaluate_corpus_case(case: &CorpusCase) -> Result<(), String> {
         RenderExtras {
             cost_totals: cost_totals.as_ref(),
             compaction_ceiling,
+            db_ceiling: db_ceiling.as_ref(),
             ..RenderExtras::default()
         },
     );

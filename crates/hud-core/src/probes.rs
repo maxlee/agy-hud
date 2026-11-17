@@ -1,7 +1,8 @@
 use crate::ansi::sanitize_text;
 use crate::stdin::{
-    CompactionScope, MIN_COMPACTION_OBSERVATION_TOKENS, extract_context_metrics,
-    normalize_model_family_str, resolve_compaction_ceiling, snap_compaction_ceiling,
+    CompactionScope, MIN_COMPACTION_OBSERVATION_TOKENS, SENTINEL_RESET_CUTOFF_MS,
+    effective_remaining_fraction, extract_context_metrics, normalize_model_family_str,
+    resolve_compaction_ceiling, snap_compaction_ceiling,
 };
 use crate::transcript::{
     MAX_VALID_TPS_X10, MIN_VALID_TPS_X10, adjust_coarse_dt_ms, blend_tps_ewma_x10, compute_tps_x10,
@@ -11,8 +12,9 @@ use crate::transcript::{
 use crate::types::{
     ActiveSpeedSample, AgyStdinData, COMPACTION_CEILING_VERSION, CachedQuotaSnapshot,
     CompactionCeilingRecord, CompactionCeilingState, CostLedgerSnapshot, CostTotals,
-    LearnedCompactionState, MemoryProbeInfo, ProbeAnswers, RawQuotaBucket, SessionCostEntry,
-    SpeedCacheSnapshot, TranscriptSummary, UpdateCacheSnapshot, VcsProbeInfo, VcsType,
+    DB_CEILING_VERSION, DbCeilingInfo, LearnedCompactionState, MemoryProbeInfo, ProbeAnswers,
+    RawQuotaBucket, SessionCostEntry, SpeedCacheSnapshot, TranscriptSummary, UpdateCacheSnapshot,
+    VcsProbeInfo, VcsType, parse_json_num_or_str,
 };
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -364,28 +366,58 @@ pub fn parse_usage_command_output(stdout: &str) -> Option<BTreeMap<String, RawQu
             if !is_valid_bucket_id(id) {
                 continue;
             }
-            let Some(fraction) = item.get("remaining_fraction").and_then(Value::as_f64) else {
-                continue;
-            };
-            if !fraction.is_finite() || !(0.0..=1.0).contains(&fraction) {
+            if item.get("disabled").and_then(Value::as_bool) == Some(true) {
                 continue;
             }
             let Some(reset_str) = item.get("reset_time").and_then(Value::as_str) else {
                 continue;
             };
-            if parse_iso_ms(reset_str).is_none() {
+            let Some(rt_ms) = parse_iso_ms(reset_str) else {
+                continue;
+            };
+            if rt_ms <= SENTINEL_RESET_CUTOFF_MS {
                 continue;
             }
-            quota.insert(
-                id.to_string(),
-                RawQuotaBucket {
-                    remaining_fraction: Some(fraction),
-                    remaining_amount: None,
-                    reset_time: Some(reset_str.to_string()),
-                    reset_in_seconds: None,
-                    disabled: None,
-                },
-            );
+
+            let remaining_fraction = match item.get("remaining_fraction") {
+                None | Some(Value::Null) => None,
+                Some(v) => {
+                    let Some(f) = v.as_f64() else {
+                        continue;
+                    };
+                    if !f.is_finite() || !(0.0..=1.0).contains(&f) {
+                        continue;
+                    }
+                    Some(f)
+                }
+            };
+            let remaining_amount = match item.get("remaining_amount") {
+                None | Some(Value::Null) => None,
+                Some(v) => {
+                    let Some(a) = parse_json_num_or_str(v) else {
+                        continue;
+                    };
+                    if a < 0.0 {
+                        continue;
+                    }
+                    Some(a)
+                }
+            };
+
+            let mut raw = RawQuotaBucket {
+                remaining_fraction,
+                remaining_amount,
+                reset_time: Some(reset_str.to_string()),
+                reset_in_seconds: None,
+                disabled: None,
+            };
+            if raw.remaining_fraction.is_none() {
+                raw.remaining_fraction = effective_remaining_fraction(&raw, 0);
+            }
+            if raw.remaining_fraction.is_none() && raw.remaining_amount.is_none() {
+                continue;
+            }
+            quota.insert(id.to_string(), raw);
         }
     }
 
@@ -1144,16 +1176,20 @@ fn extract_weekly_quota_reset_ms(stdin: Option<&AgyStdinData>, now_ms: i64) -> O
         if bucket.disabled.unwrap_or(false) {
             continue;
         }
-        if let Some(rt_ms) = bucket.reset_time.as_deref().and_then(parse_iso_ms)
-            && rt_ms > now_ms
-        {
-            return Some(rt_ms);
+        if let Some(rt_ms) = bucket.reset_time.as_deref().and_then(parse_iso_ms) {
+            if rt_ms <= SENTINEL_RESET_CUTOFF_MS {
+                continue;
+            }
+            if rt_ms > now_ms {
+                return Some(rt_ms);
+            }
+            continue;
         }
         if let Some(sec) = bucket.reset_in_seconds
             && sec.is_finite()
             && sec > 0.0
         {
-            return Some(now_ms + (sec * 1000.0).round() as i64);
+            return Some(now_ms.saturating_add((sec * 1000.0).round() as i64));
         }
     }
     None
@@ -1378,6 +1414,44 @@ pub fn parse_compaction_ceiling_info(
 ) -> Option<CompactionCeilingRecord> {
     let raw_json = answers.compaction_ceiling.as_deref()?;
     parse_compaction_ceiling_record(raw_json, expected_scope)
+}
+
+/// Parses and validates a serialized [`DbCeilingInfo`] probe payload, normalizing
+/// `model_family` and rejecting out-of-range (`< 32k`) or mismatched-version entries.
+pub fn parse_db_ceiling_record(raw_json: &str) -> Option<DbCeilingInfo> {
+    let parsed = serde_json::from_str::<DbCeilingInfo>(raw_json).ok()?;
+    if parsed.version != DB_CEILING_VERSION
+        || parsed.ceiling_tokens < MIN_COMPACTION_OBSERVATION_TOKENS
+    {
+        return None;
+    }
+    let model_id = parsed
+        .model_id
+        .as_deref()
+        .map(sanitize_text)
+        .filter(|s| !s.is_empty());
+    let model_family = parsed
+        .model_family
+        .as_deref()
+        .and_then(|s| normalize_model_family_str(s, None))
+        .or_else(|| {
+            model_id
+                .as_deref()
+                .and_then(|s| normalize_model_family_str(s, None))
+        });
+    Some(DbCeilingInfo {
+        version: DB_CEILING_VERSION,
+        ceiling_tokens: parsed.ceiling_tokens,
+        source: parsed.source,
+        model_id,
+        model_family,
+    })
+}
+
+/// Extracts and validates [`DbCeilingInfo`] from `ProbeAnswers::db_ceiling`.
+pub fn parse_db_ceiling_info(answers: &ProbeAnswers) -> Option<DbCeilingInfo> {
+    let raw_json = answers.db_ceiling.as_deref()?;
+    parse_db_ceiling_record(raw_json)
 }
 
 /// Emits an updated `CompactionCeilingRecord` only on semantic state transitions and rejects
@@ -1990,5 +2064,139 @@ mod tests {
             })
             .is_none()
         );
+    }
+
+    #[test]
+    fn usage_command_output_infers_zero_remaining_and_drops_sentinels() {
+        let usage_json = serde_json::json!({
+            "command": {
+                "data": {
+                    "groups": [{
+                        "buckets": [
+                            {
+                                "id": "gemini-5h",
+                                "reset_time": "2099-01-01T00:00:00Z"
+                            },
+                            {
+                                "id": "gemini-weekly",
+                                "remaining_fraction": null,
+                                "reset_time": "2099-01-05T00:00:00Z"
+                            },
+                            {
+                                "id": "3p-5h",
+                                "remaining_fraction": 0.5,
+                                "reset_time": "1970-01-01T00:00:00Z"
+                            },
+                            {
+                                "id": "3p-weekly",
+                                "reset_time": "0001-01-01T00:00:00Z"
+                            },
+                            {
+                                "id": "gemini-argon-wtu-weekly",
+                                "disabled": true,
+                                "reset_time": "2099-01-05T00:00:00Z"
+                            },
+                            {
+                                "id": "custom-credits",
+                                "remaining_amount": 42.0,
+                                "reset_time": "2099-01-05T00:00:00Z"
+                            },
+                            {
+                                "id": "proto3-zero-credits",
+                                "remaining_amount": "0",
+                                "reset_time": "2099-01-05T00:00:00Z"
+                            },
+                            {
+                                "id": "negative-credits",
+                                "remaining_amount": "-5",
+                                "reset_time": "2099-01-05T00:00:00Z"
+                            }
+                        ]
+                    }]
+                }
+            }
+        })
+        .to_string();
+
+        let parsed = parse_usage_command_output(&usage_json).expect("valid active buckets");
+        assert_eq!(
+            parsed.get("gemini-5h").unwrap().remaining_fraction,
+            Some(0.0)
+        );
+        assert_eq!(
+            parsed.get("gemini-weekly").unwrap().remaining_fraction,
+            Some(0.0)
+        );
+        assert!(!parsed.contains_key("3p-5h"));
+        assert!(!parsed.contains_key("3p-weekly"));
+        assert!(!parsed.contains_key("gemini-argon-wtu-weekly"));
+        assert!(!parsed.contains_key("negative-credits"));
+        let credits = parsed.get("custom-credits").unwrap();
+        assert_eq!(credits.remaining_fraction, None);
+        assert_eq!(credits.remaining_amount, Some(42.0));
+        let proto3_zero = parsed.get("proto3-zero-credits").unwrap();
+        assert_eq!(proto3_zero.remaining_fraction, None);
+        assert_eq!(proto3_zero.remaining_amount, Some(0.0));
+    }
+
+    #[test]
+    fn cost_ledger_ignores_sentinel_weekly_reset_timestamps() {
+        let now_ms = 1_794_218_400_000i64;
+        let mut quota = BTreeMap::new();
+        quota.insert(
+            "gemini-weekly".to_string(),
+            RawQuotaBucket {
+                remaining_fraction: Some(0.5),
+                remaining_amount: None,
+                reset_time: Some("1970-01-01T00:00:00Z".to_string()),
+                reset_in_seconds: Some(300.0),
+                disabled: None,
+            },
+        );
+        let stdin = AgyStdinData {
+            conversation_id: Some("conv-sentinel-reset".to_string()),
+            quota: Some(quota),
+            cost: Some(crate::types::CostStdin {
+                total_usd: Some(0.25),
+                subagent_usd: None,
+                estimated: Some(false),
+            }),
+            ..Default::default()
+        };
+        let (_totals, next_snap) = reconcile_cost_ledger(None, Some(&stdin), now_ms);
+        let snap = next_snap.expect("writes ledger snapshot");
+        assert_eq!(snap.week_reset_ms, None);
+    }
+
+    #[test]
+    fn parse_db_ceiling_record_validates_version_range_and_normalizes_family() {
+        let raw = serde_json::json!({
+            "version": 1,
+            "ceilingTokens": 840_000,
+            "source": "gen_metadata",
+            "modelId": "Gemini 4 Argon (High)",
+            "dbPath": "/Users/secret/conversations/abc.db"
+        })
+        .to_string();
+        let parsed = parse_db_ceiling_record(&raw).expect("valid db ceiling");
+        assert_eq!(parsed.ceiling_tokens, 840_000);
+        assert_eq!(parsed.model_id.as_deref(), Some("Gemini 4 Argon (High)"));
+        assert_eq!(parsed.model_family.as_deref(), Some("gemini 4 argon"));
+
+        let bad_ver = serde_json::json!({
+            "version": 2,
+            "ceilingTokens": 840_000,
+            "source": "gen_metadata"
+        })
+        .to_string();
+        assert!(parse_db_ceiling_record(&bad_ver).is_none());
+
+        let too_small = serde_json::json!({
+            "version": 1,
+            "ceilingTokens": 31_999,
+            "source": "executor_metadata"
+        })
+        .to_string();
+        assert!(parse_db_ceiling_record(&too_small).is_none());
     }
 }

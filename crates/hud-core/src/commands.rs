@@ -6,8 +6,8 @@ use crate::config::{
 use crate::probes::{
     apply_speed_cache, is_newer_semver, normalize_semver_tag, parse_cached_quota_info,
     parse_compaction_ceiling_info, parse_compaction_ceiling_record, parse_cost_ledger_info,
-    parse_memory_info, parse_speed_cache_info, parse_update_cache_info, parse_vcs_info,
-    reconcile_compaction_ceiling, reconcile_cost_ledger,
+    parse_db_ceiling_info, parse_db_ceiling_record, parse_memory_info, parse_speed_cache_info,
+    parse_update_cache_info, parse_vcs_info, reconcile_compaction_ceiling, reconcile_cost_ledger,
 };
 use crate::render::{
     RenderExtras, RenderInput, format_config_problem_line_with_cmd, render_hud_lines_full,
@@ -15,11 +15,11 @@ use crate::render::{
 use crate::stdin::CompactionScope;
 use crate::transcript::parse_transcript_and_tasks;
 use crate::types::{
-    AgyStdinData, CommandOutput, ContextWindowStdin, CostStdin, CurrentUsageStdin, DoctorFacts,
-    GlyphMode, Language, LearnedCompactionState, LogicPaths, ModelStdin, ProbeAnswers,
-    RawQuotaBucket, SandboxStdin, SubagentEntry, SubagentStatus, SubagentStdin, TodoItem,
-    TodoStatus, ToolEntry, ToolStatus, TranscriptSummary, UpdateCacheSnapshot, VcsProbeInfo,
-    VimStdin, WorkspaceStdin,
+    AgyStdinData, CommandOutput, ContextWindowStdin, CostStdin, CurrentUsageStdin, DbCeilingInfo,
+    DbCeilingSource, DoctorFacts, GlyphMode, Language, LearnedCompactionState, LogicPaths,
+    ModelStdin, ProbeAnswers, RawQuotaBucket, SandboxStdin, SubagentEntry, SubagentStatus,
+    SubagentStdin, TodoItem, TodoStatus, ToolEntry, ToolStatus, TranscriptSummary,
+    UpdateCacheSnapshot, VcsProbeInfo, VimStdin, WorkspaceStdin,
 };
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
@@ -879,12 +879,20 @@ fn sample_presets(now_ms: i64) -> HashMap<&'static str, SamplePreset> {
     let mut high_transcript = rich_transcript;
     high_transcript.compaction_count = 0;
     high_transcript.last_compaction_tokens = None;
+    let mut high_probes = rich_probes;
+    high_probes.db_ceiling = serde_json::to_string(&DbCeilingInfo::new(
+        1_048_576,
+        DbCeilingSource::GenMetadata,
+        Some("Gemini 4 Argon (Medium)".to_string()),
+        Some("gemini 4 argon".to_string()),
+    ))
+    .ok();
     presets.insert(
         "high-context",
         SamplePreset {
             stdin: high_stdin,
             transcript: high_transcript,
-            probes: rich_probes,
+            probes: high_probes,
         },
     );
 
@@ -990,6 +998,7 @@ fn run_preview(args: &[String], ctx: &CommandContext<'_>) -> CommandOutput {
             reconcile_cost_ledger(cost_ledger.as_ref(), snap.stdin.as_ref(), ctx.now_ms);
         let compaction_ceiling =
             resolve_compaction_state(snap.stdin.as_ref(), &snap.probes, &transcript, ctx.now_ms);
+        let db_ceiling = parse_db_ceiling_info(&snap.probes);
         let cols = explicit_width
             .or_else(|| snap.stdin.as_ref().and_then(|s| s.terminal_width))
             .or(Some(100));
@@ -1008,6 +1017,7 @@ fn run_preview(args: &[String], ctx: &CommandContext<'_>) -> CommandOutput {
             RenderExtras {
                 cost_totals: cost_totals.as_ref(),
                 compaction_ceiling,
+                db_ceiling: db_ceiling.as_ref(),
                 use_short_hud_cmd,
                 use_short_update_cmd,
             },
@@ -1077,6 +1087,7 @@ fn run_preview(args: &[String], ctx: &CommandContext<'_>) -> CommandOutput {
             let memory = parse_memory_info(&p.probes);
             let compaction_ceiling =
                 resolve_compaction_state(Some(&p.stdin), &p.probes, &p.transcript, ctx.now_ms);
+            let db_ceiling = parse_db_ceiling_info(&p.probes);
             let rendered = render_hud_lines_full(
                 RenderInput {
                     stdin: Some(&p.stdin),
@@ -1092,6 +1103,7 @@ fn run_preview(args: &[String], ctx: &CommandContext<'_>) -> CommandOutput {
                 RenderExtras {
                     cost_totals: None,
                     compaction_ceiling,
+                    db_ceiling: db_ceiling.as_ref(),
                     use_short_hud_cmd,
                     use_short_update_cmd,
                 },
@@ -1113,6 +1125,7 @@ fn run_preview(args: &[String], ctx: &CommandContext<'_>) -> CommandOutput {
         let memory = parse_memory_info(&p.probes);
         let compaction_ceiling =
             resolve_compaction_state(Some(&p.stdin), &p.probes, &p.transcript, ctx.now_ms);
+        let db_ceiling = parse_db_ceiling_info(&p.probes);
         let cols = explicit_width.or(p.stdin.terminal_width).or(Some(108));
         let mut lines = render_hud_lines_full(
             RenderInput {
@@ -1129,6 +1142,7 @@ fn run_preview(args: &[String], ctx: &CommandContext<'_>) -> CommandOutput {
             RenderExtras {
                 cost_totals: None,
                 compaction_ceiling,
+                db_ceiling: db_ceiling.as_ref(),
                 use_short_hud_cmd,
                 use_short_update_cmd,
             },
@@ -1172,6 +1186,7 @@ fn run_preview(args: &[String], ctx: &CommandContext<'_>) -> CommandOutput {
             RenderExtras {
                 cost_totals: None,
                 compaction_ceiling,
+                db_ceiling: None,
                 use_short_hud_cmd,
                 use_short_update_cmd,
             },
@@ -1293,6 +1308,11 @@ fn scrub_probes(probes: Option<&ProbeAnswers>) -> ProbeAnswers {
         .as_deref()
         .and_then(|raw| parse_compaction_ceiling_record(raw, None))
         .and_then(|rec| serde_json::to_string(&rec).ok());
+    let db_ceiling = p
+        .db_ceiling
+        .as_deref()
+        .and_then(parse_db_ceiling_record)
+        .and_then(|rec| serde_json::to_string(&rec).ok());
     ProbeAnswers {
         vcs,
         memory: p.memory.clone(),
@@ -1301,6 +1321,7 @@ fn scrub_probes(probes: Option<&ProbeAnswers>) -> ProbeAnswers {
         speed_cache: None,
         cost_ledger: None,
         compaction_ceiling,
+        db_ceiling,
     }
 }
 
@@ -1359,6 +1380,7 @@ fn run_report(args: &[String], ctx: &CommandContext<'_>) -> CommandOutput {
         &report_transcript,
         ctx.now_ms,
     );
+    let db_ceiling = parse_db_ceiling_info(&scrubbed_probes);
 
     let rendered: Vec<String> = render_hud_lines_full(
         RenderInput {
@@ -1375,6 +1397,7 @@ fn run_report(args: &[String], ctx: &CommandContext<'_>) -> CommandOutput {
         RenderExtras {
             cost_totals: None,
             compaction_ceiling,
+            db_ceiling: db_ceiling.as_ref(),
             ..RenderExtras::default()
         },
     )

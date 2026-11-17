@@ -1,4 +1,5 @@
 use crate::ansi::{graphemes, sanitize_text};
+use crate::stdin::is_shadow_or_utility_model;
 use crate::types::{
     AgyStdinData, PlannerStepTiming, SpeedAnchorPoint, SubagentEntry, SubagentStatus,
     TRANSCRIPT_CURSOR_VERSION, TodoItem, TodoStatus, ToolEntry, ToolStatus, TranscriptCursor,
@@ -21,6 +22,8 @@ struct RawStep {
     step_type: Option<String>,
     status: Option<String>,
     created_at: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
     input_tokens: Option<u64>,
     cache_read_tokens: Option<u64>,
     cache_creation_tokens: Option<u64>,
@@ -624,6 +627,8 @@ struct StepAccumulator {
     compaction_count: u32,
     last_compaction_tokens: Option<u64>,
     last_compaction_at_ms: Option<i64>,
+    prev_prompt_tokens: Option<u64>,
+    last_planner_step_next: usize,
 }
 
 impl StepAccumulator {
@@ -651,6 +656,8 @@ impl StepAccumulator {
                 compaction_count: 0,
                 last_compaction_tokens: None,
                 last_compaction_at_ms: None,
+                prev_prompt_tokens: None,
+                last_planner_step_next: 0,
             };
         };
 
@@ -698,6 +705,8 @@ impl StepAccumulator {
             compaction_count: c.compaction_count,
             last_compaction_tokens: c.last_compaction_tokens,
             last_compaction_at_ms: c.last_compaction_at_ms,
+            prev_prompt_tokens: c.prev_prompt_tokens,
+            last_planner_step_next: c.last_planner_step_next,
         }
     }
 
@@ -720,9 +729,9 @@ impl StepAccumulator {
                 self.last_step_at = ts;
             }
             if let Some(idx) = step.step_index
-                && idx + 1 > self.max_step_idx
+                && idx.saturating_add(1) > self.max_step_idx
             {
-                self.max_step_idx = idx + 1;
+                self.max_step_idx = idx.saturating_add(1);
             }
 
             let step_type = step.step_type.as_deref().unwrap_or("");
@@ -737,8 +746,16 @@ impl StepAccumulator {
                     self.last_compaction_tokens = Some(prompt_tok);
                     self.last_compaction_at_ms = ts;
                 }
+                self.prev_prompt_tokens = None;
             }
             if step_type == "USER_INPUT" {
+                if let Some(idx) = step.step_index
+                    && idx.saturating_add(1) < self.max_step_idx
+                {
+                    self.prev_prompt_tokens = None;
+                    self.last_planner_step_next = idx.saturating_add(1);
+                    self.max_step_idx = idx.saturating_add(1);
+                }
                 if let Some(ref mut lp) = self.latest_planner_step {
                     lp.has_trailing_user_input = true;
                 }
@@ -754,6 +771,48 @@ impl StepAccumulator {
                         }
                     } else {
                         self.active_slash_mode = None;
+                    }
+                }
+            }
+
+            if step_type == "PLANNER_RESPONSE" {
+                let prompt_tok = step
+                    .input_tokens
+                    .unwrap_or(0)
+                    .saturating_add(step.cache_read_tokens.unwrap_or(0))
+                    .saturating_add(step.cache_creation_tokens.unwrap_or(0));
+                let is_skipped_status = step.status.as_deref().is_some_and(|s| {
+                    s.eq_ignore_ascii_case("RUNNING")
+                        || s.eq_ignore_ascii_case("ERROR")
+                        || s.eq_ignore_ascii_case("CANCELLED")
+                        || s.eq_ignore_ascii_case("CANCELED")
+                        || s.eq_ignore_ascii_case("INVALID")
+                });
+                let is_shadow = step
+                    .model
+                    .as_deref()
+                    .is_some_and(is_shadow_or_utility_model);
+                if prompt_tok > 0 && !is_skipped_status && !is_shadow {
+                    let planner_idx = step.step_index.unwrap_or(fallback_idx);
+                    if planner_idx < self.last_planner_step_next {
+                        self.prev_prompt_tokens = Some(prompt_tok);
+                        self.last_planner_step_next = planner_idx.saturating_add(1);
+                        if step.step_index.is_some() {
+                            self.max_step_idx = planner_idx.saturating_add(1);
+                        }
+                    } else {
+                        if let Some(before) = self.prev_prompt_tokens
+                            && before > prompt_tok
+                        {
+                            let drop = before - prompt_tok;
+                            if drop > 5_000 && drop.saturating_mul(4) >= before {
+                                self.compaction_count = self.compaction_count.saturating_add(1);
+                                self.last_compaction_tokens = Some(before);
+                                self.last_compaction_at_ms = ts;
+                            }
+                        }
+                        self.prev_prompt_tokens = Some(prompt_tok);
+                        self.last_planner_step_next = planner_idx.saturating_add(1);
                     }
                 }
             }
@@ -980,6 +1039,8 @@ impl StepAccumulator {
             compaction_count: self.compaction_count,
             last_compaction_tokens: self.last_compaction_tokens,
             last_compaction_at_ms: self.last_compaction_at_ms,
+            prev_prompt_tokens: self.prev_prompt_tokens,
+            last_planner_step_next: self.last_planner_step_next,
             folded_tools,
             subagents,
         }
@@ -1651,5 +1712,153 @@ mod tests {
         let cur2 = cursor2.expect("cursor advances past completed steps 5..=8");
         assert_eq!(cur2.session_min_tps_x10, Some(420));
         assert_eq!(cur2.session_max_tps_x10, Some(1500));
+    }
+
+    #[test]
+    fn implicit_compaction_dual_threshold_shadow_exclusion_checkpoint_and_undo_immunity() {
+        // 1. Dual threshold boundaries:
+        //    - 20_000 -> 15_000 (drop=5_000, not > 5_000): NO compaction
+        //    - 20_000 -> 14_999 (drop=5_001 > 5_000 & 5_001*4 >= 20_000): COMPACTION (before=20_000)
+        //    - 100_000 -> 75_001 (drop=24_999 < 25%): NO compaction
+        //    - 100_000 -> 75_000 (drop=25_000 == 25.0%): COMPACTION (before=100_000)
+        let boundary_steps = [
+            json!({"step_index": 0, "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": "2026-11-10T01:00:00Z", "input_tokens": 20_000}),
+            json!({"step_index": 1, "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": "2026-11-10T01:00:05Z", "input_tokens": 15_000}),
+            json!({"step_index": 2, "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": "2026-11-10T01:00:10Z", "input_tokens": 20_000}),
+            json!({"step_index": 3, "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": "2026-11-10T01:00:15Z", "input_tokens": 14_999}),
+            json!({"step_index": 4, "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": "2026-11-10T01:00:20Z", "input_tokens": 100_000}),
+            json!({"step_index": 5, "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": "2026-11-10T01:00:25Z", "input_tokens": 75_001}),
+            json!({"step_index": 6, "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": "2026-11-10T01:00:30Z", "input_tokens": 100_000}),
+            json!({"step_index": 7, "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": "2026-11-10T01:00:35Z", "input_tokens": 75_000}),
+        ];
+        let boundary_jsonl = boundary_steps
+            .iter()
+            .map(serde_json::to_string)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+            .join("\n");
+        let b_summary = parse_transcript_and_tasks(
+            boundary_jsonl.lines().next(),
+            Some(&boundary_jsonl),
+            None,
+            None,
+        );
+        assert_eq!(b_summary.compaction_count, 2);
+        assert_eq!(b_summary.last_compaction_tokens, Some(100_000));
+        assert_eq!(
+            b_summary.last_compaction_at_ms,
+            parse_iso_ms("2026-11-10T01:00:35Z")
+        );
+
+        // 2. Shadow/utility models, RUNNING/ERROR/CANCELLED/INVALID, prompt_tok==0, and post-CHECKPOINT drops
+        //    must neither trigger implicit compaction nor double-count explicit CHECKPOINT.
+        let complex_steps = [
+            json!({"step_index": 0, "type": "USER_INPUT", "status": "DONE", "created_at": "2026-11-10T02:00:00Z", "content": "Go"}),
+            json!({"step_index": 1, "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": "2026-11-10T02:00:05Z", "model": "gemini-4-argon", "input_tokens": 13_031, "cache_read_tokens": 175_000, "cache_creation_tokens": 5_000}),
+            // Shadow/utility steps (small token counts) must be ignored completely:
+            json!({"step_index": 2, "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": "2026-11-10T02:00:06Z", "model": "gemini-2.5-flash-lite", "input_tokens": 4_000}),
+            json!({"step_index": 3, "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": "2026-11-10T02:00:07Z", "model": "MODEL_PLACEHOLDER_M50", "input_tokens": 3_000}),
+            json!({"step_index": 4, "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": "2026-11-10T02:00:08Z", "model": "nano-banana-image", "input_tokens": 2_000}),
+            // Cancelled / error / running / 0-token steps ignored:
+            json!({"step_index": 5, "type": "PLANNER_RESPONSE", "status": "CANCELLED", "created_at": "2026-11-10T02:00:09Z", "input_tokens": 10_000}),
+            json!({"step_index": 6, "type": "PLANNER_RESPONSE", "status": "ERROR", "created_at": "2026-11-10T02:00:10Z", "input_tokens": 10_000}),
+            json!({"step_index": 7, "type": "PLANNER_RESPONSE", "status": "INVALID", "created_at": "2026-11-10T02:00:11Z", "input_tokens": 10_000}),
+            json!({"step_index": 8, "type": "PLANNER_RESPONSE", "status": "RUNNING", "created_at": "2026-11-10T02:00:12Z", "input_tokens": 10_000}),
+            json!({"step_index": 9, "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": "2026-11-10T02:00:13Z", "input_tokens": 0}),
+            // Real implicit compaction (193_031 -> 126_063) -> compaction #1!
+            json!({"step_index": 10, "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": "2026-11-10T02:00:20Z", "model": "gemini-4-argon", "input_tokens": 26_063, "cache_read_tokens": 100_000}),
+            // Explicit CHECKPOINT at 260_642 -> compaction #2, resets prev_prompt_tokens so next 29_600 turn is NOT double-counted!
+            json!({"step_index": 11, "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": "2026-11-10T02:01:00Z", "model": "gemini-4-argon", "input_tokens": 60_642, "cache_read_tokens": 200_000}),
+            json!({"step_index": 12, "type": "CHECKPOINT", "status": "DONE", "created_at": "2026-11-10T02:01:10Z", "input_tokens": 6_000, "cache_read_tokens": 254_642}),
+            json!({"step_index": 13, "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": "2026-11-10T02:01:20Z", "model": "gemini-4-argon", "input_tokens": 29_600}),
+        ];
+        let complex_jsonl = complex_steps
+            .iter()
+            .map(serde_json::to_string)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+            .join("\n");
+        let c_summary = parse_transcript_and_tasks(
+            complex_jsonl.lines().next(),
+            Some(&complex_jsonl),
+            None,
+            None,
+        );
+        assert_eq!(c_summary.compaction_count, 2);
+        assert_eq!(c_summary.last_compaction_tokens, Some(260_642));
+
+        // 3. Undo / rewind immunity + subsequent post-rewind compaction + incremental v3 cursor parity
+        let rewind_steps = [
+            json!({"step_index": 390, "type": "USER_INPUT", "status": "DONE", "created_at": "2026-11-10T03:00:00Z", "content": "Turn A"}),
+            json!({"step_index": 394, "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": "2026-11-10T03:00:10Z", "input_tokens": 200_000}),
+            // Undo back to step 238 with >25% lower prompt tokens (200k -> 100k): MUST NOT count as compaction!
+            json!({"step_index": 238, "type": "USER_INPUT", "status": "DONE", "created_at": "2026-11-10T03:01:00Z", "content": "Rewound turn"}),
+            json!({"step_index": 239, "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": "2026-11-10T03:01:10Z", "input_tokens": 100_000}),
+            // Subsequent normal turns after rewind: 190_000 -> 110_000 MUST STILL detect real compaction!
+            json!({"step_index": 240, "type": "USER_INPUT", "status": "DONE", "created_at": "2026-11-10T03:02:00Z", "content": "Next"}),
+            json!({"step_index": 241, "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": "2026-11-10T03:02:10Z", "input_tokens": 190_000}),
+            json!({"step_index": 242, "type": "USER_INPUT", "status": "DONE", "created_at": "2026-11-10T03:03:00Z", "content": "Compact later"}),
+            json!({"step_index": 243, "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": "2026-11-10T03:03:10Z", "input_tokens": 110_000}),
+            // Direct PLANNER_RESPONSE rewind without USER_INPUT (step 242 <= last_planner_step_next 244): MUST NOT count!
+            json!({"step_index": 242, "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": "2026-11-10T03:04:00Z", "input_tokens": 40_000}),
+        ];
+        let lines: Vec<String> = rewind_steps
+            .iter()
+            .map(|v| format!("{}\n", serde_json::to_string(v).unwrap()))
+            .collect();
+        let full_rewind = lines.concat();
+        let head_r = lines[0].trim_end();
+        let full_res = parse_transcript_and_tasks(Some(head_r), Some(&full_rewind), None, None);
+        assert_eq!(full_res.compaction_count, 1);
+        assert_eq!(full_res.last_compaction_tokens, Some(190_000));
+        assert_eq!(
+            full_res.last_compaction_at_ms,
+            parse_iso_ms("2026-11-10T03:03:10Z")
+        );
+
+        // Incremental cursor parity across rewind boundary:
+        let first_part = format!("{}{}", lines[0], lines[1]);
+        let (_, cur_a_opt) =
+            parse_transcript_with_cursor(None, Some(head_r), Some(&first_part), 0, None, None);
+        let cur_a = cur_a_opt.expect("cursor before step 394");
+        assert_eq!(cur_a.version, 3);
+        let rest = &full_rewind[cur_a.offset as usize..];
+        let (inc_res, cur_b_opt) = parse_transcript_with_cursor(
+            Some(&cur_a),
+            Some(head_r),
+            Some(rest),
+            cur_a.offset,
+            None,
+            None,
+        );
+        assert_eq!(inc_res.compaction_count, 1);
+        assert_eq!(inc_res.last_compaction_tokens, Some(190_000));
+        assert!(cur_b_opt.is_some());
+
+        // Stale v2 cursor must be rejected cleanly on upgrade to v3
+        let mut stale_v2 = cur_a;
+        stale_v2.version = 2;
+        let (res_from_v2, _) = parse_transcript_with_cursor(
+            Some(&stale_v2),
+            Some(head_r),
+            Some(&full_rewind),
+            0,
+            None,
+            None,
+        );
+        assert_eq!(res_from_v2.compaction_count, 1);
+        assert_eq!(res_from_v2.last_compaction_tokens, Some(190_000));
+
+        // Untrusted `step_index = usize::MAX` must saturate cleanly without overflow panics
+        let max_steps = [
+            json!({"step_index": usize::MAX, "type": "USER_INPUT", "status": "DONE", "created_at": "2026-11-10T04:00:00Z", "content": "Max"}),
+            json!({"step_index": usize::MAX, "type": "PLANNER_RESPONSE", "status": "DONE", "created_at": "2026-11-10T04:00:05Z", "input_tokens": 100_000}),
+        ]
+        .iter()
+        .map(|v| format!("{}\n", serde_json::to_string(v).unwrap()))
+        .collect::<String>();
+        let max_res = parse_transcript_and_tasks(None, Some(&max_steps), None, None);
+        assert_eq!(max_res.step_count, usize::MAX);
+        assert_eq!(max_res.compaction_count, 0);
     }
 }
