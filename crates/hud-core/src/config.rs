@@ -73,6 +73,8 @@ pub struct DisplayConfig {
     #[serde(default)]
     pub show_title: bool,
     #[serde(default)]
+    pub show_session_id: bool,
+    #[serde(default)]
     pub glyph_mode: GlyphMode,
     pub show_context_bar: bool,
     pub bar_length: usize,
@@ -109,6 +111,8 @@ pub struct DisplayConfig {
     pub tools_max_visible: usize,
     pub show_skills_and_mcp: bool,
     pub show_subagents: bool,
+    #[serde(default = "default_true")]
+    pub show_subagent_model: bool,
     pub show_todos: bool,
     pub custom_tag: String,
     #[serde(default)]
@@ -128,6 +132,7 @@ impl Default for DisplayConfig {
             show_project: true,
             show_launch_dir: false,
             show_title: false,
+            show_session_id: false,
             glyph_mode: GlyphMode::Unicode,
             show_context_bar: true,
             bar_length: 12,
@@ -156,6 +161,7 @@ impl Default for DisplayConfig {
             tools_max_visible: 3,
             show_skills_and_mcp: true,
             show_subagents: true,
+            show_subagent_model: true,
             show_todos: true,
             custom_tag: String::new(),
             merge_groups: Vec::new(),
@@ -367,6 +373,11 @@ pub const CONFIG_SCHEMA: &[SchemaEntry] = &[
         description: "Show sanitized conversation_title in header (up to 24 cols; dropped first on narrow terminals).",
     },
     SchemaEntry {
+        key: "display.showSessionId",
+        kind: SchemaValueKind::Boolean,
+        description: "Show short 8-character session ID prefix (#<id>) in header (dropped first on narrow terminals).",
+    },
+    SchemaEntry {
         key: "display.glyphMode",
         kind: SchemaValueKind::Enum(&["\"unicode\"", "\"nerd\"", "\"ascii\""]),
         description: "Icon/glyph set: unicode (default), nerd (Nerd Font icons), or ascii (7-bit text for SSH/TTY).",
@@ -505,6 +516,11 @@ pub const CONFIG_SCHEMA: &[SchemaEntry] = &[
         key: "display.showSubagents",
         kind: SchemaValueKind::Boolean,
         description: "Show detailed subagent activity line when subagents are active or completed.",
+    },
+    SchemaEntry {
+        key: "display.showSubagentModel",
+        kind: SchemaValueKind::Boolean,
+        description: "Show compact model badge on each subagent entry when reported.",
     },
     SchemaEntry {
         key: "display.showTodos",

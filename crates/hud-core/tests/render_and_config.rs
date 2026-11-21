@@ -1,6 +1,6 @@
 use hud_core::ansi::{
-    github_branch_link, mask_preserving_width, sanitize_title_text, strip_ansi,
-    terminal_filter_with_repo, text_width,
+    BOLD, colors, github_branch_link, mask_preserving_width, paint, sanitize_title_text,
+    strip_ansi, terminal_filter_with_repo, text_width,
 };
 use hud_core::commands::{CommandContext, execute_subcommand};
 use hud_core::config::{
@@ -4444,5 +4444,504 @@ fn pr1_auto_edit_mode_subagent_status_fallback_and_standalone_right_align() {
     assert!(
         fam_out.contains("neon-weekly") && !fam_out.contains("ai-credits"),
         "expected dedicated family bucket before ai-credits under 2-bucket cap: {fam_out}"
+    );
+}
+
+#[test]
+fn pr3_subagent_model_badges_zero_io_stdin_telemetry_and_short_session_id() {
+    let default_cfg = HudConfig::default();
+    assert!(default_cfg.display.show_subagent_model);
+    assert!(!default_cfg.display.show_session_id);
+
+    let cfg_override = parse_config_str(Some(
+        r#"{"display":{"showSubagentModel":false,"showSessionId":true}}"#,
+    ));
+    assert!(cfg_override.problems.is_empty());
+    assert!(!cfg_override.config.display.show_subagent_model);
+    assert!(cfg_override.config.display.show_session_id);
+
+    let bad_cfg = parse_config_str(Some(
+        r#"{"display":{"showSubagentModel":"yes","showSessionId":123}}"#,
+    ));
+    assert_eq!(bad_cfg.problems.len(), 2);
+
+    let now_ms = 1_794_218_400_000i64;
+    let render_with = |stdin: &AgyStdinData,
+                       tx: &TranscriptSummary,
+                       cfg: &HudConfig,
+                       cols: usize|
+     -> Vec<String> {
+        render_hud_lines(RenderInput {
+            stdin: Some(stdin),
+            config: cfg,
+            transcript: tx,
+            vcs: None,
+            memory: None,
+            cached_quota: None,
+            update_info: None,
+            columns: Some(cols),
+            now_ms,
+        })
+    };
+
+    // 1. Subagent model badges (with role, without role, Blocked yellow icon, noise filtering, ASCII/Unicode/Nerd, toggle off)
+    let sub_tx = TranscriptSummary {
+        subagents: vec![
+            SubagentEntry {
+                name: "research".to_string(),
+                role: Some("Architecture Reviewer".to_string()),
+                model: Some("gemini-3.1-pro".to_string()),
+                status: SubagentStatus::Running,
+                started_at: Some(now_ms - 12_000),
+                ended_at: None,
+            },
+            SubagentEntry {
+                name: "builder".to_string(),
+                role: None,
+                model: Some("Gemini 4 Hydrogen (XHigh)".to_string()),
+                status: SubagentStatus::Blocked,
+                started_at: Some(now_ms - 8_000),
+                ended_at: None,
+            },
+            SubagentEntry {
+                name: "fallback".to_string(),
+                role: Some("Noise Model".to_string()),
+                model: Some("inherit".to_string()),
+                status: SubagentStatus::Completed,
+                started_at: Some(now_ms - 25_000),
+                ended_at: Some(now_ms - 5_000),
+            },
+            SubagentEntry {
+                name: "plain".to_string(),
+                role: None,
+                model: Some("AUTO".to_string()),
+                status: SubagentStatus::Completed,
+                started_at: Some(now_ms - 15_000),
+                ended_at: Some(now_ms - 5_000),
+            },
+        ],
+        ..TranscriptSummary::default()
+    };
+    let sub_stdin = sample_stdin(180);
+    for gm in [GlyphMode::Unicode, GlyphMode::Nerd] {
+        let mut cfg = HudConfig::default();
+        cfg.display.glyph_mode = gm;
+        let lines = render_with(&sub_stdin, &sub_tx, &cfg, 180);
+        let sub_raw = lines
+            .iter()
+            .find(|l| strip_ansi(l).contains("Architecture Reviewer"))
+            .expect("subagents line");
+        let sub_plain = strip_ansi(sub_raw);
+        assert!(
+            sub_plain.contains("◐ Architecture Reviewer [research · 3.1-pro] (12s)"),
+            "{gm:?}: {sub_plain}"
+        );
+        assert!(
+            sub_plain.contains("◷ builder [Hydrogen] (8s)"),
+            "{gm:?}: {sub_plain}"
+        );
+        assert!(
+            sub_plain.contains("✓ Noise Model [fallback] (20s)"),
+            "{gm:?}: {sub_plain}"
+        );
+        assert!(sub_plain.contains("✓ plain (10s)"), "{gm:?}: {sub_plain}");
+        assert!(
+            sub_raw.contains(&paint("◷", &[colors::YELLOW, BOLD])),
+            "Blocked must stay yellow bold: {sub_raw:?}"
+        );
+        assert!(
+            sub_raw.contains(&paint("3.1-pro", &[colors::MAGENTA]))
+                && sub_raw.contains(&paint("Hydrogen", &[colors::MAGENTA])),
+            "Model segment should be magenta: {sub_raw:?}"
+        );
+    }
+
+    let mut ascii_cfg = HudConfig::default();
+    ascii_cfg.display.glyph_mode = GlyphMode::Ascii;
+    let ascii_sub_lines = render_with(&sub_stdin, &sub_tx, &ascii_cfg, 180);
+    for l in &ascii_sub_lines {
+        assert!(l.is_ascii(), "Non-ASCII leak: {}", strip_ansi(l));
+    }
+    let ascii_sub_raw = ascii_sub_lines
+        .iter()
+        .find(|l| strip_ansi(l).contains("Architecture Reviewer"))
+        .unwrap();
+    let ascii_sub_plain = strip_ansi(ascii_sub_raw);
+    assert!(
+        ascii_sub_plain.contains("~ Architecture Reviewer [research . 3.1-pro] (12s)"),
+        "{ascii_sub_plain}"
+    );
+    assert!(
+        ascii_sub_plain.contains("! builder [Hydrogen] (8s)"),
+        "{ascii_sub_plain}"
+    );
+    assert!(
+        ascii_sub_raw.contains(&paint("!", &[colors::YELLOW, BOLD])),
+        "ASCII Blocked `!` must stay yellow bold: {ascii_sub_raw:?}"
+    );
+
+    let mut hidden_model_cfg = HudConfig::default();
+    hidden_model_cfg.display.show_subagent_model = false;
+    let hidden_sub_plain = render_with(&sub_stdin, &sub_tx, &hidden_model_cfg, 180)
+        .into_iter()
+        .map(|l| strip_ansi(&l))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        hidden_sub_plain.contains("◐ Architecture Reviewer [research] (12s)")
+            && hidden_sub_plain.contains("◷ builder (8s)")
+            && !hidden_sub_plain.contains("3.1-pro")
+            && !hidden_sub_plain.contains("Hydrogen"),
+        "{hidden_sub_plain}"
+    );
+
+    // 2. `sandbox.allow_network` + `cost.subagent_usd` + `battle.{status, focused_arm}` across EN/ZH/JA and ASCII/Unicode/Nerd
+    let mut rich_stdin = sample_stdin(150);
+    rich_stdin.sandbox = Some(SandboxStdin {
+        enabled: Some(true),
+        allow_network: Some(true),
+    });
+    rich_stdin.cost = Some(CostStdin {
+        total_usd: Some(1.38),
+        subagent_usd: Some(0.42),
+        estimated: Some(false),
+    });
+    rich_stdin.battle = Some(hud_core::types::BattleStdin {
+        status: Some("voting".to_string()),
+        focused_arm: Some(2),
+    });
+
+    for (lang, exp_battle, exp_cost, exp_sandbox) in [
+        (
+            Language::En,
+            "[BATTLE #2]",
+            "$1.38 (sub $0.42)",
+            "🛡 Sandbox ON (net)",
+        ),
+        (
+            Language::ZhHans,
+            "[对战 #2]",
+            "$1.38 (子代理 $0.42)",
+            "🛡 沙箱开启 (联网)",
+        ),
+        (
+            Language::Ja,
+            "[対戦 #2]",
+            "$1.38 (子 $0.42)",
+            "🛡 サンドボックスON (ネット)",
+        ),
+    ] {
+        let cfg = HudConfig {
+            language: lang,
+            ..HudConfig::default()
+        };
+        let lines = render_with(&rich_stdin, &TranscriptSummary::default(), &cfg, 150);
+        let joined_raw = lines.join("\n");
+        let joined_plain = lines
+            .iter()
+            .map(|l| strip_ansi(l))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            joined_plain.contains(exp_battle),
+            "{lang:?}: {joined_plain}"
+        );
+        assert!(joined_plain.contains(exp_cost), "{lang:?}: {joined_plain}");
+        assert!(
+            joined_plain.contains(exp_sandbox),
+            "{lang:?}: {joined_plain}"
+        );
+        assert!(
+            joined_raw.contains(&paint(exp_battle, &[colors::MAGENTA, BOLD])),
+            "Battle badge must be magenta+bold: {joined_raw:?}"
+        );
+        assert!(
+            joined_raw.contains(&paint(exp_sandbox, &[colors::YELLOW, BOLD])),
+            "Sandbox (net) must be yellow+bold: {joined_raw:?}"
+        );
+        assert!(
+            joined_raw.contains("\x1b[2m("),
+            "Subagent cost suffix must be DIM: {joined_raw:?}"
+        );
+    }
+
+    // Nerd & ASCII checks for sandbox(net) + battle + subagent cost
+    let mut nerd_cfg = HudConfig::default();
+    nerd_cfg.display.glyph_mode = GlyphMode::Nerd;
+    let nerd_plain = render_with(&rich_stdin, &TranscriptSummary::default(), &nerd_cfg, 150)
+        .into_iter()
+        .map(|l| strip_ansi(&l))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(nerd_plain.contains("\u{f0a3} Sandbox ON (net)"));
+    assert!(nerd_plain.contains("[BATTLE #2]"));
+    assert!(nerd_plain.contains("$1.38 (sub $0.42)"));
+
+    let ascii_rich_lines = render_with(&rich_stdin, &TranscriptSummary::default(), &ascii_cfg, 150);
+    for l in &ascii_rich_lines {
+        assert!(l.is_ascii(), "Non-ASCII leak: {}", strip_ansi(l));
+    }
+    let ascii_rich_plain = ascii_rich_lines
+        .iter()
+        .map(|l| strip_ansi(l))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(ascii_rich_plain.contains("Sandbox ON (net)"));
+    assert!(ascii_rich_plain.contains("[BATTLE #2]"));
+    assert!(ascii_rich_plain.contains("$1.38 (sub $0.42)"));
+
+    // Sandbox allow_network=false keeps green Sandbox ON; disabled sandbox hides completely
+    let mut safe_sb_stdin = rich_stdin.clone();
+    safe_sb_stdin.sandbox = Some(SandboxStdin {
+        enabled: Some(true),
+        allow_network: Some(false),
+    });
+    let safe_sb_raw = render_with(
+        &safe_sb_stdin,
+        &TranscriptSummary::default(),
+        &HudConfig::default(),
+        150,
+    )
+    .join("\n");
+    assert!(safe_sb_raw.contains(&paint("🛡 Sandbox ON", &[colors::GREEN, BOLD])));
+    assert!(!strip_ansi(&safe_sb_raw).contains("(net)"));
+
+    // Battle without focused_arm or focused_arm == 0 omits #N; inactive statuses suppressed
+    for (status, arm, expected) in [
+        ("active", None, Some("[BATTLE]")),
+        ("active", Some(0), Some("[BATTLE]")),
+        ("active", Some(-1), Some("[BATTLE]")),
+        ("none", Some(1), None),
+        ("INACTIVE", Some(1), None),
+        ("off", Some(1), None),
+        ("Disabled", Some(1), None),
+        ("  ", Some(1), None),
+    ] {
+        let mut b_stdin = rich_stdin.clone();
+        b_stdin.battle = Some(hud_core::types::BattleStdin {
+            status: Some(status.to_string()),
+            focused_arm: arm,
+        });
+        let b_plain = strip_ansi(
+            &render_with(
+                &b_stdin,
+                &TranscriptSummary::default(),
+                &HudConfig::default(),
+                150,
+            )[0],
+        );
+        match expected {
+            Some(tok) => assert!(
+                b_plain.contains(tok),
+                "status={status} arm={arm:?}: {b_plain}"
+            ),
+            None => assert!(
+                !b_plain.contains("BATTLE"),
+                "status={status} arm={arm:?} should suppress: {b_plain}"
+            ),
+        }
+    }
+
+    // Subagent cost suppression (< 0.001, NaN, compact mode)
+    for bad_sub in [None, Some(0.0), Some(0.0005), Some(-0.1), Some(f64::NAN)] {
+        let mut c_stdin = rich_stdin.clone();
+        c_stdin.cost = Some(CostStdin {
+            total_usd: Some(1.38),
+            subagent_usd: bad_sub,
+            estimated: Some(false),
+        });
+        let c_plain = render_with(
+            &c_stdin,
+            &TranscriptSummary::default(),
+            &HudConfig::default(),
+            150,
+        )
+        .into_iter()
+        .map(|l| strip_ansi(&l))
+        .collect::<Vec<_>>()
+        .join("\n");
+        assert!(c_plain.contains("$1.38") && !c_plain.contains("(sub"));
+    }
+    let compact_cfg = HudConfig {
+        line_layout: LineLayout::Compact,
+        ..HudConfig::default()
+    };
+    let compact_plain = render_with(
+        &rich_stdin,
+        &TranscriptSummary::default(),
+        &compact_cfg,
+        180,
+    )
+    .into_iter()
+    .map(|l| strip_ansi(&l))
+    .collect::<Vec<_>>()
+    .join("\n");
+    assert!(
+        compact_plain.contains("$1.38") && !compact_plain.contains("(sub"),
+        "Compact meta must omit subagent cost breakdown: {compact_plain}"
+    );
+
+    // 3. `exceeds_200k_tokens` cold-start subtle yellow `(>200k)` hint (and hidden when ceiling is known)
+    let mut cold_200k_stdin = sample_stdin(140);
+    cold_200k_stdin.exceeds_200k_tokens = Some(true);
+    cold_200k_stdin.context_window = Some(ContextWindowStdin {
+        context_window_size: Some(1_048_576),
+        used_percentage: Some(34.5),
+        current_usage: Some(CurrentUsageStdin {
+            input_tokens: Some(362_000),
+            ..Default::default()
+        }),
+        ..Default::default()
+    });
+    for cv in [
+        ContextValueMode::Both,
+        ContextValueMode::Tokens,
+        ContextValueMode::Percent,
+        ContextValueMode::Remaining,
+    ] {
+        let mut cfg = HudConfig::default();
+        cfg.display.context_value = cv;
+        let lines = render_with(&cold_200k_stdin, &TranscriptSummary::default(), &cfg, 140);
+        let ctx_raw = lines
+            .iter()
+            .find(|l| strip_ansi(l).contains("Ctx"))
+            .unwrap();
+        let ctx_plain = strip_ansi(ctx_raw);
+        assert!(
+            ctx_plain.contains("362k/? (>200k)")
+                && !ctx_plain.contains('█')
+                && !ctx_plain.contains("34.5%"),
+            "{cv:?}: {ctx_plain}"
+        );
+        assert!(
+            ctx_raw.contains("\x1b[33m(>200k)\x1b[0m"),
+            "Expected subtle yellow (>200k): {ctx_raw:?}"
+        );
+    }
+
+    // Combined cleanly with compaction badge when ceiling is still unknown
+    let comp_unknown_tx = TranscriptSummary {
+        compaction_count: 1,
+        ..TranscriptSummary::default()
+    };
+    let comp_both = strip_ansi(
+        &render_with(
+            &cold_200k_stdin,
+            &comp_unknown_tx,
+            &HudConfig::default(),
+            140,
+        )[1],
+    );
+    assert!(comp_both.contains("362k/? (>200k) (↻1)"), "{comp_both}");
+
+    let mut tok_cfg = HudConfig::default();
+    tok_cfg.display.context_value = ContextValueMode::Tokens;
+    let comp_tok = strip_ansi(&render_with(&cold_200k_stdin, &comp_unknown_tx, &tok_cfg, 140)[1]);
+    assert!(comp_tok.contains("362k/? (>200k) · ↻1"), "{comp_tok}");
+
+    // Hidden when ceiling becomes known via DB metadata
+    let db_512 = DbCeilingInfo::new(
+        512_000,
+        DbCeilingSource::GenMetadata,
+        Some("Gemini 4 Argon (Medium)".to_string()),
+        Some("gemini 4 argon".to_string()),
+    );
+    let known_lines = render_hud_lines_full(
+        RenderInput {
+            stdin: Some(&cold_200k_stdin),
+            config: &HudConfig::default(),
+            transcript: &TranscriptSummary::default(),
+            vcs: None,
+            memory: None,
+            cached_quota: None,
+            update_info: None,
+            columns: Some(140),
+            now_ms,
+        },
+        RenderExtras {
+            db_ceiling: Some(&db_512),
+            ..RenderExtras::default()
+        },
+    );
+    let known_plain = strip_ansi(&known_lines[1]);
+    assert!(known_plain.contains("(362k/512k)") && !known_plain.contains(">200k"));
+
+    // 4. `display.showSessionId` extraction, fallback, sanitization & narrow-width step-0 drop
+    let mut id_stdin = sample_stdin(160);
+    id_stdin.conversation_id = Some("4a93ad0a-5f06-4795-ac00-41997a6de596".to_string());
+    id_stdin.session_id = Some("sess9999-1111".to_string());
+    id_stdin.conversation_title = Some("PR-3 Telemetry".to_string());
+
+    // Default false -> hidden
+    let no_id_header = strip_ansi(
+        &render_with(
+            &id_stdin,
+            &TranscriptSummary::default(),
+            &HudConfig::default(),
+            160,
+        )[0],
+    );
+    assert!(!no_id_header.contains("#4a93ad0a"), "{no_id_header}");
+
+    // Enabled -> `#4a93ad0a` in DIM
+    let mut sid_cfg = HudConfig::default();
+    sid_cfg.display.show_session_id = true;
+    sid_cfg.display.show_title = true;
+    sid_cfg.display.custom_tag = "CORE-TAG".to_string();
+    let sid_header_raw = &render_with(&id_stdin, &TranscriptSummary::default(), &sid_cfg, 160)[0];
+    let sid_header_plain = strip_ansi(sid_header_raw);
+    assert!(
+        sid_header_plain.contains("#4a93ad0a") && sid_header_plain.contains("PR-3 Telemetry"),
+        "{sid_header_plain}"
+    );
+    assert!(
+        sid_header_raw.contains("\x1b[2m#4a93ad0a\x1b[0m"),
+        "Session ID must use DIM styling: {sid_header_raw:?}"
+    );
+
+    // Fallback to `session_id` when `conversation_id` is blank or lacks ASCII alphanumeric chars
+    for bad_conv_id in ["   ", "___", "---"] {
+        let mut fallback_id_stdin = id_stdin.clone();
+        fallback_id_stdin.conversation_id = Some(bad_conv_id.to_string());
+        fallback_id_stdin.session_id = Some("\x1b[31mxy_98-ab123456\x1b[0m".to_string());
+        let fallback_header = strip_ansi(
+            &render_with(
+                &fallback_id_stdin,
+                &TranscriptSummary::default(),
+                &sid_cfg,
+                160,
+            )[0],
+        );
+        assert!(
+            fallback_header.contains("#xy98-ab1") && !fallback_header.contains("#---"),
+            "bad_conv_id={bad_conv_id:?}: {fallback_header}"
+        );
+    }
+
+    // Hyphen/punctuation-only IDs on both `conversation_id` and `session_id` are suppressed
+    let mut suppressed_id_stdin = id_stdin.clone();
+    suppressed_id_stdin.conversation_id = Some("---".to_string());
+    suppressed_id_stdin.session_id = Some("___---".to_string());
+    let suppressed_header = strip_ansi(
+        &render_with(
+            &suppressed_id_stdin,
+            &TranscriptSummary::default(),
+            &sid_cfg,
+            160,
+        )[0],
+    );
+    assert!(
+        !suppressed_header.contains("│ #"),
+        "hyphen-only IDs must be suppressed: {suppressed_header}"
+    );
+
+    // Narrow width drops BOTH `showTitle` and `showSessionId` in header_steps[0] while keeping `customTag`
+    let step0_header =
+        strip_ansi(&render_with(&id_stdin, &TranscriptSummary::default(), &sid_cfg, 92)[0]);
+    assert!(
+        !step0_header.contains("#4a93ad0a")
+            && !step0_header.contains("PR-3 Telemetry")
+            && step0_header.contains("CORE-TAG"),
+        "header_steps[0] should drop title and session ID together before customTag: {step0_header}"
     );
 }

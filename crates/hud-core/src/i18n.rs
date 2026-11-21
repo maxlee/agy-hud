@@ -18,6 +18,7 @@ pub struct ModeLabels {
     pub plan: &'static str,
     pub auto: &'static str,
     pub accept_edits: &'static str,
+    pub battle: &'static str,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -26,10 +27,12 @@ pub struct MetricLabels {
     pub quota: &'static str,
     pub cache: &'static str,
     pub cost: &'static str,
+    pub subagent_cost: &'static str,
     pub today: &'static str,
     pub week: &'static str,
     pub sandbox_on: &'static str,
     pub sandbox_off: &'static str,
+    pub sandbox_net: &'static str,
     pub artifacts: &'static str,
     pub subagents: &'static str,
     pub tasks: &'static str,
@@ -67,16 +70,19 @@ pub const EN: Labels = Labels {
         plan: "PLAN",
         auto: "AUTO",
         accept_edits: "ACCEPT",
+        battle: "BATTLE",
     },
     metrics: MetricLabels {
         context: "Ctx",
         quota: "Quota",
         cache: "Cache",
         cost: "Cost",
+        subagent_cost: "sub",
         today: "Today",
         week: "Week",
         sandbox_on: "Sandbox ON",
         sandbox_off: "Sandbox off",
+        sandbox_net: "net",
         artifacts: "art",
         subagents: "agents",
         tasks: "tasks",
@@ -108,16 +114,19 @@ pub const ZH_HANS: Labels = Labels {
         plan: "规划",
         auto: "自动",
         accept_edits: "接受编辑",
+        battle: "对战",
     },
     metrics: MetricLabels {
         context: "上下文",
         quota: "配额",
         cache: "缓存",
         cost: "费用",
+        subagent_cost: "子代理",
         today: "今日",
         week: "本周",
         sandbox_on: "沙箱开启",
         sandbox_off: "沙箱关闭",
+        sandbox_net: "联网",
         artifacts: "产物",
         subagents: "子代理",
         tasks: "后台",
@@ -149,16 +158,19 @@ pub const JA: Labels = Labels {
         plan: "計画",
         auto: "自動",
         accept_edits: "編集承認",
+        battle: "対戦",
     },
     metrics: MetricLabels {
         context: "コンテキスト",
         quota: "利用枠",
         cache: "キャッシュ",
         cost: "費用",
+        subagent_cost: "子",
         today: "本日",
         week: "今週",
         sandbox_on: "サンドボックスON",
         sandbox_off: "サンドボックスOFF",
+        sandbox_net: "ネット",
         artifacts: "成果物",
         subagents: "サブエージェント",
         tasks: "タスク",
@@ -266,13 +278,22 @@ mod tests {
         assert_eq!(ja.metrics.context, "コンテキスト");
         assert_eq!(ja.metrics.quota, "利用枠");
         assert_eq!(ja.mode.plan, "計画");
+        assert_eq!(ja.mode.battle, "対戦");
+        assert_eq!(ja.metrics.subagent_cost, "子");
+        assert_eq!(ja.metrics.sandbox_net, "ネット");
 
         let zh = get_labels(Language::ZhHans);
         assert_eq!(zh.state.idle, "就绪");
         assert_eq!(zh.metrics.context, "上下文");
+        assert_eq!(zh.mode.battle, "对战");
+        assert_eq!(zh.metrics.subagent_cost, "子代理");
+        assert_eq!(zh.metrics.sandbox_net, "联网");
 
         let en = get_labels(Language::En);
         assert_eq!(en.state.idle, "READY");
+        assert_eq!(en.mode.battle, "BATTLE");
+        assert_eq!(en.metrics.subagent_cost, "sub");
+        assert_eq!(en.metrics.sandbox_net, "net");
 
         let auto = get_labels(Language::Auto);
         assert_eq!(auto.state.idle, "READY");

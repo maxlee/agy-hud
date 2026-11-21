@@ -73,6 +73,6 @@
     "+- ~ THINKING | [PLAN] | [Gemini 4 Argon . high] | agy-hud > hud-cli git:(feat/ascii* ^14) | 5m",
     "|- Ctx ####=--- 55.0% | agents 1/2",
     "|- Quota(5h) ##--- 40%^ (3h 45m)",
-    "+- ~ Security Scanner [active] (10s)"
+    "+- ~ Security Scanner [active . 3-flash] (10s)"
   ]
 }

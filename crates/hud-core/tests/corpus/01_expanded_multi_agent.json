@@ -104,7 +104,7 @@
     "├─ Quota(weekly) █▒··· 32% (4d)",
     "├─ ◐ run_command: cargo test --workspace · ✓ edit_file ×3: render.rs",
     "├─ Skills: hud │ MCP: context7",
-    "├─ ◐ Architecture Reviewer [research] (12s) │ ✓ Test Runner [verifier] (25s)",
+    "├─ ◐ Architecture Reviewer [research · 3.1-pro] (12s) │ ✓ Test Runner [verifier · 3-flash] (25s)",
     "╰─ ▸ Validate corpus snapshots (1/2 · 50%)"
   ]
 }

@@ -8,8 +8,8 @@ use crate::probes::{is_newer_semver, normalize_semver_tag, resolve_output_speed_
 use crate::stdin::{
     CompactionInputs, compute_quota_pace, extract_context_metrics_scaled,
     extract_quota_buckets_reconciled, format_compact_tokens, format_duration_seconds,
-    format_model_name_with_glyphs, format_session_cost, format_workspace_breadcrumb,
-    normalize_plan_tier,
+    format_model_name_with_glyphs, format_session_cost, format_subagent_model_label,
+    format_workspace_breadcrumb, normalize_plan_tier,
 };
 use crate::transcript::parse_subagent_status;
 use crate::types::{
@@ -192,6 +192,23 @@ fn render_mode_badges(
         parts.push(paint(&format!("[{vim_mode}]"), &[vim_color, BOLD]));
     }
 
+    if let Some(battle) = stdin.and_then(|s| s.battle.as_ref()) {
+        let status_clean = sanitize_text(battle.status.as_deref().unwrap_or(""));
+        let status_lower = status_clean.to_ascii_lowercase();
+        if !status_lower.is_empty()
+            && !matches!(
+                status_lower.as_str(),
+                "none" | "inactive" | "off" | "disabled"
+            )
+        {
+            let badge_text = match battle.focused_arm {
+                Some(n) if n > 0 => format!("[{} #{n}]", labels.mode.battle),
+                _ => format!("[{}]", labels.mode.battle),
+            };
+            parts.push(paint(&badge_text, &[colors::MAGENTA, BOLD]));
+        }
+    }
+
     let custom_agent = sanitize_text(
         stdin
             .and_then(|s| s.agent.as_ref())
@@ -322,6 +339,7 @@ fn render_vcs_segment(
 #[derive(Clone, Copy)]
 struct HeaderOpts {
     show_title: bool,
+    show_session_id: bool,
     show_custom_tag: bool,
     show_duration: bool,
     show_update: bool,
@@ -340,6 +358,7 @@ struct HeaderOpts {
 #[derive(Clone, Copy)]
 struct MetricsOpts {
     compact_meta: bool,
+    show_subagent_cost: bool,
     show_cache_hit_rate: bool,
     quota_bar_enabled: bool,
     context_value: ContextValueMode,
@@ -411,19 +430,24 @@ fn render_context_segment(
             .map(format_compact_tokens)
             .unwrap_or_else(|| "?".to_string());
         let ratio = format!("{}{}", paint(&used_str, &[BOLD]), paint("/?", &[DIM]));
+        let ratio_with_hint = if stdin.and_then(|s| s.exceeds_200k_tokens) == Some(true) {
+            format!("{ratio} {}", paint("(>200k)", &[colors::YELLOW]))
+        } else {
+            ratio
+        };
         let value_text = match (opts.context_value, compaction_badge) {
             (ContextValueMode::Tokens, Some(badge)) => {
-                format!("{ratio}{}{badge}", paint(mid_dot, &[DIM]))
+                format!("{ratio_with_hint}{}{badge}", paint(mid_dot, &[DIM]))
             }
             (_, Some(badge)) => {
                 format!(
-                    "{ratio} {}{}{}",
+                    "{ratio_with_hint} {}{}{}",
                     paint("(", &[DIM]),
                     badge,
                     paint(")", &[DIM])
                 )
             }
-            (_, None) => ratio,
+            (_, None) => ratio_with_hint,
         };
         return format!(
             "{} {value_text}{cache_part}",
@@ -842,9 +866,27 @@ fn collect_counts_and_meta_items(
             } else {
                 ""
             };
+            let main_cost = paint(&format!("{prefix}{formatted_usd}"), &[colors::YELLOW, BOLD]);
+            let sub_suffix = if !opts.compact_meta
+                && opts.show_subagent_cost
+                && let Some(sub_usd) = cost.subagent_usd
+                && sub_usd.is_finite()
+                && sub_usd >= 0.001
+                && let Some(formatted_sub) = format_session_cost(sub_usd)
+            {
+                format!(
+                    " {}",
+                    paint(
+                        &format!("({} {formatted_sub})", labels.metrics.subagent_cost),
+                        &[DIM],
+                    )
+                )
+            } else {
+                String::new()
+            };
             items.push(MetaTaggedItem {
                 tag: "cost",
-                rendered: paint(&format!("{prefix}{formatted_usd}"), &[colors::YELLOW, BOLD]),
+                rendered: format!("{main_cost}{sub_suffix}"),
             });
         }
 
@@ -920,19 +962,25 @@ fn collect_counts_and_meta_items(
     }
 
     if config.display.show_sandbox
-        && stdin
-            .and_then(|s| s.sandbox.as_ref())
-            .and_then(|sb| sb.enabled)
-            == Some(true)
+        && let Some(sb) = stdin.and_then(|s| s.sandbox.as_ref())
+        && sb.enabled == Some(true)
     {
-        let badge = match gm {
+        let base_badge = match gm {
             GlyphMode::Ascii => labels.metrics.sandbox_on.to_string(),
             GlyphMode::Nerd => format!("\u{f0a3} {}", labels.metrics.sandbox_on),
             GlyphMode::Unicode => format!("🛡 {}", labels.metrics.sandbox_on),
         };
+        let rendered = if sb.allow_network == Some(true) {
+            paint(
+                &format!("{base_badge} ({})", labels.metrics.sandbox_net),
+                &[colors::YELLOW, BOLD],
+            )
+        } else {
+            paint(&base_badge, &[colors::GREEN, BOLD])
+        };
         items.push(MetaTaggedItem {
             tag: "sandbox",
-            rendered: paint(&badge, &[colors::GREEN, BOLD]),
+            rendered,
         });
     }
 
@@ -1122,22 +1170,42 @@ fn render_subagents_line(
                 SubagentStatus::Error => paint(if ascii { "x" } else { "✗" }, &[colors::RED, BOLD]),
                 SubagentStatus::Completed => paint(if ascii { "+" } else { "✓" }, &[colors::GREEN]),
             };
-            let title = match ag.role.as_deref() {
-                Some(role) if !role.is_empty() => {
-                    let styled_role = if active {
-                        paint(role, &[BOLD])
-                    } else {
-                        role.to_string()
-                    };
-                    format!("{styled_role} {}", paint(&format!("[{}]", ag.name), &[DIM]))
+            let model_label = config
+                .display
+                .show_subagent_model
+                .then(|| ag.model.as_deref().and_then(format_subagent_model_label))
+                .flatten();
+            let model_dot = if ascii { " . " } else { " · " };
+            let style_primary = |text: &str| {
+                if active {
+                    paint(text, &[BOLD])
+                } else {
+                    text.to_string()
                 }
-                _ => {
-                    if active {
-                        paint(&ag.name, &[BOLD])
-                    } else {
-                        ag.name.clone()
-                    }
+            };
+            let title = match (ag.role.as_deref().filter(|r| !r.is_empty()), model_label) {
+                (Some(role), Some(model)) => format!(
+                    "{} {}{}{}",
+                    style_primary(role),
+                    paint(&format!("[{}{model_dot}", ag.name), &[DIM]),
+                    paint(&model, &[colors::MAGENTA]),
+                    paint("]", &[DIM]),
+                ),
+                (Some(role), None) => {
+                    format!(
+                        "{} {}",
+                        style_primary(role),
+                        paint(&format!("[{}]", ag.name), &[DIM])
+                    )
                 }
+                (None, Some(model)) => format!(
+                    "{} {}{}{}",
+                    style_primary(&ag.name),
+                    paint("[", &[DIM]),
+                    paint(&model, &[colors::MAGENTA]),
+                    paint("]", &[DIM]),
+                ),
+                (None, None) => style_primary(&ag.name),
             };
             let elapsed = if let Some(start) = ag.started_at {
                 let end = ag.ended_at.unwrap_or(now_ms);
@@ -1343,6 +1411,19 @@ pub fn format_speed_badge(
     )
 }
 
+fn short_session_id_prefix(raw: &str) -> Option<String> {
+    let clean = sanitize_text(raw);
+    let prefix: String = clean
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
+        .take(8)
+        .collect();
+    prefix
+        .chars()
+        .any(|c| c.is_ascii_alphanumeric())
+        .then_some(prefix)
+}
+
 fn build_header_line(
     input: &RenderInput<'_>,
     labels: &Labels,
@@ -1473,6 +1554,16 @@ fn build_header_line(
             let clipped = truncate_ansi_with_ellipsis(&clean_title, 24, ellipsis(gm));
             header_parts.push(format!("\"{clipped}\""));
         }
+    }
+    if opts.show_session_id
+        && let Some(prefix) = stdin.and_then(|s| {
+            s.conversation_id
+                .as_deref()
+                .and_then(short_session_id_prefix)
+                .or_else(|| s.session_id.as_deref().and_then(short_session_id_prefix))
+        })
+    {
+        header_parts.push(paint(&format!("#{prefix}"), &[DIM]));
     }
     if opts.show_duration
         && let Some(started_at) = transcript.session_started_at
@@ -1922,6 +2013,7 @@ pub fn render_hud_lines_full(input: RenderInput<'_>, extras: RenderExtras<'_>) -
 
     let mut header_opts = HeaderOpts {
         show_title: config.display.show_title,
+        show_session_id: config.display.show_session_id,
         show_custom_tag: true,
         show_duration: config.display.show_duration,
         show_update: config.updates.enabled,
@@ -1948,7 +2040,10 @@ pub fn render_hud_lines_full(input: RenderInput<'_>, extras: RenderExtras<'_>) -
     let mut line1 = build_header_line(&input, labels, &header_opts, line_budget);
     if let Some(budget) = line_budget {
         let header_steps: [fn(&mut HeaderOpts); 7] = [
-            |o| o.show_title = false,
+            |o| {
+                o.show_title = false;
+                o.show_session_id = false;
+            },
             |o| {
                 o.show_custom_tag = false;
                 o.show_duration = false;
@@ -1987,6 +2082,7 @@ pub fn render_hud_lines_full(input: RenderInput<'_>, extras: RenderExtras<'_>) -
         || config.display.show_weekly_cost;
     let base_metrics_opts = MetricsOpts {
         compact_meta: layout_mode == LineLayout::Compact,
+        show_subagent_cost: true,
         show_cache_hit_rate: config.display.show_cache_hit_rate,
         quota_bar_enabled: config.display.quota_bar_enabled,
         context_value: config.display.context_value,
@@ -2094,7 +2190,8 @@ pub fn render_hud_lines_full(input: RenderInput<'_>, extras: RenderExtras<'_>) -
             &ctx_opts,
         );
         if let Some(budget) = line_budget {
-            let ctx_steps: [fn(&mut MetricsOpts); 5] = [
+            let ctx_steps: [fn(&mut MetricsOpts); 6] = [
+                |o| o.show_subagent_cost = false,
                 |o| o.compact_meta = true,
                 |o| o.show_cache_hit_rate = false,
                 |o| {

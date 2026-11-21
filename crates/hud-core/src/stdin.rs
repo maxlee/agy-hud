@@ -265,10 +265,16 @@ fn strip_trailing_paren(name: &str) -> &str {
 
 fn strip_short_model_prefixes(name: &str) -> &str {
     let mut s = name.trim();
-    if s.len() >= 7 && s[..7].eq_ignore_ascii_case("google ") {
+    if s.as_bytes()
+        .get(..7)
+        .is_some_and(|p| p.eq_ignore_ascii_case(b"google "))
+    {
         s = s[7..].trim_start();
     }
-    if s.len() >= 7 && s[..7].eq_ignore_ascii_case("gemini ") {
+    if s.as_bytes()
+        .get(..7)
+        .is_some_and(|p| p.eq_ignore_ascii_case(b"gemini "))
+    {
         let rest = s[7..].trim_start();
         // Optional version token e.g. "4 " or "2.5 "
         if let Some(space_idx) = rest.find(' ') {
@@ -277,7 +283,11 @@ fn strip_short_model_prefixes(name: &str) -> &str {
                 s = rest[space_idx + 1..].trim_start();
             }
         }
-    } else if s.len() >= 7 && s[..7].eq_ignore_ascii_case("claude ") {
+    } else if s
+        .as_bytes()
+        .get(..7)
+        .is_some_and(|p| p.eq_ignore_ascii_case(b"claude "))
+    {
         s = s[7..].trim_start();
     }
     s
@@ -358,6 +368,154 @@ pub fn format_model_name_with_glyphs(
         EffortFormatMode::Text => format!("{base} {dot_sep} {}", effort_short(&inferred_effort)),
         EffortFormatMode::Hidden => base.to_string(),
     }
+}
+
+fn capitalize_ascii_first(s: &str) -> String {
+    let mut chars = s.chars();
+    let Some(first) = chars.next() else {
+        return String::new();
+    };
+    let mut out = String::with_capacity(s.len());
+    out.push(first.to_ascii_uppercase());
+    out.push_str(chars.as_str());
+    out
+}
+
+fn is_version_token(tok: &str) -> bool {
+    !tok.is_empty()
+        && tok.bytes().any(|b| b.is_ascii_digit())
+        && tok.bytes().all(|b| b.is_ascii_digit() || b == b'.')
+}
+
+fn is_generic_gemini_tier(tok_lower: &str) -> bool {
+    matches!(
+        tok_lower,
+        "pro" | "flash" | "ultra" | "mini" | "nano" | "exp" | "preview" | "lite" | "image"
+    )
+}
+
+fn format_claude_slug_rest(rest: &str) -> Option<String> {
+    let mut parts: Vec<&str> = rest.split('-').filter(|p| !p.is_empty()).collect();
+    if parts.is_empty() {
+        return None;
+    }
+    if parts.len() >= 3
+        && parts
+            .last()
+            .is_some_and(|p| p.len() == 8 && p.bytes().all(|b| b.is_ascii_digit()))
+    {
+        parts.pop();
+    }
+    let mut tokens: Vec<String> = Vec::new();
+    let mut idx = 0;
+    while idx < parts.len() {
+        if parts[idx].bytes().all(|b| b.is_ascii_digit()) {
+            let mut ver = parts[idx].to_string();
+            while idx + 1 < parts.len() && parts[idx + 1].bytes().all(|b| b.is_ascii_digit()) {
+                idx += 1;
+                ver.push('.');
+                ver.push_str(parts[idx]);
+            }
+            tokens.push(ver);
+        } else {
+            tokens.push(capitalize_ascii_first(&parts[idx].to_ascii_lowercase()));
+        }
+        idx += 1;
+    }
+    (!tokens.is_empty()).then(|| tokens.join(" "))
+}
+
+fn is_noise_model_token(s: &str) -> bool {
+    let trimmed = s.trim();
+    trimmed.is_empty()
+        || trimmed.eq_ignore_ascii_case("inherit")
+        || trimmed.eq_ignore_ascii_case("default")
+        || trimmed.eq_ignore_ascii_case("auto")
+}
+
+/// Formats a raw subagent model identifier or display name into a compact badge label
+/// (`"Gemini 4 Hydrogen (XHigh)"` -> `"Hydrogen"`, `"gemini-3.1-pro"` -> `"3.1-pro"`,
+/// `"claude-sonnet-5-5-high"` -> `"Sonnet 5.5"`), returning `None` for empty or noise tokens.
+pub fn format_subagent_model_label(raw: &str) -> Option<String> {
+    let clean = sanitize_text(raw);
+    let mut s = clean.trim().to_string();
+    if is_noise_model_token(&s) {
+        return None;
+    }
+
+    loop {
+        let next = strip_trailing_paren(&s);
+        if next.len() == s.len() {
+            break;
+        }
+        s = next.to_string();
+    }
+    s = strip_trailing_efforts(s, None, true);
+    let trimmed = s.trim();
+    if is_noise_model_token(trimmed) {
+        return None;
+    }
+
+    if !trimmed.contains(' ') && trimmed.contains('-') {
+        let lower = trimmed.to_ascii_lowercase();
+        let slug = lower.strip_prefix("google-").unwrap_or(&lower);
+
+        if let Some(rest) = slug.strip_prefix("gemini-") {
+            if rest.is_empty() {
+                return None;
+            }
+            if rest
+                .split('-')
+                .any(|seg| seg.eq_ignore_ascii_case("orchestrator"))
+            {
+                return Some("Orchestrator".to_string());
+            }
+            let parts: Vec<&str> = rest.split('-').filter(|p| !p.is_empty()).collect();
+            if parts.is_empty() {
+                return None;
+            }
+            if parts.len() >= 2 && is_version_token(parts[0]) && !is_generic_gemini_tier(parts[1]) {
+                let first_cap = capitalize_ascii_first(parts[1]);
+                return Some(if parts.len() == 2 {
+                    first_cap
+                } else {
+                    format!("{first_cap}-{}", parts[2..].join("-"))
+                });
+            }
+            if parts.len() == 1 && !is_generic_gemini_tier(parts[0]) {
+                return Some(capitalize_ascii_first(parts[0]));
+            }
+            return Some(parts.join("-"));
+        }
+
+        if let Some(rest) = slug.strip_prefix("claude-") {
+            return format_claude_slug_rest(rest);
+        }
+
+        let parts: Vec<&str> = slug.split('-').filter(|p| !p.is_empty()).collect();
+        if parts.len() == 2
+            && parts[0] == "orchestrator"
+            && matches!(parts[1], "neon" | "argon" | "carbon" | "hydrogen")
+        {
+            return Some("Orchestrator".to_string());
+        }
+
+        return Some(trimmed.to_string());
+    }
+
+    let mut base = strip_short_model_prefixes(trimmed);
+    if base
+        .as_bytes()
+        .get(..11)
+        .is_some_and(|p| p.eq_ignore_ascii_case(b"gemini pro "))
+    {
+        let after = base[11..].trim_start();
+        if after.to_ascii_lowercase().starts_with("orchestrator") {
+            base = after;
+        }
+    }
+    let final_str = base.trim();
+    (!is_noise_model_token(final_str)).then(|| final_str.to_string())
 }
 
 /// Normalizes verbose plan tier names (e.g. `"Google AI Pro"` -> `"Pro"`).
@@ -1819,5 +1977,64 @@ mod tests {
             Some("gemini 4 argon (1m)".to_string()),
         );
         assert!(!db_ceiling_matches_family(&qual_db, Some("gemini 4 argon")));
+    }
+
+    #[test]
+    fn subagent_model_label_formats_display_names_slugs_and_filters_noise() {
+        for noise in [
+            "",
+            "   ",
+            "\x1b[31m  \x1b[0m",
+            "inherit",
+            "INHERIT",
+            " default ",
+            "AUTO",
+            "()",
+            "(high)",
+            "gemini-",
+            "claude-",
+        ] {
+            assert_eq!(
+                format_subagent_model_label(noise),
+                None,
+                "expected None for noise input {noise:?}"
+            );
+        }
+
+        let cases = [
+            ("Gemini 4 Hydrogen (XHigh)", "Hydrogen"),
+            ("Claude Sonnet 5.5 (High)", "Sonnet 5.5"),
+            ("Orchestrator (Neon)", "Orchestrator"),
+            ("Orchestrator (Carbon) (High)", "Orchestrator"),
+            ("Gemini Pro Orchestrator (High)", "Orchestrator"),
+            ("gemini-4-hydrogen-xhigh", "Hydrogen"),
+            ("gemini-4-neon-high", "Neon"),
+            ("gemini-4-carbon-medium", "Carbon"),
+            ("gemini-4-argon-low", "Argon"),
+            ("google-gemini-4-argon-x-high", "Argon"),
+            ("gemini-3.1-pro", "3.1-pro"),
+            ("gemini-3-flash", "3-flash"),
+            ("gemini-3.8-flash-high", "3.8-flash"),
+            ("gemini-2.5-flash-lite", "2.5-flash-lite"),
+            ("claude-sonnet-5-5-high", "Sonnet 5.5"),
+            ("claude-opus-5-5-medium", "Opus 5.5"),
+            ("claude-haiku-4-5-20251001", "Haiku 4.5"),
+            ("claude-3-5-sonnet-20241022", "3.5 Sonnet"),
+            ("gemini-pro-orchestrator-neon", "Orchestrator"),
+            ("  \x1b[35mgemini-4-neon-xhigh\x1b[0m ", "Neon"),
+            ("gpt-5.4-high", "gpt-5.4"),
+            ("自定义模型名称", "自定义模型名称"),
+            ("🚀自定义模型名称", "🚀自定义模型名称"),
+            ("Gemini 4 🚀X", "🚀X"),
+            ("模型-名称", "模型-名称"),
+            ("gemini-4-模型", "模型"),
+        ];
+        for (raw, expected) in cases {
+            assert_eq!(
+                format_subagent_model_label(raw).as_deref(),
+                Some(expected),
+                "unexpected label for {raw:?}"
+            );
+        }
     }
 }
