@@ -1073,87 +1073,187 @@ pub fn probe_vcs_cached(
     Some(fresh_json)
 }
 
-pub fn probe_memory(runner: &dyn ProbeRunner) -> Option<String> {
-    if cfg!(target_os = "linux")
-        && let Some(meminfo) = read_bounded_string(Path::new("/proc/meminfo"), 64 * 1024)
-    {
-        let mut total_kb: Option<u64> = None;
-        let mut avail_kb: Option<u64> = None;
-        for line in meminfo.lines() {
-            if let Some(rest) = line.strip_prefix("MemTotal:") {
-                total_kb = rest.split_whitespace().next().and_then(|s| s.parse().ok());
-            } else if let Some(rest) = line.strip_prefix("MemAvailable:") {
-                avail_kb = rest.split_whitespace().next().and_then(|s| s.parse().ok());
+pub const MEMORY_CACHE_TTL_MS: i64 = 2_000;
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MemoryCacheEntry {
+    at: i64,
+    expires_at: i64,
+    total_bytes: u64,
+    value: String,
+}
+
+fn probe_linux_memory() -> Option<String> {
+    if !cfg!(target_os = "linux") {
+        return None;
+    }
+    let meminfo = read_bounded_string(Path::new("/proc/meminfo"), 64 * 1024)?;
+    let mut total_kb: Option<u64> = None;
+    let mut avail_kb: Option<u64> = None;
+    for line in meminfo.lines() {
+        if let Some(rest) = line.strip_prefix("MemTotal:") {
+            total_kb = rest.split_whitespace().next().and_then(|s| s.parse().ok());
+        } else if let Some(rest) = line.strip_prefix("MemAvailable:") {
+            avail_kb = rest.split_whitespace().next().and_then(|s| s.parse().ok());
+        }
+    }
+    let (Some(tot), Some(avail)) = (total_kb, avail_kb) else {
+        return None;
+    };
+    if tot == 0 {
+        return None;
+    }
+    let total_bytes = tot * 1024;
+    let used_bytes = total_bytes.saturating_sub(avail * 1024);
+    let used_percent = (((used_bytes as f64) / (total_bytes as f64)) * 100.0)
+        .round()
+        .clamp(0.0, 100.0) as u64;
+    serde_json::to_string(&MemoryProbeInfo {
+        total_bytes,
+        used_bytes,
+        used_percent,
+    })
+    .ok()
+}
+
+fn parse_macos_vm_stat(total_bytes: u64, vm_out: &str) -> Option<String> {
+    if total_bytes == 0 {
+        return None;
+    }
+    let mut page_size = 16_384u64;
+    let mut active = 0u64;
+    let mut wired = 0u64;
+    let mut compressed = 0u64;
+
+    for line in vm_out.lines() {
+        if let Some(idx) = line.find("page size of ") {
+            let after = &line[idx + "page size of ".len()..];
+            if let Some(num_str) = after.split_whitespace().next()
+                && let Ok(ps) = num_str.parse::<u64>()
+            {
+                page_size = ps;
+            }
+        } else if let Some((label, raw_val)) = line.split_once(':') {
+            let num = raw_val
+                .trim()
+                .trim_end_matches('.')
+                .parse::<u64>()
+                .unwrap_or(0);
+            match label.trim() {
+                "Pages active" => active = num,
+                "Pages wired down" => wired = num,
+                "Pages occupied by compressor" => compressed = num,
+                _ => {}
             }
         }
-        if let (Some(tot), Some(avail)) = (total_kb, avail_kb)
-            && tot > 0
-        {
-            let total_bytes = tot * 1024;
-            let used_bytes = total_bytes.saturating_sub(avail * 1024);
-            let used_percent = (((used_bytes as f64) / (total_bytes as f64)) * 100.0)
-                .round()
-                .clamp(0.0, 100.0) as u64;
-            return serde_json::to_string(&MemoryProbeInfo {
-                total_bytes,
-                used_bytes,
-                used_percent,
-            })
-            .ok();
+    }
+    let used_pages = active.saturating_add(wired).saturating_add(compressed);
+    if used_pages == 0 {
+        return None;
+    }
+    let used_bytes = total_bytes.min(used_pages.saturating_mul(page_size));
+    let used_percent = (((used_bytes as f64) / (total_bytes as f64)) * 100.0)
+        .round()
+        .clamp(0.0, 100.0) as u64;
+    serde_json::to_string(&MemoryProbeInfo {
+        total_bytes,
+        used_bytes,
+        used_percent,
+    })
+    .ok()
+}
+
+fn read_macos_total_bytes(runner: &dyn ProbeRunner) -> Option<u64> {
+    let sysctl_args = vec!["-n".to_string(), "hw.memsize".to_string()];
+    runner
+        .run("sysctl", &sysctl_args, None)
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|&b| b > 0)
+}
+
+fn is_symlink_path(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink())
+}
+
+fn probe_macos_memory_cached(
+    paths: &AgyPaths,
+    now_ms: i64,
+    runner: &dyn ProbeRunner,
+) -> Option<String> {
+    let cache_allowed =
+        !is_symlink_path(&paths.hud_home) && !is_symlink_path(&paths.probe_cache_dir);
+    let cache_file = paths.probe_cache_dir.join("memory.json");
+
+    let cached = if cache_allowed {
+        read_bounded_string(&cache_file, 16 * 1024)
+            .and_then(|raw| serde_json::from_str::<MemoryCacheEntry>(&raw).ok())
+            .filter(|entry| entry.total_bytes > 0)
+    } else {
+        None
+    };
+
+    if let Some(ref entry) = cached
+        && now_ms >= entry.at
+        && now_ms < entry.expires_at
+        && serde_json::from_str::<MemoryProbeInfo>(&entry.value)
+            .is_ok_and(|info| info.total_bytes > 0)
+    {
+        return Some(entry.value.clone());
+    }
+
+    let total_bytes = cached
+        .as_ref()
+        .map(|entry| entry.total_bytes)
+        .or_else(|| read_macos_total_bytes(runner))?;
+
+    let vm_out = runner.run("vm_stat", &[], None)?;
+    let fresh_json = parse_macos_vm_stat(total_bytes, &vm_out)?;
+
+    if cache_allowed {
+        let entry = MemoryCacheEntry {
+            at: now_ms,
+            expires_at: now_ms.saturating_add(MEMORY_CACHE_TTL_MS),
+            total_bytes,
+            value: fresh_json.clone(),
+        };
+        if let Ok(bytes) = serde_json::to_vec(&entry) {
+            let _ = create_private_dir_all(&paths.probe_cache_dir);
+            let _ = atomic_write_bytes(&cache_file, &bytes, 0o600);
         }
+    }
+
+    Some(fresh_json)
+}
+
+pub fn probe_memory(runner: &dyn ProbeRunner) -> Option<String> {
+    if cfg!(target_os = "linux") {
+        return probe_linux_memory();
     }
 
     if cfg!(target_os = "macos") {
-        let sysctl_args = vec!["-n".to_string(), "hw.memsize".to_string()];
-        let total_bytes = runner
-            .run("sysctl", &sysctl_args, None)
-            .and_then(|s| s.trim().parse::<u64>().ok())?;
-        if total_bytes == 0 {
-            return None;
-        }
+        let total_bytes = read_macos_total_bytes(runner)?;
         let vm_out = runner.run("vm_stat", &[], None)?;
-        let mut page_size = 16_384u64;
-        let mut active = 0u64;
-        let mut wired = 0u64;
-        let mut compressed = 0u64;
-
-        for line in vm_out.lines() {
-            if let Some(idx) = line.find("page size of ") {
-                let after = &line[idx + "page size of ".len()..];
-                if let Some(num_str) = after.split_whitespace().next()
-                    && let Ok(ps) = num_str.parse::<u64>()
-                {
-                    page_size = ps;
-                }
-            } else if let Some((label, raw_val)) = line.split_once(':') {
-                let num = raw_val
-                    .trim()
-                    .trim_end_matches('.')
-                    .parse::<u64>()
-                    .unwrap_or(0);
-                match label.trim() {
-                    "Pages active" => active = num,
-                    "Pages wired down" => wired = num,
-                    "Pages occupied by compressor" => compressed = num,
-                    _ => {}
-                }
-            }
-        }
-        let used_pages = active.saturating_add(wired).saturating_add(compressed);
-        if used_pages > 0 {
-            let used_bytes = total_bytes.min(used_pages.saturating_mul(page_size));
-            let used_percent = (((used_bytes as f64) / (total_bytes as f64)) * 100.0)
-                .round()
-                .clamp(0.0, 100.0) as u64;
-            return serde_json::to_string(&MemoryProbeInfo {
-                total_bytes,
-                used_bytes,
-                used_percent,
-            })
-            .ok();
-        }
+        return parse_macos_vm_stat(total_bytes, &vm_out);
     }
 
+    None
+}
+
+/// Cached host memory probe used on the 300ms hot path.
+/// On macOS, persists `hw.memsize` (`total_bytes`) and caches `vm_stat` readings for `2000ms` in
+/// `<hudHome>/probe-cache/memory.json`. On Linux, reads `/proc/meminfo` directly without caching.
+pub fn probe_memory_cached(
+    paths: &AgyPaths,
+    now_ms: i64,
+    runner: &dyn ProbeRunner,
+) -> Option<String> {
+    if cfg!(target_os = "linux") {
+        return probe_linux_memory();
+    }
+    if cfg!(target_os = "macos") {
+        return probe_macos_memory_cached(paths, now_ms, runner);
+    }
     None
 }
 
@@ -1233,6 +1333,23 @@ pub fn collect_render_inputs(
             if !config.vcs.enabled {
                 return None;
             }
+            let has_stdin_identity = stdin.vcs.as_ref().is_some_and(|sv| {
+                sv.branch.as_deref().is_some_and(|b| !b.trim().is_empty())
+                    || sv.client.as_deref().is_some_and(|c| !c.trim().is_empty())
+            });
+            let has_stdin_client = stdin
+                .vcs
+                .as_ref()
+                .and_then(|v| v.client.as_deref())
+                .is_some_and(|c| !c.trim().is_empty());
+            if has_stdin_identity
+                && ((!config.vcs.show_ahead_behind
+                    && !config.vcs.show_file_stats
+                    && !config.hyperlinks)
+                    || has_stdin_client)
+            {
+                return None;
+            }
             let dir = cwd?;
             probe_vcs_cached(
                 dir,
@@ -1248,7 +1365,7 @@ pub fn collect_render_inputs(
             if !config.display.show_memory {
                 return None;
             }
-            probe_memory(runner)
+            probe_memory_cached(paths, now_ms, runner)
         });
 
         let db_handle = s.spawn(|| {
@@ -1313,4 +1430,280 @@ pub fn collect_render_inputs(
             },
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hud_core::probes::{parse_memory_info, parse_vcs_info};
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct TempDirGuard(PathBuf);
+
+    impl TempDirGuard {
+        fn new(label: &str) -> Self {
+            let pid = std::process::id();
+            let nanos = std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let dir = std::env::temp_dir().join(format!("agy-hud-collector-{label}-{pid}-{nanos}"));
+            fs::create_dir_all(&dir).expect("create temp dir");
+            Self(dir)
+        }
+    }
+
+    impl Drop for TempDirGuard {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn paths_in(root: &Path) -> AgyPaths {
+        let home = root.join("home");
+        let cli_dir = root.join("cli");
+        let hud_home = cli_dir.join("agy-hud");
+        let mut env = HashMap::new();
+        env.insert("HOME".to_string(), home.to_string_lossy().into_owned());
+        env.insert(
+            "USERPROFILE".to_string(),
+            home.to_string_lossy().into_owned(),
+        );
+        env.insert(
+            "AGY_CONFIG_DIR".to_string(),
+            home.join(".gemini/config").to_string_lossy().into_owned(),
+        );
+        env.insert(
+            "AGY_CLI_DIR".to_string(),
+            cli_dir.to_string_lossy().into_owned(),
+        );
+        env.insert(
+            "AGY_HUD_HOME".to_string(),
+            hud_home.to_string_lossy().into_owned(),
+        );
+        AgyPaths::from_env_map(&env)
+    }
+
+    #[test]
+    fn macos_memory_probe_caches_total_bytes_and_vm_stat_for_2000ms_ttl() {
+        let tmp = TempDirGuard::new("mem-cache");
+        let paths = paths_in(&tmp.0);
+        let calls: Mutex<Vec<String>> = Mutex::new(Vec::new());
+        let active_pages = AtomicUsize::new(200_000);
+
+        let runner = |cmd: &str, _args: &[String], _cwd: Option<&Path>| -> Option<String> {
+            calls.lock().unwrap().push(cmd.to_string());
+            match cmd {
+                "sysctl" => Some("17179869184\n".to_string()), // 16 GiB
+                "vm_stat" => {
+                    let act = active_pages.load(Ordering::SeqCst);
+                    Some(format!(
+                        "Mach Virtual Memory Statistics: (page size of 16384 bytes)\n\
+                         Pages active: {act}.\n\
+                         Pages wired down: 50000.\n\
+                         Pages occupied by compressor: 50000.\n"
+                    ))
+                }
+                _ => None,
+            }
+        };
+
+        let t0 = 1_700_000_000_000i64;
+
+        // 1. Cold miss: invokes `sysctl` + `vm_stat` (2 calls) and writes memory.json
+        let raw1 = probe_macos_memory_cached(&paths, t0, &runner).expect("cold macOS memory");
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            &["sysctl".to_string(), "vm_stat".to_string()]
+        );
+        let info1: MemoryProbeInfo = serde_json::from_str(&raw1).unwrap();
+        assert_eq!(info1.total_bytes, 17_179_869_184);
+        assert!(paths.probe_cache_dir.join("memory.json").is_file());
+
+        // 2. Warm hit within 2000ms TTL: 0 ProbeRunner calls!
+        calls.lock().unwrap().clear();
+        active_pages.store(400_000, Ordering::SeqCst);
+        let raw2 = probe_macos_memory_cached(&paths, t0 + 1_999, &runner).expect("warm cache hit");
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "expected 0 runner calls on cache hit, got {:?}",
+            *calls.lock().unwrap()
+        );
+        assert_eq!(raw2, raw1);
+
+        // 3. Past 2000ms TTL: reuses persisted `total_bytes`, invokes ONLY `vm_stat` (never `sysctl`!)
+        let raw3 = probe_macos_memory_cached(&paths, t0 + 2_000, &runner).expect("ttl refresh");
+        assert_eq!(calls.lock().unwrap().as_slice(), &["vm_stat".to_string()]);
+        let info3: MemoryProbeInfo = serde_json::from_str(&raw3).unwrap();
+        assert_eq!(info3.total_bytes, 17_179_869_184);
+        assert!(info3.used_bytes > info1.used_bytes);
+
+        // 4. Subsequent hit at t0 + 3500ms: 0 ProbeRunner calls again!
+        calls.lock().unwrap().clear();
+        let raw4 = probe_macos_memory_cached(&paths, t0 + 3_500, &runner).expect("second warm hit");
+        assert!(calls.lock().unwrap().is_empty());
+        assert_eq!(raw4, raw3);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn collect_render_inputs_hits_macos_memory_cache_with_zero_runner_calls() {
+        let tmp = TempDirGuard::new("collect-mem");
+        let paths = paths_in(&tmp.0);
+        let t0 = 1_700_000_000_000i64;
+        let seeded = MemoryCacheEntry {
+            at: t0,
+            expires_at: t0 + MEMORY_CACHE_TTL_MS,
+            total_bytes: 16_000_000_000,
+            value: serde_json::to_string(&MemoryProbeInfo {
+                total_bytes: 16_000_000_000,
+                used_bytes: 8_000_000_000,
+                used_percent: 50,
+            })
+            .unwrap(),
+        };
+        create_private_dir_all(&paths.probe_cache_dir).unwrap();
+        atomic_write_bytes(
+            &paths.probe_cache_dir.join("memory.json"),
+            &serde_json::to_vec(&seeded).unwrap(),
+            0o600,
+        )
+        .unwrap();
+
+        let calls = AtomicUsize::new(0);
+        let runner = |_cmd: &str, _args: &[String], _cwd: Option<&Path>| -> Option<String> {
+            calls.fetch_add(1, Ordering::SeqCst);
+            None
+        };
+
+        let mut cfg = HudConfig::default();
+        cfg.vcs.enabled = false;
+        cfg.updates.enabled = false;
+        cfg.display.show_speed = false;
+        cfg.display.show_memory = true;
+        let stdin = AgyStdinData::default();
+        let logic_paths = crate::paths::build_logic_paths(&paths, Some(&stdin), None);
+
+        let collected =
+            collect_render_inputs(&paths, &logic_paths, &cfg, &stdin, t0 + 500, &runner);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let mem = parse_memory_info(&collected.probes).expect("cached memory parsed");
+        assert_eq!(mem.used_percent, 50);
+    }
+
+    #[test]
+    fn collect_render_inputs_lightweight_vcs_fast_path_avoids_subprocesses() {
+        let tmp = TempDirGuard::new("lightweight-vcs");
+        let paths = paths_in(&tmp.0);
+        let repo_dir = tmp.0.join("repo");
+        fs::create_dir_all(repo_dir.join(".git/refs/heads")).unwrap();
+        fs::write(repo_dir.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+
+        let calls = AtomicUsize::new(0);
+        let runner = |_cmd: &str, _args: &[String], _cwd: Option<&Path>| -> Option<String> {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Some("# branch.head main\n# branch.ab +2 -1\n".to_string())
+        };
+
+        // 1. Lightweight config (`show_ahead_behind=false && show_file_stats=false && hyperlinks=false`)
+        //    with `stdin.vcs.branch` present -> 0 subprocesses, `probes.vcs == None`, `parse_vcs_info` uses stdin!
+        let mut light_cfg = HudConfig::default();
+        light_cfg.display.show_memory = false;
+        light_cfg.display.show_speed = false;
+        light_cfg.updates.enabled = false;
+        light_cfg.hyperlinks = false;
+        light_cfg.vcs.show_ahead_behind = false;
+        light_cfg.vcs.show_file_stats = false;
+
+        let stdin_branch = AgyStdinData {
+            cwd: Some(repo_dir.to_string_lossy().into_owned()),
+            vcs: Some(VcsStdin {
+                vcs_type: Some("git".to_string()),
+                branch: Some("feat/lightweight".to_string()),
+                dirty: Some(true),
+                client: None,
+            }),
+            ..Default::default()
+        };
+        let lp1 = crate::paths::build_logic_paths(&paths, Some(&stdin_branch), None);
+        let col1 = collect_render_inputs(
+            &paths,
+            &lp1,
+            &light_cfg,
+            &stdin_branch,
+            1_700_000_000_000,
+            &runner,
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(col1.probes.vcs.is_none());
+        let vcs1 = parse_vcs_info(Some(&stdin_branch), &col1.probes).unwrap();
+        assert_eq!(vcs1.branch, "feat/lightweight");
+        assert!(vcs1.dirty);
+
+        // 2. Even with `show_ahead_behind=true`, `show_file_stats=true`, `hyperlinks=true`,
+        //    non-empty `stdin.vcs.client` skips subprocesses!
+        let mut heavy_cfg = HudConfig::default();
+        heavy_cfg.display.show_memory = false;
+        heavy_cfg.display.show_speed = false;
+        heavy_cfg.updates.enabled = false;
+        heavy_cfg.hyperlinks = true;
+        heavy_cfg.vcs.show_ahead_behind = true;
+        heavy_cfg.vcs.show_file_stats = true;
+
+        let stdin_client = AgyStdinData {
+            cwd: Some(repo_dir.to_string_lossy().into_owned()),
+            vcs: Some(VcsStdin {
+                vcs_type: Some("hg".to_string()),
+                branch: None,
+                dirty: Some(false),
+                client: Some("citc-ws-42".to_string()),
+            }),
+            ..Default::default()
+        };
+        let lp2 = crate::paths::build_logic_paths(&paths, Some(&stdin_client), None);
+        let col2 = collect_render_inputs(
+            &paths,
+            &lp2,
+            &heavy_cfg,
+            &stdin_client,
+            1_700_000_000_000,
+            &runner,
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(col2.probes.vcs.is_none());
+        let vcs2 = parse_vcs_info(Some(&stdin_client), &col2.probes).unwrap();
+        assert_eq!(vcs2.vcs_type, VcsType::Hg);
+        assert_eq!(vcs2.branch, "citc-ws-42");
+
+        // 3. Negative control: heavy config without `client` invokes probe runner
+        let col3 = collect_render_inputs(
+            &paths,
+            &lp1,
+            &heavy_cfg,
+            &stdin_branch,
+            1_700_000_000_000,
+            &runner,
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(col3.probes.vcs.is_some());
+
+        // 4. Negative control: lightweight config without `stdin.vcs` branch/client invokes probe runner
+        let stdin_no_vcs = AgyStdinData {
+            cwd: Some(repo_dir.to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        let lp4 = crate::paths::build_logic_paths(&paths, Some(&stdin_no_vcs), None);
+        let col4 = collect_render_inputs(
+            &paths,
+            &lp4,
+            &light_cfg,
+            &stdin_no_vcs,
+            1_700_000_001_600,
+            &runner,
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(col4.probes.vcs.is_some());
+    }
 }

@@ -4192,3 +4192,345 @@ EOF
         "background refresh with --lock-token must NOT recreate hud_home after pre-start uninstall"
     );
 }
+
+#[test]
+fn pr2_sharded_speed_cache_isolates_concurrent_sessions_and_post_render_maintenance_prunes() {
+    let tmp = TempDir::new("pr2-speed-shards");
+    let fake_home = tmp.path.join("home");
+    let gemini_cfg = fake_home.join(".gemini/config");
+    let cli_dir = tmp.path.join("cli");
+    let hud_home = cli_dir.join("agy-hud");
+    fs::create_dir_all(&hud_home).unwrap();
+    fs::write(
+        hud_home.join("config.json"),
+        r#"{"updates":{"enabled":false},"vcs":{"enabled":false}}"#,
+    )
+    .unwrap();
+
+    let iso_secs_ago = |ago_secs: u64| -> String {
+        let secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            .saturating_sub(ago_secs) as i64;
+        let days = secs.div_euclid(86_400);
+        let sod = secs.rem_euclid(86_400);
+        let z = days + 719_468;
+        let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+        let doe = z - era * 146_097;
+        let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+        let y = yoe + era * 400;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let d = doy - (153 * mp + 2) / 5 + 1;
+        let m = mp + if mp < 10 { 3 } else { -9 };
+        let year = y + i64::from(m <= 2);
+        format!(
+            "{year:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z",
+            sod / 3600,
+            (sod % 3600) / 60,
+            sod % 60
+        )
+    };
+    let t_user = iso_secs_ago(15);
+    let t_planner = iso_secs_ago(5);
+
+    let write_session_tx = |conv_id: &str, output_tokens: u64| {
+        let log_dir = cli_dir
+            .join("brain")
+            .join(conv_id)
+            .join(".system_generated/logs");
+        fs::create_dir_all(&log_dir).unwrap();
+        let tx = log_dir.join("transcript.jsonl");
+        let body = format!(
+            "{}\n{}\n",
+            json!({
+                "step_index": 0,
+                "type": "USER_INPUT",
+                "status": "DONE",
+                "created_at": t_user,
+                "content": "go"
+            }),
+            json!({
+                "step_index": 1,
+                "type": "PLANNER_RESPONSE",
+                "status": "DONE",
+                "created_at": t_planner,
+                "model": "gemini-4-argon",
+                "output_tokens": output_tokens
+            }),
+        );
+        fs::write(&tx, body).unwrap();
+        tx
+    };
+
+    let tx_a = write_session_tx("conv-alpha", 1000);
+    let tx_b = write_session_tx("conv-beta", 200);
+
+    let env_vars: [(&str, &Path); 5] = [
+        ("HOME", fake_home.as_path()),
+        ("USERPROFILE", fake_home.as_path()),
+        ("AGY_CONFIG_DIR", gemini_cfg.as_path()),
+        ("AGY_CLI_DIR", cli_dir.as_path()),
+        ("AGY_HUD_HOME", hud_home.as_path()),
+    ];
+
+    let payload_a = json!({
+        "cwd": tmp.path,
+        "conversation_id": "conv-alpha",
+        "transcript_path": tx_a,
+        "agent_state": "idle",
+        "terminal_width": 120,
+        "model": { "id": "Gemini 4 Argon", "display_name": "Gemini 4 Argon" },
+        "context_window": { "used_percentage": 15.0 }
+    })
+    .to_string();
+    let payload_b = json!({
+        "cwd": tmp.path,
+        "conversation_id": "conv-beta",
+        "transcript_path": tx_b,
+        "agent_state": "idle",
+        "terminal_width": 120,
+        "model": { "id": "Gemini 4 Argon", "display_name": "Gemini 4 Argon" },
+        "context_window": { "used_percentage": 15.0 }
+    })
+    .to_string();
+
+    // Run both sessions concurrently and sequentially — neither may overwrite the other!
+    std::thread::scope(|s| {
+        let h1 = s.spawn(|| run_bin(&[], &env_vars, Some(&payload_a)));
+        let h2 = s.spawn(|| run_bin(&[], &env_vars, Some(&payload_b)));
+        let (ok1, out1) = h1.join().unwrap();
+        let (ok2, out2) = h2.join().unwrap();
+        assert!(ok1, "alpha failed: {out1}");
+        assert!(ok2, "beta failed: {out2}");
+    });
+
+    let data_dir = hud_home.join("data");
+    assert!(
+        !data_dir.join("speed-cache.json").exists(),
+        "sharded session renders must NOT write legacy data/speed-cache.json"
+    );
+    let shard_a = data_dir.join("speed-cache").join(format!(
+        "{}.json",
+        hud_cli::paths::fnv1a_64_hex("conv-alpha")
+    ));
+    let shard_b = data_dir.join("speed-cache").join(format!(
+        "{}.json",
+        hud_cli::paths::fnv1a_64_hex("conv-beta")
+    ));
+    assert!(shard_a.is_file(), "missing alpha shard: {shard_a:?}");
+    assert!(shard_b.is_file(), "missing beta shard: {shard_b:?}");
+
+    let json_a: Value = serde_json::from_str(&fs::read_to_string(&shard_a).unwrap()).unwrap();
+    let json_b: Value = serde_json::from_str(&fs::read_to_string(&shard_b).unwrap()).unwrap();
+    assert_eq!(json_a["sessionKey"], "conv-alpha");
+    assert_eq!(json_b["sessionKey"], "conv-beta");
+    assert!(
+        json_a["tpsX10"].as_u64().unwrap() > json_b["tpsX10"].as_u64().unwrap(),
+        "alpha and beta speeds must remain isolated: alpha={json_a}, beta={json_b}"
+    );
+
+    // Seed 265 files into data/speed-cache/, clear .maintenance-at, and verify post-render pruning trims to 256!
+    let sc_dir = data_dir.join("speed-cache");
+    for i in 0..265 {
+        fs::write(sc_dir.join(format!("extra-{i:03}.json")), b"{}").unwrap();
+    }
+    let _ = fs::remove_file(data_dir.join(".maintenance-at"));
+
+    // Payload with neither ID falls back to legacy speed-cache.json cleanly
+    let payload_no_id = json!({
+        "cwd": tmp.path,
+        "agent_state": "idle",
+        "terminal_width": 120,
+        "model": { "id": "Gemini 4 Argon", "display_name": "Gemini 4 Argon" },
+        "context_window": { "used_percentage": 15.0 }
+    })
+    .to_string();
+    let (ok_fallback, out_fallback) = run_bin(&[], &env_vars, Some(&payload_no_id));
+    assert!(ok_fallback, "fallback failed: {out_fallback}");
+
+    assert!(
+        data_dir.join(".maintenance-at").is_file(),
+        "post-render maintenance must write .maintenance-at"
+    );
+    let remaining_sc: usize = fs::read_dir(&sc_dir)
+        .unwrap()
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|ft| ft.is_file()))
+        .count();
+    assert!(
+        remaining_sc <= 256,
+        "expected speed-cache dir trimmed to <= 256 files, got {remaining_sc}"
+    );
+}
+
+#[test]
+fn pr2_cost_ledger_skips_lock_when_unchanged_and_tracks_degraded_write_in_heartbeat() {
+    let tmp = TempDir::new("pr2-ledger-and-heartbeat");
+    let fake_home = tmp.path.join("home");
+    let gemini_cfg = fake_home.join(".gemini/config");
+    let cli_dir = tmp.path.join("cli");
+    let hud_home = cli_dir.join("agy-hud");
+    fs::create_dir_all(&hud_home).unwrap();
+    fs::write(
+        hud_home.join("config.json"),
+        r#"{"updates":{"enabled":false},"vcs":{"enabled":false},"display":{"showDailyCost":true,"showWeeklyCost":true}}"#,
+    )
+    .unwrap();
+
+    let env_vars: [(&str, &Path); 5] = [
+        ("HOME", fake_home.as_path()),
+        ("USERPROFILE", fake_home.as_path()),
+        ("AGY_CONFIG_DIR", gemini_cfg.as_path()),
+        ("AGY_CLI_DIR", cli_dir.as_path()),
+        ("AGY_HUD_HOME", hud_home.as_path()),
+    ];
+
+    let payload_40 = json!({
+        "cwd": tmp.path,
+        "conversation_id": "conv-cost-skip",
+        "agent_state": "idle",
+        "terminal_width": 130,
+        "model": { "id": "Gemini 3 Flash", "display_name": "Gemini 3 Flash" },
+        "context_window": { "used_percentage": 10.0 },
+        "cost": { "total_usd": 0.40, "estimated": false }
+    })
+    .to_string();
+
+    // 1. Initial render writes cost-ledger.json and records heartbeat outcome = "ok"
+    let (ok1, out1) = run_bin(&[], &env_vars, Some(&payload_40));
+    assert!(ok1, "tick 1 failed: {out1}");
+    assert!(strip_ansi(&out1).contains("Today $0.40"));
+    let hb1: Value =
+        serde_json::from_str(&fs::read_to_string(hud_home.join("heartbeat.json")).unwrap())
+            .unwrap();
+    assert_eq!(hb1["outcome"], "ok");
+
+    // 2. Plant a fresh cost-ledger.lock sentinel: unchanged spend ($0.40) must NOT acquire lock!
+    let lock_path = hud_home.join("data/cost-ledger.lock");
+    fs::write(&lock_path, b"sentinel-lock").unwrap();
+    let (ok2, out2) = run_bin(&[], &env_vars, Some(&payload_40));
+    assert!(ok2, "tick 2 failed: {out2}");
+    assert!(strip_ansi(&out2).contains("Today $0.40"));
+    assert_eq!(
+        fs::read_to_string(&lock_path).unwrap(),
+        "sentinel-lock",
+        "unchanged spend must skip with_exclusive_lock_file completely"
+    );
+    let hb2: Value =
+        serde_json::from_str(&fs::read_to_string(hud_home.join("heartbeat.json")).unwrap())
+            .unwrap();
+    assert_eq!(hb2["outcome"], "ok");
+
+    // 3. Increased spend ($0.90) while cost-ledger.lock is held -> attempts lock, fails non-fatally,
+    //    preserves exit code 0 & output, and records HeartbeatInfo.outcome = "degraded:write"!
+    let payload_90 = json!({
+        "cwd": tmp.path,
+        "conversation_id": "conv-cost-skip",
+        "agent_state": "idle",
+        "terminal_width": 130,
+        "model": { "id": "Gemini 3 Flash", "display_name": "Gemini 3 Flash" },
+        "context_window": { "used_percentage": 10.0 },
+        "cost": { "total_usd": 0.90, "estimated": false }
+    })
+    .to_string();
+    let (ok3, out3) = run_bin(&[], &env_vars, Some(&payload_90));
+    assert!(
+        ok3,
+        "degraded write must still exit 0 so agy never disables statusLine"
+    );
+    assert!(strip_ansi(&out3).contains("Today $0.90"));
+    let hb3: Value =
+        serde_json::from_str(&fs::read_to_string(hud_home.join("heartbeat.json")).unwrap())
+            .unwrap();
+    assert_eq!(hb3["outcome"], "degraded:write");
+
+    // 4. Remove lock -> tick recovers cleanly to "ok", then plant directory at last-snapshot.json
+    //    to verify snapshot write failure also reports "degraded:write" & surfaces in `doctor`!
+    fs::remove_file(&lock_path).unwrap();
+    let (ok4, _) = run_bin(&[], &env_vars, Some(&payload_90));
+    assert!(ok4);
+    let hb4: Value =
+        serde_json::from_str(&fs::read_to_string(hud_home.join("heartbeat.json")).unwrap())
+            .unwrap();
+    assert_eq!(hb4["outcome"], "ok");
+
+    let snap_path = hud_home.join("data/last-snapshot.json");
+    fs::remove_file(&snap_path).unwrap();
+    fs::create_dir_all(&snap_path).unwrap();
+    let (ok5, out5) = run_bin(&[], &env_vars, Some(&payload_90));
+    assert!(ok5, "last-snapshot write failure must still exit 0: {out5}");
+    let hb5: Value =
+        serde_json::from_str(&fs::read_to_string(hud_home.join("heartbeat.json")).unwrap())
+            .unwrap();
+    assert_eq!(hb5["outcome"], "degraded:write");
+
+    let (ok_doc, doc_out) = run_bin(&["doctor"], &env_vars, None);
+    assert!(ok_doc);
+    assert!(
+        doc_out.contains("degraded:write"),
+        "doctor should report degraded:write outcome: {doc_out}"
+    );
+}
+
+#[test]
+fn pr2_lazy_unprefixed_skills_respects_updates_enabled_and_clean_config() {
+    let tmp = TempDir::new("pr2-lazy-skills");
+    let fake_home = tmp.path.join("home");
+    let gemini_cfg = fake_home.join(".gemini/config");
+    let cli_dir = tmp.path.join("cli");
+    let hud_home = cli_dir.join("agy-hud");
+
+    fs::create_dir_all(hud_home.join("data")).unwrap();
+    fs::write(
+        hud_home.join("data/update-cache.json"),
+        serde_json::to_string(&json!({
+            "checkedAt": 1_700_000_000_000i64,
+            "latestVersion": "9.9.0"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::write(
+        hud_home.join("config.json"),
+        r#"{"updates":{"enabled":false},"vcs":{"enabled":false}}"#,
+    )
+    .unwrap();
+
+    let env_vars: [(&str, &Path); 5] = [
+        ("HOME", fake_home.as_path()),
+        ("USERPROFILE", fake_home.as_path()),
+        ("AGY_CONFIG_DIR", gemini_cfg.as_path()),
+        ("AGY_CLI_DIR", cli_dir.as_path()),
+        ("AGY_HUD_HOME", hud_home.as_path()),
+    ];
+
+    let (ok_inst, _) = run_bin(&["install", "--stack"], &env_vars, None);
+    assert!(ok_inst);
+
+    let payload = json!({
+        "cwd": tmp.path,
+        "conversation_id": "conv-lazy-skills",
+        "agent_state": "idle",
+        "terminal_width": 140,
+        "model": { "id": "Gemini 3 Flash", "display_name": "Gemini 3 Flash" },
+        "context_window": { "used_percentage": 18.0 }
+    })
+    .to_string();
+
+    let (ok_no_upd, out_no_upd) = run_bin(&[], &env_vars, Some(&payload));
+    assert!(ok_no_upd);
+    let plain_no_upd = strip_ansi(&out_no_upd);
+    assert!(!plain_no_upd.contains("v9.9.0"));
+    assert!(!plain_no_upd.contains("Config:"));
+
+    fs::write(
+        hud_home.join("config.json"),
+        r#"{"updates":{"enabled":true},"vcs":{"enabled":false}}"#,
+    )
+    .unwrap();
+    let (ok_upd, out_upd) = run_bin(&[], &env_vars, Some(&payload));
+    assert!(ok_upd);
+    assert!(strip_ansi(&out_upd).contains("↑ v9.9.0 · /hud-update"));
+}

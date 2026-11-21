@@ -8,7 +8,8 @@ use hud_cli::collector::{
 use hud_cli::install::{inspect_unprefixed_skills, install_status_line, uninstall_status_line};
 use hud_cli::paths::{
     AgyPaths, atomic_write_bytes, build_logic_paths, canonical_or_parent, existing_data_dir,
-    prepare_data_dir, undo_config, with_exclusive_lock_file, write_config_with_undo,
+    maybe_maintain_data_dir, prepare_data_dir_fast, undo_config, with_exclusive_lock_file,
+    write_config_with_undo,
 };
 use hud_cli::quota_refresh::{maybe_spawn_background_quota_refresh, run_quota_subcommand};
 use hud_cli::update::{maybe_spawn_background_update_check, run_update_subcommand};
@@ -16,7 +17,7 @@ use hud_core::ansi::terminal_filter_with_repo;
 use hud_core::commands::{CommandContext, execute_subcommand};
 use hud_core::config::{MAX_CONFIG_BYTES, parse_config_str};
 use hud_core::probes::{
-    apply_speed_cache, parse_cached_quota_info, parse_compaction_ceiling_info,
+    apply_speed_cache, is_newer_semver, parse_cached_quota_info, parse_compaction_ceiling_info,
     parse_compaction_ceiling_record, parse_cost_ledger_info, parse_db_ceiling_info,
     parse_memory_info, parse_speed_cache_info, parse_update_cache_info, parse_vcs_info,
     reconcile_compaction_ceiling, reconcile_cost_ledger,
@@ -26,9 +27,9 @@ use hud_core::render::{
 };
 use hud_core::stdin::CompactionScope;
 use hud_core::types::{
-    AgyStdinData, CostLedgerSnapshot, DoctorFacts, HeartbeatInfo, InstalledPluginFacts,
-    LearnedCompactionState, LogicPaths, PluginFacts, ProbeAnswers, RuntimeFacts, TranscriptSummary,
-    UnprefixedSkillsFacts,
+    AgyStdinData, CostLedgerSnapshot, DoctorFacts, HUD_VERSION, HeartbeatInfo,
+    InstalledPluginFacts, LearnedCompactionState, LogicPaths, PluginFacts, ProbeAnswers,
+    RuntimeFacts, TranscriptSummary, UnprefixedSkillsFacts, UpdateCacheSnapshot,
 };
 use serde_json::{Value, json};
 use std::io::{IsTerminal, Write};
@@ -223,6 +224,29 @@ fn detect_unprefixed_skills(paths: &AgyPaths) -> UnprefixedSkillsFacts {
         None
     };
     inspect_unprefixed_skills(paths, plugin_root.as_deref())
+}
+
+fn resolve_short_skill_cmds_with<F>(
+    has_config_problems: bool,
+    updates_enabled: bool,
+    update_info: Option<&UpdateCacheSnapshot>,
+    detect_fn: F,
+) -> (bool, bool)
+where
+    F: FnOnce() -> UnprefixedSkillsFacts,
+{
+    let needs_config_cmd = has_config_problems;
+    let needs_update_cmd = updates_enabled
+        && update_info.is_some_and(|u| is_newer_semver(HUD_VERSION, &u.latest_version));
+    if needs_config_cmd || needs_update_cmd {
+        let unprefixed = detect_fn();
+        (
+            unprefixed.hud == "installed",
+            unprefixed.hud_update == "installed",
+        )
+    } else {
+        (false, false)
+    }
 }
 
 fn print_filtered_with_repo<S: AsRef<str>>(lines: &[S], allowed_github_repo: Option<&str>) {
@@ -591,7 +615,7 @@ fn run() -> u8 {
         return 0;
     };
 
-    let data_real = prepare_data_dir(&paths);
+    let data_real = prepare_data_dir_fast(&paths);
     let logic_paths = build_logic_paths(&paths, Some(&stdin_payload), data_real.as_deref());
     let config_text = read_bounded_string(&paths.config_path, MAX_CONFIG_BYTES as u64);
     let mut loaded_cfg = parse_config_str(config_text.as_deref());
@@ -612,6 +636,8 @@ fn run() -> u8 {
         &SystemProbeRunner,
     );
 
+    let mut write_degraded = false;
+
     if loaded_cfg.config.display.show_speed {
         let existing_speed_cache = parse_speed_cache_info(&collected.probes);
         if let Some(next_speed_cache) = apply_speed_cache(
@@ -621,8 +647,10 @@ fn run() -> u8 {
             started_ms,
         ) && let Ok(speed_json) = serde_json::to_string(&next_speed_cache)
         {
-            if let Some(ref sc_path) = logic_paths.speed_cache {
-                let _ = atomic_write_bytes(Path::new(sc_path), speed_json.as_bytes(), 0o600);
+            if let Some(ref sc_path) = logic_paths.speed_cache
+                && atomic_write_bytes(Path::new(sc_path), speed_json.as_bytes(), 0o600).is_err()
+            {
+                write_degraded = true;
             }
             collected.probes.speed_cache = Some(speed_json);
         }
@@ -632,37 +660,53 @@ fn run() -> u8 {
         || loaded_cfg.config.display.show_daily_cost
         || loaded_cfg.config.display.show_weekly_cost
     {
-        if let Some(ref ledger_str_path) = logic_paths.cost_ledger {
+        let precheck_existing = parse_cost_ledger_info(&collected.probes);
+        let (precheck_totals, precheck_updated) =
+            reconcile_cost_ledger(precheck_existing.as_ref(), Some(&stdin_payload), started_ms);
+        if precheck_updated.is_some()
+            && let Some(ref ledger_str_path) = logic_paths.cost_ledger
+        {
             let ledger_path = Path::new(ledger_str_path);
             let lock_path = ledger_path.with_extension("lock");
-            with_exclusive_lock_file(&lock_path, 2_000, || {
-                let fresh_raw = read_bounded_string(ledger_path, 64 * 1024);
-                let existing_ledger = fresh_raw
-                    .as_deref()
-                    .and_then(|s| serde_json::from_str::<CostLedgerSnapshot>(s).ok())
-                    .filter(|l| l.version == 1 && !l.day_key.is_empty());
-                let (totals, maybe_updated) = reconcile_cost_ledger(
-                    existing_ledger.as_ref(),
-                    Some(&stdin_payload),
-                    started_ms,
-                );
-                if let Some(updated) = maybe_updated
-                    && let Ok(serialized) = serde_json::to_string(&updated)
-                {
-                    let _ = atomic_write_bytes(ledger_path, serialized.as_bytes(), 0o600);
-                    collected.probes.cost_ledger = Some(serialized);
-                } else if fresh_raw.is_some() {
-                    collected.probes.cost_ledger = fresh_raw;
+            if let Some((totals, next_raw, failed)) =
+                with_exclusive_lock_file(&lock_path, 2_000, || {
+                    let fresh_raw = read_bounded_string(ledger_path, 64 * 1024);
+                    let existing_ledger = fresh_raw
+                        .as_deref()
+                        .and_then(|s| serde_json::from_str::<CostLedgerSnapshot>(s).ok())
+                        .filter(|l| l.version == 1 && !l.day_key.is_empty());
+                    let (totals, maybe_updated) = reconcile_cost_ledger(
+                        existing_ledger.as_ref(),
+                        Some(&stdin_payload),
+                        started_ms,
+                    );
+                    let mut write_failed = false;
+                    let mut next_raw = fresh_raw;
+                    if let Some(updated) = maybe_updated
+                        && let Ok(serialized) = serde_json::to_string(&updated)
+                    {
+                        if atomic_write_bytes(ledger_path, serialized.as_bytes(), 0o600).is_err() {
+                            write_failed = true;
+                        } else {
+                            next_raw = Some(serialized);
+                        }
+                    }
+                    (totals, next_raw, write_failed)
+                })
+            {
+                if failed {
+                    write_degraded = true;
+                }
+                if next_raw.is_some() {
+                    collected.probes.cost_ledger = next_raw;
                 }
                 totals
-            })
-            .unwrap_or_else(|| {
-                let existing = parse_cost_ledger_info(&collected.probes);
-                reconcile_cost_ledger(existing.as_ref(), Some(&stdin_payload), started_ms).0
-            })
+            } else {
+                write_degraded = true;
+                precheck_totals
+            }
         } else {
-            let existing = parse_cost_ledger_info(&collected.probes);
-            reconcile_cost_ledger(existing.as_ref(), Some(&stdin_payload), started_ms).0
+            precheck_totals
         }
     } else {
         None
@@ -682,9 +726,12 @@ fn run() -> u8 {
     let update_info = parse_update_cache_info(&collected.probes);
     let db_ceiling = parse_db_ceiling_info(&collected.probes);
     let columns = stdin_payload.terminal_width.filter(|&w| w > 0);
-    let unprefixed = detect_unprefixed_skills(&paths);
-    let use_short_hud_cmd = unprefixed.hud == "installed";
-    let use_short_update_cmd = unprefixed.hud_update == "installed";
+    let (use_short_hud_cmd, use_short_update_cmd) = resolve_short_skill_cmds_with(
+        !loaded_cfg.problems.is_empty(),
+        loaded_cfg.config.updates.enabled,
+        update_info.as_ref(),
+        || detect_unprefixed_skills(&paths),
+    );
 
     let mut lines = render_hud_lines_full(
         RenderInput {
@@ -725,12 +772,19 @@ fn run() -> u8 {
             "lastCompactionTokens": collected.transcript.last_compaction_tokens,
             "lastCompactionAtMs": collected.transcript.last_compaction_at_ms,
         });
-        if let Ok(bytes) = serde_json::to_vec(&snap_json) {
-            let _ = atomic_write_bytes(Path::new(snap_path), &bytes, 0o600);
+        if let Ok(bytes) = serde_json::to_vec(&snap_json)
+            && atomic_write_bytes(Path::new(snap_path), &bytes, 0o600).is_err()
+        {
+            write_degraded = true;
         }
     }
 
     let elapsed_ms = wall_started.elapsed().as_millis() as u64;
+    let outcome = if write_degraded {
+        "degraded:write"
+    } else {
+        "ok"
+    };
     write_heartbeat(
         &paths.heartbeat_path,
         &HeartbeatInfo {
@@ -739,7 +793,7 @@ fn run() -> u8 {
             path: canonical_or_parent(&current_exe)
                 .to_string_lossy()
                 .into_owned(),
-            outcome: "ok".to_string(),
+            outcome: outcome.to_string(),
             columns,
             duration_ms: Some(elapsed_ms),
         },
@@ -747,6 +801,10 @@ fn run() -> u8 {
 
     let allowed_github_repo = vcs.as_ref().and_then(|v| v.repo_url.as_deref());
     print_filtered_with_repo(&lines, allowed_github_repo);
+
+    if let Some(ref data_dir) = data_real {
+        maybe_maintain_data_dir(&paths, data_dir, started_ms);
+    }
 
     if loaded_cfg.config.quota.background_refresh {
         maybe_spawn_background_quota_refresh(&paths, &current_exe, &stdin_payload, started_ms);
@@ -760,4 +818,70 @@ fn run() -> u8 {
 
 fn main() -> ExitCode {
     ExitCode::from(run())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn resolve_short_skill_cmds_skips_detection_when_no_warning_or_update() {
+        let calls = AtomicUsize::new(0);
+        let newer = UpdateCacheSnapshot {
+            checked_at: 1_700_000_000_000,
+            latest_version: "99.0.0".to_string(),
+            release_url: None,
+        };
+        let same = UpdateCacheSnapshot {
+            checked_at: 1_700_000_000_000,
+            latest_version: HUD_VERSION.to_string(),
+            release_url: None,
+        };
+        let installed = || UnprefixedSkillsFacts {
+            hud: "installed".to_string(),
+            hud_update: "installed".to_string(),
+            skills_dir: String::new(),
+        };
+
+        // 1. Clean config + no update cache -> skips detection
+        let res1 = resolve_short_skill_cmds_with(false, true, None, || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            installed()
+        });
+        assert_eq!(res1, (false, false));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        // 2. Clean config + same version -> skips detection
+        let res2 = resolve_short_skill_cmds_with(false, true, Some(&same), || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            installed()
+        });
+        assert_eq!(res2, (false, false));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        // 3. Clean config + newer version BUT updates.enabled = false -> skips detection
+        let res3 = resolve_short_skill_cmds_with(false, false, Some(&newer), || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            installed()
+        });
+        assert_eq!(res3, (false, false));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        // 4. Config problem present -> runs detection once
+        let res4 = resolve_short_skill_cmds_with(true, false, None, || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            installed()
+        });
+        assert_eq!(res4, (true, true));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // 5. Update available & enabled -> runs detection once
+        let res5 = resolve_short_skill_cmds_with(false, true, Some(&newer), || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            installed()
+        });
+        assert_eq!(res5, (true, true));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
 }
