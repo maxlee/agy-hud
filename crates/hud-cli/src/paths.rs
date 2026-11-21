@@ -710,7 +710,7 @@ fn atomic_write_bytes_inner(
     let _ = mode_octal;
     if let Err(err) = fs::rename(&tmp_path, target) {
         #[cfg(windows)]
-        if target.exists() {
+        if fs::symlink_metadata(target).is_ok_and(|m| m.file_type().is_file()) {
             let old_path = target.with_file_name(format!("{file_name}.old"));
             let _ = fs::remove_file(&old_path);
             if fs::rename(target, &old_path).is_ok() && fs::rename(&tmp_path, target).is_ok() {
@@ -1258,5 +1258,26 @@ mod tests {
             );
         });
         assert!(!lock_path.exists());
+    }
+
+    #[test]
+    fn atomic_write_bytes_rejects_existing_directory_target() {
+        let tmp = TempDirGuard::new("atomic-dir-target");
+        let target = tmp.0.join("last-snapshot.json");
+        fs::create_dir_all(&target).unwrap();
+
+        let res = atomic_write_bytes(&target, b"{\"ok\":true}\n", 0o600);
+        assert!(
+            res.is_err(),
+            "atomic_write_bytes must fail when target is a directory"
+        );
+        assert!(
+            target.is_dir(),
+            "existing directory target must remain intact"
+        );
+        assert!(
+            !tmp.0.join("last-snapshot.json.old").exists(),
+            "no .old directory may be created"
+        );
     }
 }

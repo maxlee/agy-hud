@@ -1435,7 +1435,9 @@ pub fn collect_render_inputs(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hud_core::probes::{parse_memory_info, parse_vcs_info};
+    #[cfg(target_os = "macos")]
+    use hud_core::probes::parse_memory_info;
+    use hud_core::probes::parse_vcs_info;
     use std::collections::HashMap;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
