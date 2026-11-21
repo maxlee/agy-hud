@@ -34,7 +34,7 @@
 ├─ Quota(weekly) ▓···· 16% (4d 18h)
 ├─ ◐ run_command: Cargo test execution · ✓ edit_file ×2: render.rs · ✓ read_file ×5: SKILL.md
 ├─ Skills: hud, agy-customizations │ MCP: context7
-├─ ◐ CLI Docs Researcher [research] (1m 15s) │ ◷ Waiter [self] (20s) │ ✓ Security Auditor [self] (1m)
+├─ ◐ CLI Docs Researcher [research · 3.1-pro] (1m 15s) │ ◷ Waiter [self · Hydrogen] (20s) │ ✓ Security Auditor [self] (1m)
 ╰─ ▸ Verify compile-time arch_guard boundaries (2/4 · 50%)
 ```
 
@@ -54,12 +54,13 @@ Ctx ███████░ 89.6% │ Quota(weekly) 92% (1h 30m)
 
 | Row / Segment | What It Shows | Key Config Toggle |
 | :--- | :--- | :--- |
-| **State & Mode** | Live `IDLE` / `WORK` / `TOOL` / `CONFIRM` state, `[PLAN]` / `[AUTO]` / `[ACCEPT]` cycle mode (plus `/plan` detection & `VIM` mode badge) | `display.showState`, `display.showMode` |
+| **State & Mode** | Live `IDLE` / `WORK` / `TOOL` / `CONFIRM` state, `[PLAN]` / `[AUTO]` / `[ACCEPT]` (`accept-edits` & `auto_edit`) cycle mode, `[BATTLE]` / `[BATTLE #N]` battle badge (`battle.{status, focused_arm}`), `/plan` detection, `VIM` badge, and optional 8-char `#<id>` short session ID for `/resume <prefix>` | `display.showState`, `display.showMode`, `display.showSessionId` |
 | **Model, Tier & Speed** | Compact model name, reasoning effort (`low`/`med`/`high`), normalized plan tier (`Pro`/`Ultra`), and TTFT-stripped `~tok/s` decode rate with speed-tier emoji (`🐢`/`🛵`/`🚗`/`🚅`/`✈️`/`🚀`/`🛰️`/`🛸`/`👽`, hidden in `ascii` mode) and session `(min~max)` range | `display.showModel`, `display.showPlanTier`, `display.showSpeed`, `display.glyphMode` |
-| **Workspace & VCS** | Clickable `file://` OSC 8 project path (plus optional `project › subdir` breadcrumb), clickable GitHub branch OSC 8 links, `git` (worktrees, dirty, unpushed `↑N` thresholds, file stats), `jj` (bookmarks, `@change_id`, conflicts), or `hg` | `display.showProject`, `display.showLaunchDir`, `vcs.pushWarningThreshold`, `vcs.showFileStats` |
-| **Context & Meta** | Turn-1 conversation DB & compaction-watermark-scaled (`256k`, `512k`, or model-specific learned ceiling; neutral `<used>/?` on unconfirmed large windows) 8th-block Unicode context bar + `↻N` explicit/implicit auto-compaction counter badge, prompt `Cache` hit %, session/daily/weekly cost (`Today` / `Week`), inline counts (`agents`, `tasks`, `+N queued`, plus opt-in `art` from upstream `agy` `stdin.artifact_count`), and Sandbox badge | `display.contextScale`, `display.showContextBar`, `display.showDailyCost`, `display.showWeeklyCost`, `display.showCounts`, `display.showArtifacts` |
-| **Quota Pace** | Model-routed quota buckets (`5h` / `weekly`) with exhausted `0%`-remaining recovery & sentinel (`<= 2000-01-01`) timestamp filtering, burn-rate projection (`▲` pace alert when projected > 90% / > 100% before reset), optional low-usage threshold hiding, and reset countdown | `display.showQuota`, `display.quotaPace`, `display.quotaThreshold`, `quota.backgroundRefresh` |
-| **Activity & Composable Rows** | Folded tool invocations (`×N` deduplication), active `Skills` & `MCP` servers (`!` error alerts), `Subagents` (`◐`/`◷`/`✗`/`✓` with 60s completed retirement), `task.md` progress, and customizable row merging / right-alignment | `display.mergeGroups`, `display.rightAlign`, `display.showTools`, `display.showSubagents`, `display.showTodos` |
+| **Workspace & VCS** | Clickable `file://` OSC 8 project path (plus optional `project › subdir` breadcrumb), clickable GitHub branch OSC 8 links, `git` (worktrees, dirty, unpushed `↑N` thresholds, file stats), `jj` (bookmarks, `@change_id`, conflicts), or `hg`, plus zero-subprocess fast path when `stdin.vcs` suffices | `display.showProject`, `display.showLaunchDir`, `vcs.pushWarningThreshold`, `vcs.showFileStats` |
+| **Context & Meta** | Turn-1 conversation DB & compaction-watermark-scaled (`256k`, `512k`, or learned ceiling; neutral `<used>/?` with `(>200k)` cold-start hint from `exceeds_200k_tokens` on unconfirmed large windows) 8th-block Unicode context bar + `↻N` compaction badge, prompt `Cache` hit %, session/subagent/daily/weekly cost (`$1.38 (sub $0.42)`, `Today` / `Week`), inline counts (`agents`, `tasks`, `+N queued`, opt-in `art`), and Sandbox badge (`🛡 Sandbox ON` / amber `🛡 Sandbox ON (net)` via `sandbox.allow_network`) | `display.contextScale`, `display.showContextBar`, `display.showDailyCost`, `display.showWeeklyCost`, `display.showCounts`, `display.showArtifacts` |
+| **Quota Pace** | Model-routed quota buckets (`5h` / `weekly`) with exhausted `0%`-remaining recovery & sentinel (`<= 2000-01-01`) timestamp filtering, burn-rate projection (`▲` pace alert when projected > 90% / > 100% before reset), optional low-usage threshold hiding, and reset countdown (`GEMINI_API_KEY` API-key mode auto-skips quota probes) | `display.showQuota`, `display.quotaPace`, `display.quotaThreshold`, `quota.backgroundRefresh` |
+| **Activity & Composable Rows** | Folded tool invocations (`×N` deduplication), active `Skills` & `MCP` servers (`!` error alerts), `Subagents` (`◐`/`◷`/`✗`/`✓` with compact per-agent model badges e.g. `[research · 3.1-pro]` / `[Hydrogen]` & 60s retirement), `task.md` progress, and customizable row merging / right-alignment | `display.mergeGroups`, `display.rightAlign`, `display.showTools`, `display.showSubagents`, `display.showSubagentModel`, `display.showTodos` |
+| **Native Terminal Title** | Optional `< 1 ms` zero-subprocess single-line terminal tab/window title via `agy-hud title` (`● repo (branch*) · Model · 34% — Title`) | `install --with-title` / `--no-title`, `preview --title` |
 
 ---
 
@@ -79,7 +80,7 @@ Ctx ███████░ 89.6% │ Quota(weekly) 92% (1h 30m)
 
 ### Requirements
 
-- **Antigravity CLI (`agy`)** `v1.4.5+` (fully aligned with `v1.5.4+` schemas)
+- **Antigravity CLI (`agy`)** `v1.4.5+` (fully aligned with `v1.5.4`–`v1.5.13` schemas, `/title`, `/resume <prefix>`, `GEMINI_API_KEY` quota suppression, and `auto_edit` mode)
 - **Zero Rust / Node.js / npm required** for the one-line installer, GitHub plugin, or prebuilt installations (`rustc 1.85+` only if compiling from source)
 
 > **Marketplace status**: Submitted to the Antigravity Marketplace and currently under review. Once approved, you'll also be able to add **AGY HUD** directly from **Customizations → Marketplace** in Antigravity Desktop and click the **"Set up the HUD status line in Antigravity CLI"** starter prompt chip to activate both the status line and global `/hud` & `/hud-update` shortcuts.
@@ -153,7 +154,7 @@ agy plugin install .
 | :--- | :--- |
 | `/hud` · `/agy-hud:hud` | Interactively install, diagnose, preview, or customize layout, language, and badges in natural language (`/hud` works globally in CLI & App after `agy-hud install`; `/agy-hud:hud` is always available via the plugin) |
 | `/hud-update` · `/agy-hud:hud-update` | Check GitHub Releases and perform a SHA-256-verified binary, plugin, and managed shortcut self-upgrade in one step |
-| `/statusline` | Built-in `agy` command to toggle the status bar on or off |
+| `/statusline` · `/title` | Built-in `agy` commands to toggle the bottom status bar or native terminal tab title on or off |
 
 ### Native CLI Subcommands
 
@@ -161,10 +162,11 @@ Invoke via `~/.gemini/antigravity-cli/agy-hud/bin/agy-hud` (or `./scripts/agy-hu
 
 | Subcommand | Purpose |
 | :--- | :--- |
-| `install [--stack] [--replace]` | Deploy native binary, configure `statusLine` in `settings.json` (with timestamped backup), and install conflict-safe `/hud` & `/hud-update` shortcuts to `~/.gemini/config/skills/` |
-| `uninstall [--plugin] [--keep-config]` | Remove `statusLine`, clean backups, remove only `agy-hud`-managed shortcuts & HUD directory, and restore official `agy` default |
-| `doctor [--pretty]` | Inspect runtime, plugin enablement, unprefixed shortcut status, `statusLine` wiring, config validity, and glyph alignment |
-| `preview [--state <name>] [--last] [--set k=v]` | Render `showcase`, `idle`, `tool_use`, `confirm`, `high-context`, inline JSON, or last live snapshot |
+| `install [--stack] [--replace] [--with-title] [--no-title]` | Deploy native binary, configure `statusLine` (and optionally native `title`, preserved across upgrades) in `settings.json` with backups, and install conflict-safe `/hud` & `/hud-update` shortcuts |
+| `uninstall [--plugin] [--keep-config] [--reset-default]` | Remove `statusLine` and `agy-hud`-managed `title` (restoring prior third-party backups or official `agy` defaults), clean backups, remove managed shortcuts & HUD directory |
+| `title` | Native terminal window/tab title mode: reads `agy` JSON from `stdin` and prints a sanitized single plain-text line (`<= 80` cols) with zero subprocesses or disk writes |
+| `doctor [--pretty]` | Inspect runtime, plugin enablement, unprefixed shortcut status, `statusLine` & `title` wiring, config validity, and glyph alignment |
+| `preview [--state <name>] [--last] [--set k=v] [--title]` | Render `showcase`, `idle`, `tool_use`, `confirm`, `high-context`, inline JSON, or last live snapshot (add `--title` for plain single-line title preview) |
 | `schema [query]` | Browse all validated configuration keys, types, defaults, and descriptions |
 | `set <key>=<value> ...` / `set --undo` | Atomically update `~/.gemini/antigravity-cli/agy-hud/config.json` or revert the previous change |
 | `update [--check] [--force]` | Check for or apply the latest SHA-256-verified release from GitHub (binary, plugin, and managed shortcuts) |
@@ -174,8 +176,12 @@ Invoke via `~/.gemini/antigravity-cli/agy-hud/bin/agy-hud` (or `./scripts/agy-hu
 ### Common Customization Recipes
 
 ```bash
-# Preview all 5 responsive layout & language presets
+# Preview all 5 responsive layout & language presets (or native terminal tab titles)
 ~/.gemini/antigravity-cli/agy-hud/bin/agy-hud preview --state showcase
+~/.gemini/antigravity-cli/agy-hud/bin/agy-hud preview --state showcase --title
+
+# Enable native terminal tab title alongside statusLine (`agy` `/title`)
+~/.gemini/antigravity-cli/agy-hud/bin/agy-hud install --with-title
 
 # Switch UI to Simplified Chinese and enable +/- VCS file stats
 ~/.gemini/antigravity-cli/agy-hud/bin/agy-hud set language=zh-Hans vcs.showFileStats=true
@@ -195,8 +201,8 @@ Invoke via `~/.gemini/antigravity-cli/agy-hud/bin/agy-hud` (or `./scripts/agy-hu
 # Switch glyph mode: unicode (default) | nerd (Nerd Fonts) | ascii (strict 7-bit)
 ~/.gemini/antigravity-cli/agy-hud/bin/agy-hud set display.glyphMode=nerd
 
-# Customize header badges (conversation title, plan tier, ~tok/s speed tier & min~max range, project folder)
-~/.gemini/antigravity-cli/agy-hud/bin/agy-hud set display.showTitle=true display.showSpeed=true
+# Customize header badges (conversation title, 8-char session ID prefix, plan tier, ~tok/s speed, subagent model badges)
+~/.gemini/antigravity-cli/agy-hud/bin/agy-hud set display.showTitle=true display.showSessionId=true display.showSpeed=true display.showSubagentModel=true
 ~/.gemini/antigravity-cli/agy-hud/bin/agy-hud set display.showProject=false vcs.enabled=true
 
 # Show upstream `agy` `stdin.artifact_count` (`art`, or `产物` in `zh-Hans`; off by default because fresh sessions report 1)
@@ -221,7 +227,7 @@ Invoke via `~/.gemini/antigravity-cli/agy-hud/bin/agy-hud` (or `./scripts/agy-hu
 
 ## 🧹 Clean Uninstall (Zero Residue)
 
-Uninstall at any time with a single command — removes `"statusLine"` from `settings.json` (restoring Antigravity CLI's official default status bar while keeping all your other settings intact), cleans tracked backups, unregisters the plugin, removes **only** `agy-hud`-managed shortcuts under `~/.gemini/config/skills/{hud,hud-update}` (verified via `.agy-hud-managed.json` so any custom `/hud` skill or `skills.json` is never touched), and deletes `~/.gemini/antigravity-cli/agy-hud`:
+Uninstall at any time with a single command — removes `"statusLine"` and `agy-hud`-managed `"title"` from `settings.json` (restoring prior third-party configs from `previous-statusline.json` / `previous-title.json` or official defaults while keeping all your other settings intact), cleans tracked backups, unregisters the plugin, removes **only** `agy-hud`-managed shortcuts under `~/.gemini/config/skills/{hud,hud-update}` (verified via `.agy-hud-managed.json` so any custom `/hud` skill or `skills.json` is never touched), and deletes `~/.gemini/antigravity-cli/agy-hud`:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/maxlee/agy-hud/main/uninstall.sh | sh

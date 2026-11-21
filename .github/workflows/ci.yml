@@ -45,3 +45,4 @@ jobs:
           cargo build --release
           ./target/release/agy-hud --version
           ./target/release/agy-hud preview --state showcase >/dev/null
+          ./target/release/agy-hud preview --state showcase --title >/dev/null

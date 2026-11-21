@@ -34,7 +34,7 @@
 ├─ 配额(weekly) ▓···· 16% (4d 18h)
 ├─ ◐ run_command: Cargo test execution · ✓ edit_file ×2: render.rs · ✓ read_file ×5: SKILL.md
 ├─ 技能: hud, agy-customizations │ MCP: context7
-├─ ◐ CLI Docs Researcher [research] (1m 15s) │ ◷ Waiter [self] (20s) │ ✓ Security Auditor [self] (1m)
+├─ ◐ CLI Docs Researcher [research · 3.1-pro] (1m 15s) │ ◷ Waiter [self · Hydrogen] (20s) │ ✓ Security Auditor [self] (1m)
 ╰─ ▸ Verify compile-time arch_guard boundaries (2/4 · 50%)
 ```
 
@@ -54,12 +54,13 @@
 
 | 模块区域 | 展示内容 | 常用配置开关 |
 | :--- | :--- | :--- |
-| **运行状态与模式** | 实时 `空闲` / `思考中` / `调用工具` / `等待确认` 状态，`[计划]` / `[自动]` / `[接受]` 模式（自动识别 `/plan` 与 `VIM` 模式徽章） | `display.showState`, `display.showMode` |
+| **运行状态与模式** | 实时 `空闲` / `思考中` / `调用工具` / `等待确认` 状态，`[计划]` / `[自动]` / `[接受编辑]`（`accept-edits` 与 `auto_edit`）模式、`[对战]` / `[对战 #N]`（`battle.{status, focused_arm}`）、`/plan` 识别、`VIM` 徽章，以及对应 `/resume <prefix>` 的可选 8 位短会话 ID（`#4a93ad0a`） | `display.showState`, `display.showMode`, `display.showSessionId` |
 | **模型、档位与速率** | 模型简称、推理强度（`low`/`med`/`high`）、订阅档位（`Pro`/`Ultra`），以及剥离 `TTFT` 的真实生成速率 `~tok/s`、速度分档图标（`🐢`/`🛵`/`🚗`/`🚅`/`✈️`/`🚀`/`🛰️`/`🛸`/`👽`，`ascii` 模式下自动隐藏）与会话 `(min~max)` 速率区间 | `display.showModel`, `display.showPlanTier`, `display.showSpeed`, `display.glyphMode` |
-| **项目路径与 VCS** | 支持点击跳转的 `file://` OSC 8 目录链接（含可选 `项目根 › 子目录` 面包屑）、GitHub 分支点击跳转、`git`（含 Worktree、脏标记、`↑N` 未推送阈值变色、文件增删）、`jj` 与 `hg` | `display.showProject`, `display.showLaunchDir`, `vcs.pushWarningThreshold`, `vcs.showFileStats` |
-| **上下文与跨会话账本** | 首轮自动读取会话 DB 与按模型记忆压缩水位线（`256k`、`512k` 等；未确认大窗口诚实显示 `<used>/?`）的 1/8 精细进度条 + 显式/隐式 `↻N` 会话压缩计数徽章、Prompt `Cache` 命中率、当前/今日/本周累计花费（`今日` / `本周`）、内联计数（`子代理`、`后台`、`+N 排队`，以及默认关闭、来自上游 `agy` `stdin.artifact_count` 的可选 `产物` 计数）、沙箱徽章 | `display.contextScale`, `display.showContextBar`, `display.showDailyCost`, `display.showWeeklyCost`, `display.showCounts`, `display.showArtifacts` |
-| **配额消耗速率（Pace）** | 按当前模型智能路由配额桶（`5h` / `weekly`），支持耗尽 `0%` 桶识别与哨兵时间戳（`<= 2000-01-01`）过滤、耗尽速率预测（`▲` 增速预警）、低占用自动隐藏阈值及重置倒计时 | `display.showQuota`, `display.quotaPace`, `display.quotaThreshold`, `quota.backgroundRefresh` |
-| **活动明细与可组合行** | 同名工具调用折叠计数（`×N`）、`Skills` 与 `MCP` 服务（异常标红 `!`）、四态 `Subagents`（完成满 60 秒自动退场）、`task.md` 进度，以及自由并排合并与右对齐 | `display.mergeGroups`, `display.rightAlign`, `display.showTools`, `display.showSubagents`, `display.showTodos` |
+| **项目路径与 VCS** | 支持点击跳转的 `file://` OSC 8 目录链接（含可选 `项目根 › 子目录` 面包屑）、GitHub 分支点击跳转、`git`（含 Worktree、脏标记、`↑N` 未推送阈值变色、文件增删）、`jj` 与 `hg`；当 `stdin.vcs` 已完备时启用零子进程快路径 | `display.showProject`, `display.showLaunchDir`, `vcs.pushWarningThreshold`, `vcs.showFileStats` |
+| **上下文与跨会话账本** | 首轮自动读取会话 DB 与按模型记忆压缩水位线（`256k`、`512k` 等；未确认大窗口诚实显示 `<used>/?` 并在 `exceeds_200k_tokens` 为真时附带 `(>200k)` 提示）的 1/8 精细进度条 + 显式/隐式 `↻N` 压缩徽章、Prompt `Cache` 命中率、当前/子代理分账（`$1.38 (子代理 $0.42)` via `cost.subagent_usd`）/今日/本周累计花费、内联计数与沙箱徽章（`🛡 沙箱开启` / 联网态琥珀色 `🛡 沙箱开启 (联网)` via `sandbox.allow_network`） | `display.contextScale`, `display.showContextBar`, `display.showDailyCost`, `display.showWeeklyCost`, `display.showCounts`, `display.showArtifacts` |
+| **配额消耗速率（Pace）** | 按当前模型智能路由配额桶（`5h` / `weekly`），支持耗尽 `0%` 桶识别与哨兵时间戳（`<= 2000-01-01`）过滤、耗尽速率预测（`▲` 增速预警）、低占用自动隐藏阈值及重置倒计时（`GEMINI_API_KEY` API Key 模式下自动静默跳过配额探针） | `display.showQuota`, `display.quotaPace`, `display.quotaThreshold`, `quota.backgroundRefresh` |
+| **活动明细与可组合行** | 同名工具调用折叠计数（`×N`）、`Skills` 与 `MCP` 服务（异常标红 `!`）、四态 `Subagents`（展示紧凑异构模型徽章如 `[research · 3.1-pro]` / `[Hydrogen]`，完成满 60 秒自动退场）、`task.md` 进度，以及自由并排合并与右对齐 | `display.mergeGroups`, `display.rightAlign`, `display.showTools`, `display.showSubagents`, `display.showSubagentModel`, `display.showTodos` |
+| **原生终端标签页标题** | 通过 `agy-hud title` 实现 `< 1 ms` 零子进程纯文本单行终端窗口/Tab 标题（`● repo (branch*) · Model · 34% — 标题`） | `install --with-title` / `--no-title`, `preview --title` |
 
 ---
 
@@ -79,7 +80,7 @@
 
 ### 环境要求
 
-- **Antigravity CLI (`agy`)** `v1.4.5+`（已完整对齐 `v1.5.4+` 最新内部接口）
+- **Antigravity CLI (`agy`)** `v1.4.5+`（已完整对齐 `v1.5.4`–`v1.5.13` 最新内部接口、`/title`、`/resume <prefix>`、`GEMINI_API_KEY` 配额隐藏与 `auto_edit` 模式）
 - **零 Rust / Node.js / npm 依赖**（使用一键脚本、GitHub 插件或预编译包安装时无需编译环境；仅从源码构建时需 `rustc 1.85+`）
 
 > **Marketplace 上架状态**：已提交至 Antigravity Marketplace 官方审核队列，审核通过后即可在 Antigravity 桌面端 **Customizations → Marketplace** 中搜索 **AGY HUD** 一键添加，并点击 **"Set up the HUD status line in Antigravity CLI"** 快捷引导胶囊一键启用状态栏与全局 `/hud`、`/hud-update` 快捷技能。
@@ -153,7 +154,7 @@ agy plugin install .
 | :--- | :--- |
 | `/hud` · `/agy-hud:hud` | 使用自然语言交互式安装、诊断、预览或调整布局、界面语言与各模块开关（执行 `agy-hud install` 后 `/hud` 在 CLI 与桌面端全局可用；`/agy-hud:hud` 始终作为插件入口可用） |
 | `/hud-update` · `/agy-hud:hud-update` | 检查 GitHub 最新发行版并一键完成 SHA-256 校验的二进制、插件与托管快捷技能同步升级 |
-| `/statusline` | `agy` 官方内置命令，用于临时开启或隐藏底部状态栏 |
+| `/statusline` · `/title` | `agy` 官方内置命令，用于临时开启或隐藏底部状态栏或原生终端标签页标题 |
 
 ### 原生 CLI 子命令一览
 
@@ -161,10 +162,11 @@ agy plugin install .
 
 | 子命令 | 用途说明 |
 | :--- | :--- |
-| `install [--stack] [--replace]` | 部署原生二进制、原子写入 `settings.json`（自动创建带时间戳的备份），并在 `~/.gemini/config/skills/` 安装冲突安全的 `/hud` 与 `/hud-update` 快捷技能 |
-| `uninstall [--plugin] [--keep-config]` | 移除 `statusLine`、清理备份与数据目录、仅清理 `agy-hud` 托管的快捷技能，并无损恢复 `agy` 官方默认状态栏 |
-| `doctor [--pretty]` | 检查运行引擎、插件启用状态、无前缀快捷技能状态、`statusLine` 挂载、配置合法性及终端图标对齐情况 |
-| `preview [--state <name>] [--last] [--set k=v]` | 预览 `showcase`（5 大场景）、`idle`、`tool_use`、`confirm`、`high-context` 或最近一次真实快照 |
+| `install [--stack] [--replace] [--with-title] [--no-title]` | 部署原生二进制、原子写入 `settings.json` `statusLine`（及可选原生 `title`，后续升级自动保留），并安装冲突安全的 `/hud` 与 `/hud-update` 快捷技能 |
+| `uninstall [--plugin] [--keep-config] [--reset-default]` | 移除 `statusLine` 及由 `agy-hud` 托管的 `title`（自动还原第三方备份或官方默认）、清理备份与数据目录、仅清理托管快捷技能 |
+| `title` | 原生终端窗口/Tab 标题模式：从 `stdin` 读取 `agy` JSON 并输出经转义净化的纯文本单行标题（`<= 80` 列），零子进程、零磁盘写 |
+| `doctor [--pretty]` | 检查运行引擎、插件启用状态、无前缀快捷技能状态、`statusLine` 与 `title` 挂载、配置合法性及终端图标对齐情况 |
+| `preview [--state <name>] [--last] [--set k=v] [--title]` | 预览 `showcase`（5 大场景）、`idle`、`tool_use`、`confirm`、`high-context` 或最近一次真实快照（追加 `--title` 可预览纯文本单行终端标题） |
 | `schema [关键词]` | 检索全部受强类型校验的配置项、类型、默认值与说明 |
 | `set <key>=<value> ...` / `set --undo` | 原子修改 `~/.gemini/antigravity-cli/agy-hud/config.json` 或一键回滚上一次修改 |
 | `update [--check] [--force]` | 检查或执行经过 SHA-256 校验的自升级（同步升级二进制、插件与托管快捷技能） |
@@ -174,8 +176,12 @@ agy plugin install .
 ### 常用配置示例
 
 ```bash
-# 一次预览全部 5 种终端宽度、状态与中英文布局效果
+# 一次预览全部 5 种终端宽度、状态与中英文布局效果（以及原生终端标签页标题）
 ~/.gemini/antigravity-cli/agy-hud/bin/agy-hud preview --state showcase
+~/.gemini/antigravity-cli/agy-hud/bin/agy-hud preview --state showcase --title
+
+# 同步启用 Antigravity CLI 原生终端标签页标题（`agy` `/title`）
+~/.gemini/antigravity-cli/agy-hud/bin/agy-hud install --with-title
 
 # 切换为简体中文界面并开启 VCS 文件增删统计
 ~/.gemini/antigravity-cli/agy-hud/bin/agy-hud set language=zh-Hans vcs.showFileStats=true
@@ -195,9 +201,9 @@ agy plugin install .
 # 切换图标字符集：unicode（默认）| nerd（Nerd Fonts）| ascii（纯 7-bit 安全字符）
 ~/.gemini/antigravity-cli/agy-hud/bin/agy-hud set display.glyphMode=nerd
 
-# 独立隐藏目录名但保留 Git 分支显示，或自定义顶栏标题与 ~tok/s 速率徽章（分档图标 + min~max 区间）
+# 独立隐藏目录名但保留 Git 分支显示，或开启顶栏标题、8 位短会话 ID、~tok/s 速率与子代理模型徽章
 ~/.gemini/antigravity-cli/agy-hud/bin/agy-hud set display.showProject=false vcs.enabled=true
-~/.gemini/antigravity-cli/agy-hud/bin/agy-hud set display.showTitle=true display.showSpeed=true
+~/.gemini/antigravity-cli/agy-hud/bin/agy-hud set display.showTitle=true display.showSessionId=true display.showSpeed=true display.showSubagentModel=true
 
 # 开启上游 `agy` `stdin.artifact_count` 计数（`产物`，英文界面为 `art`；因新会话常上报 1 而默认关闭）
 ~/.gemini/antigravity-cli/agy-hud/bin/agy-hud set display.showArtifacts=true
@@ -221,7 +227,7 @@ agy plugin install .
 
 ## 🧹 零残留干净卸载
 
-随时可通过一条命令完整卸载——自动移除 `settings.json` 中的 `statusLine` 字段（恢复 `agy` 官方默认状态栏并完整保留你的其余所有配置）、清理备份、注销插件、**仅清理**经 `.agy-hud-managed.json` 校验归属 `agy-hud` 的 `~/.gemini/config/skills/{hud,hud-update}` 托管快捷技能（绝不删除用户自定义的同名技能，也不触碰 `skills.json`），并删除 `~/.gemini/antigravity-cli/agy-hud`：
+随时可通过一条命令完整卸载——自动移除 `settings.json` 中的 `statusLine` 与由 `agy-hud` 托管的 `title` 字段（优先从 `previous-statusline.json` / `previous-title.json` 还原原有第三方配置或恢复 `agy` 官方默认，并完整保留你的其余所有配置）、清理备份、注销插件、**仅清理**经 `.agy-hud-managed.json` 校验归属 `agy-hud` 的 `~/.gemini/config/skills/{hud,hud-update}` 托管快捷技能（绝不删除用户自定义的同名技能，也不触碰 `skills.json`），并删除 `~/.gemini/antigravity-cli/agy-hud`：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/maxlee/agy-hud/main/uninstall.sh | sh

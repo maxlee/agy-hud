@@ -34,7 +34,12 @@ Use `sh scripts/hud-cli.sh` (relative to this skill directory) to inspect, previ
      ```bash
      sh scripts/hud-cli.sh install --stack
      ```
-   - Revert / clean uninstall (restores official default `statusLine`, unregisters plugin if installed, cleanly removes only `agy-hud`-managed shortcuts under `~/.gemini/config/skills/{hud,hud-update}`, and removes tracked backups and `~/.gemini/antigravity-cli/agy-hud`; pass `--keep-config` to retain `config.json`):
+   - Enable or disable Antigravity CLI's native terminal tab `title` (`agy-hud title`, zero-subprocess single-line title; opt-in is preserved across future `install` / `update` runs):
+     ```bash
+     sh scripts/hud-cli.sh install --with-title
+     sh scripts/hud-cli.sh install --no-title
+     ```
+   - Revert / clean uninstall (restores official default `statusLine` and `title` or prior third-party backups, unregisters plugin if installed, cleanly removes only `agy-hud`-managed shortcuts under `~/.gemini/config/skills/{hud,hud-update}`, and removes tracked backups and `~/.gemini/antigravity-cli/agy-hud`; pass `--keep-config` to retain `config.json`):
      ```bash
      sh scripts/hud-cli.sh uninstall
      ```
@@ -50,9 +55,10 @@ Use `sh scripts/hud-cli.sh` (relative to this skill directory) to inspect, previ
      sh scripts/hud-cli.sh schema
      sh scripts/hud-cli.sh schema quota
      ```
-   - Show the user a live preview with `--set` overrides before saving:
+   - Show the user a live preview with `--set` overrides (or `--title` for native terminal tab title output) before saving:
      ```bash
      sh scripts/hud-cli.sh preview --state showcase
+     sh scripts/hud-cli.sh preview --state showcase --title
      sh scripts/hud-cli.sh preview --set language=zh-Hans --set lineLayout=expanded
      sh scripts/hud-cli.sh preview --last
      ```
@@ -63,6 +69,7 @@ Use `sh scripts/hud-cli.sh` (relative to this skill directory) to inspect, previ
      sh scripts/hud-cli.sh set language=zh-Hans vcs.showFileStats=true
      sh scripts/hud-cli.sh set display.contextScale=compaction
      sh scripts/hud-cli.sh set display.glyphMode=ascii display.showTitle=true display.showSpeed=true
+     sh scripts/hud-cli.sh set display.showSessionId=true display.showSubagentModel=true
      sh scripts/hud-cli.sh set display.showDailyCost=true display.showWeeklyCost=true display.showLaunchDir=true
      sh scripts/hud-cli.sh set display.quotaPace=true display.quotaThreshold=25 vcs.pushWarningThreshold=5
      sh scripts/hud-cli.sh set 'display.mergeGroups=[["context","quota"]]' 'display.rightAlign=["quota"]'
@@ -70,6 +77,8 @@ Use `sh scripts/hud-cli.sh` (relative to this skill directory) to inspect, previ
      sh scripts/hud-cli.sh set display.showArtifacts=true
      ```
    - Speed badge (`display.showSpeed`): shows speed-tier emoji + `~tok/s` + session `(min~max)` range (`display.glyphMode=ascii` omits the emoji).
+   - Subagent model badges (`display.showSubagentModel`, default `true`): shows each subagent's compact model badge (`◐ Role [research · 3.1-pro] (12s)` / `◐ builder [Hydrogen] (8s)`).
+   - Short session ID (`display.showSessionId`, default `false`): shows an 8-character `#<prefix>` badge in the header matching `agy`'s `/resume <prefix>` command (dropped first on narrow terminals).
    - Artifact count (`display.showArtifacts`): shows upstream `agy` `stdin.artifact_count` (`art`, or `产物` in `zh-Hans`, `成果物` in `ja`) inside inline counts when `display.showCounts` is `true`. Off by default because `agy` can report `1` on fresh sessions before any user Markdown artifact exists.
    - Manually refresh the official `/usage` quota cache on demand:
      ```bash
