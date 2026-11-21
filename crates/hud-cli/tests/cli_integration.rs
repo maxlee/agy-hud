@@ -2,7 +2,7 @@ use hud_cli::collector::{
     DetectedRepo, GIT_SAFE_PREFIX, HG_SAFE_PREFIX, JJ_PROBE_ARGS, ProbeRunner, SystemProbeRunner,
     collect_render_inputs, compute_vcs_signature, detect_vcs_repo, extract_git_filter_names,
     probe_git, probe_hg, probe_jj, probe_vcs_cached, probe_vcs_uncached,
-    read_and_parse_transcript_incremental, resolve_executable_in_path,
+    read_and_parse_transcript_incremental, read_git_head_fallback, resolve_executable_in_path,
 };
 use hud_cli::install::format_statusline_command_for_platform;
 use hud_cli::paths::{
@@ -3944,4 +3944,251 @@ fn collector_worker4_latency_cursor_tracking_and_file_shrink_reset() {
         Some(&stdin),
     );
     assert_eq!(s_regrown.compaction_count, 0);
+}
+
+#[test]
+fn read_git_head_fallback_extracts_origin_from_common_dir_for_linked_worktree() {
+    let tmp = TempDir::new("worktree-head-fallback");
+    let common_dir = tmp.path.join("repo/.git");
+    let git_dir = common_dir.join("worktrees/wt-1");
+    fs::create_dir_all(&git_dir).unwrap();
+    fs::write(git_dir.join("HEAD"), "ref: refs/heads/feat/wt-fallback\n").unwrap();
+    fs::write(
+        common_dir.join("config"),
+        "[remote \"origin\"]\n\turl = https://github.com/Max/agy-hud.git\n",
+    )
+    .unwrap();
+
+    let info = read_git_head_fallback(&git_dir, &common_dir).expect("head fallback");
+    assert_eq!(info.branch, "feat/wt-fallback");
+    assert_eq!(
+        info.repo_url.as_deref(),
+        Some("https://github.com/Max/agy-hud")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn pr1_quota_refresh_auth_exit2_timeout_exit3_api_key_skip_and_uninstall_race() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = TempDir::new("quota-pr1");
+    let fake_home = tmp.path.join("home");
+    let gemini_cfg = fake_home.join(".gemini/config");
+    let cli_dir = tmp.path.join("cli");
+    let hud_home = cli_dir.join("agy-hud");
+    let bin_dir = tmp.path.join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    fs::create_dir_all(&hud_home).unwrap();
+
+    // Bare `agy` executable placed on PATH to verify `resolve_executable_in_path` resolution + env forwarding
+    let fake_agy = bin_dir.join("agy");
+    let marker_file = tmp.path.join("agy-was-called");
+    fs::write(&fake_agy, "#!/bin/sh\nexit 0\n").unwrap();
+    fs::set_permissions(&fake_agy, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let sys_path = std::env::var_os("PATH").unwrap_or_default();
+    let mut joined_paths = vec![bin_dir];
+    joined_paths.extend(std::env::split_paths(&sys_path));
+    let combined_path = std::env::join_paths(joined_paths).unwrap();
+
+    let run_with_extra = |args: &[&str], extra: &[(&str, &str)], stdin_data: Option<&str>| {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_agy-hud"));
+        cmd.args(args)
+            .env_remove("GEMINI_API_KEY")
+            .env_remove("AGY_ADC_AUTH")
+            .env_remove("AGY_HUD_AGY_BIN")
+            .env("HOME", &fake_home)
+            .env("USERPROFILE", &fake_home)
+            .env("AGY_CONFIG_DIR", &gemini_cfg)
+            .env("AGY_CLI_DIR", &cli_dir)
+            .env("AGY_HUD_HOME", &hud_home)
+            .env("PATH", &combined_path)
+            .env("AGY_HUD_DISABLE_BG_UPDATE", "1")
+            .env("AGY_SKIP_PLUGIN_INSTALL", "1")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        for (k, v) in extra {
+            cmd.env(k, v);
+        }
+        if stdin_data.is_some() {
+            cmd.stdin(Stdio::piped());
+        } else {
+            cmd.stdin(Stdio::null());
+        }
+        let mut child = cmd.spawn().unwrap();
+        if let Some(input) = stdin_data
+            && let Some(mut pipe) = child.stdin.take()
+        {
+            pipe.write_all(input.as_bytes()).unwrap();
+        }
+        let out = child.wait_with_output().unwrap();
+        (
+            out.status.success(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+        )
+    };
+
+    // Wait: `run_agy_usage_isolated` uses `.env_clear()` and forwards specific keys; pass `MOCK_MODE` via a wrapper script per mode!
+    let mk_mode_script = |name: &str, body: &str| {
+        let p = tmp.path.join(name);
+        fs::write(&p, body).unwrap();
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
+        p
+    };
+
+    // 1. Exit code 2 -> UnsupportedAuthExit2: forwards GEMINI_API_KEY & AGY_ADC_AUTH, writes 24h backoff, clear error
+    let agy_exit2 = mk_mode_script(
+        "agy-exit2.sh",
+        &format!(
+            "#!/bin/sh\necho \"$GEMINI_API_KEY|$AGY_ADC_AUTH\" > \"{}\"\nexit 2\n",
+            marker_file.display()
+        ),
+    );
+    let (ok2, out2) = run_with_extra(
+        &["quota", "refresh"],
+        &[
+            ("AGY_HUD_AGY_BIN", agy_exit2.to_str().unwrap()),
+            ("GEMINI_API_KEY", "test-api-key"),
+            ("AGY_ADC_AUTH", "1"),
+        ],
+        None,
+    );
+    assert!(!ok2);
+    assert!(
+        out2.contains("exit code 2") && out2.contains("GEMINI_API_KEY"),
+        "expected clear exit code 2 / GEMINI_API_KEY message: {out2}"
+    );
+    assert_eq!(
+        fs::read_to_string(&marker_file).unwrap().trim(),
+        "test-api-key|1"
+    );
+    let backoff2: Value = serde_json::from_str(
+        &fs::read_to_string(hud_home.join("data/quota-backoff.json")).unwrap(),
+    )
+    .unwrap();
+    let retry_at = backoff2["nextRetryAt"].as_i64().unwrap();
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    assert!(
+        retry_at >= now_ms + 86_000_000,
+        "expected ~24h cooldown retry_at={retry_at}, now={now_ms}"
+    );
+
+    // 2. Exit code 3 -> TimeoutExit3: normal backoff + clear timeout message
+    let _ = fs::remove_file(hud_home.join("data/quota-backoff.json"));
+    let agy_exit3 = mk_mode_script("agy-exit3.sh", "#!/bin/sh\nexit 3\n");
+    let (ok3, out3) = run_with_extra(
+        &["quota", "refresh"],
+        &[("AGY_HUD_AGY_BIN", agy_exit3.to_str().unwrap())],
+        None,
+    );
+    assert!(!ok3);
+    assert!(
+        out3.to_ascii_lowercase().contains("timed out") && out3.contains("exit code 3"),
+        "expected clear timeout exit code 3 message: {out3}"
+    );
+    let backoff3: Value = serde_json::from_str(
+        &fs::read_to_string(hud_home.join("data/quota-backoff.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(backoff3["failures"], 1);
+    assert!(backoff3["nextRetryAt"].as_i64().unwrap() <= now_ms + 700_000);
+
+    // 3. `maybe_spawn_background_quota_refresh` skips early when `GEMINI_API_KEY` is non-empty
+    let _ = fs::remove_file(hud_home.join("data/quota-backoff.json"));
+    let _ = fs::remove_file(&marker_file);
+    fs::write(
+        hud_home.join("config.json"),
+        r#"{"quota":{"backgroundRefresh":true}}"#,
+    )
+    .unwrap();
+    let agy_bare_marker = format!("#!/bin/sh\ntouch \"{}\"\nexit 0\n", marker_file.display());
+    fs::write(&fake_agy, agy_bare_marker).unwrap();
+    let render_payload = json!({
+        "cwd": tmp.path,
+        "conversation_id": "conv-bg-skip",
+        "agent_state": "working",
+        "terminal_width": 120
+    })
+    .to_string();
+    let (ok_bg, _) = run_with_extra(
+        &[],
+        &[("GEMINI_API_KEY", "non-empty-key")],
+        Some(&render_payload),
+    );
+    assert!(ok_bg);
+    std::thread::sleep(std::time::Duration::from_millis(80));
+    assert!(
+        !marker_file.exists(),
+        "background quota refresh must NOT spawn when GEMINI_API_KEY is set"
+    );
+    assert!(!hud_home.join("data/quota.lock").exists());
+
+    // 4. Bare `agy` resolution via PATH works in `run_agy_usage_isolated`
+    let agy_bare_ok = r#"#!/bin/sh
+cat <<'EOF'
+{"command":{"data":{"groups":[{"buckets":[{"id":"gemini-5h","remaining_fraction":0.5,"reset_time":"2099-01-01T00:00:00Z"}]}]}}}
+EOF
+"#;
+    fs::write(&fake_agy, agy_bare_ok).unwrap();
+    let (ok_bare, out_bare) = run_with_extra(&["quota", "refresh"], &[], None);
+    assert!(ok_bare, "bare `agy` PATH lookup failed: {out_bare}");
+    assert!(hud_home.join("data/quota-cache.json").is_file());
+
+    // 5. `hud_home` deletion race during `agy -p /usage` (both success and failure paths)
+    let race_ok_script = format!(
+        r#"#!/bin/sh
+rm -rf "{}"
+cat <<'EOF'
+{{"command":{{"data":{{"groups":[{{"buckets":[{{"id":"gemini-5h","remaining_fraction":0.5,"reset_time":"2099-01-01T00:00:00Z"}}]}}]}}}}}}
+EOF
+"#,
+        hud_home.display()
+    );
+    let agy_race_ok = mk_mode_script("agy-race-ok.sh", &race_ok_script);
+    let (ok_race_bg, _) = run_with_extra(
+        &["quota", "refresh", "--background"],
+        &[("AGY_HUD_AGY_BIN", agy_race_ok.to_str().unwrap())],
+        None,
+    );
+    assert!(ok_race_bg);
+    assert!(
+        !hud_home.exists(),
+        "successful probe after hud_home deletion must NOT recreate hud_home/quota-cache.json"
+    );
+
+    fs::create_dir_all(&hud_home).unwrap();
+    let race_err_script = format!("#!/bin/sh\nrm -rf \"{}\"\nexit 1\n", hud_home.display());
+    let agy_race_err = mk_mode_script("agy-race-err.sh", &race_err_script);
+    let (ok_race_err, _) = run_with_extra(
+        &["quota", "refresh", "--background"],
+        &[("AGY_HUD_AGY_BIN", agy_race_err.to_str().unwrap())],
+        None,
+    );
+    assert!(ok_race_err);
+    assert!(
+        !hud_home.exists(),
+        "failed probe after hud_home deletion must NOT recreate hud_home/quota-backoff.json"
+    );
+
+    // 6. Pre-start uninstall race: `--background --lock-token <tok>` must NOT recreate missing hud_home/data
+    let (ok_missing_bg, _) = run_with_extra(
+        &[
+            "quota",
+            "refresh",
+            "--background",
+            "--lock-token",
+            "stale-tok",
+        ],
+        &[],
+        None,
+    );
+    assert!(ok_missing_bg);
+    assert!(
+        !hud_home.exists(),
+        "background refresh with --lock-token must NOT recreate hud_home after pre-start uninstall"
+    );
 }

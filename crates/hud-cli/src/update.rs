@@ -1,4 +1,4 @@
-use crate::collector::{exec_file_safe, read_bounded_string};
+use crate::collector::{exec_file_safe, read_bounded_string, resolve_executable_in_path};
 use crate::install::detect_installed_binary_version;
 use crate::paths::{
     AgyPaths, atomic_write_bytes, create_private_dir_all, existing_data_dir, prepare_data_dir,
@@ -161,7 +161,9 @@ fn run_bounded_network_cmd(
     timeout_ms: u64,
     max_stdout: u64,
 ) -> Option<String> {
-    let mut command = Command::new(program);
+    let resolved_bin =
+        resolve_executable_in_path(program, std::env::var_os("PATH").as_deref(), cfg!(windows))?;
+    let mut command = Command::new(&resolved_bin);
     command
         .args(args)
         .stdin(Stdio::null())
@@ -527,7 +529,10 @@ fn extract_release_archive(archive_path: &Path, extract_dir: &Path) -> Result<()
     let extract_str = extract_dir.to_string_lossy().into_owned();
 
     if archive_str.ends_with(".tar.gz") {
-        let status = Command::new("tar")
+        let tar_bin =
+            resolve_executable_in_path("tar", std::env::var_os("PATH").as_deref(), cfg!(windows))
+                .ok_or_else(|| "Unable to locate `tar` in PATH.".to_string())?;
+        let status = Command::new(&tar_bin)
             .args(["-xzf", &archive_str, "-C", &extract_str])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -546,7 +551,10 @@ fn extract_release_archive(archive_path: &Path, extract_dir: &Path) -> Result<()
         let ps_dst = extract_str.replace('\'', "''");
         let ps_cmd =
             format!("Expand-Archive -LiteralPath '{ps_arc}' -DestinationPath '{ps_dst}' -Force");
-        let status = Command::new("powershell")
+        let ps_bin =
+            resolve_executable_in_path("powershell", std::env::var_os("PATH").as_deref(), true)
+                .ok_or_else(|| "Unable to locate `powershell` in PATH.".to_string())?;
+        let status = Command::new(&ps_bin)
             .args(["-NoProfile", "-NonInteractive", "-Command", &ps_cmd])
             .stdin(Stdio::null())
             .stdout(Stdio::null())

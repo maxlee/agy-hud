@@ -99,7 +99,7 @@
     "step_count": 8
   },
   "expectedPlainLines": [
-    "╭─ 🔧 TOOL │ [Gemini 4 Argon · high] Ultra │ agy-hud git:(feat/corpus* ↑5) │ ⏱ 6m",
+    "╭─ 🔧 TOOL │ [ACCEPT] │ [Gemini 4 Argon · high] Ultra │ agy-hud git:(feat/corpus* ↑5) │ ⏱ 6m",
     "├─ Ctx ███▒···· 46.0% │ $1.38 · agents 1/2",
     "├─ Quota(weekly) █▒··· 32% (4d)",
     "├─ ◐ run_command: cargo test --workspace · ✓ edit_file ×3: render.rs",

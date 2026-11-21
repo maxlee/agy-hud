@@ -984,10 +984,10 @@ pub fn probe_hg(root: &Path, runner: &dyn ProbeRunner) -> Option<VcsProbeInfo> {
 
 /// Zero-subprocess fallback reading `.git/HEAD` (including linked worktree gitdirs) when `git`
 /// is unavailable, exceeds `PROBE_TIMEOUT_MS`, or contains unskippable local filter names.
-pub fn read_git_head_fallback(git_dir: &Path) -> Option<VcsProbeInfo> {
+pub fn read_git_head_fallback(git_dir: &Path, common_dir: &Path) -> Option<VcsProbeInfo> {
     let head_raw = read_bounded_string(&git_dir.join("HEAD"), 4096)?;
     let mut info = parse_git_head_text(&head_raw)?;
-    info.repo_url = extract_git_remote_origin_url(git_dir, git_dir);
+    info.repo_url = extract_git_remote_origin_url(git_dir, common_dir);
     Some(info)
 }
 
@@ -999,13 +999,8 @@ pub fn probe_vcs_uncached(repo: &DetectedRepo, runner: &dyn ProbeRunner) -> Opti
             root,
             git_dir,
             common_dir,
-        } => probe_git(root, git_dir, common_dir, runner).or_else(|| {
-            let mut info = read_git_head_fallback(git_dir)?;
-            if info.repo_url.is_none() {
-                info.repo_url = extract_git_remote_origin_url(git_dir, common_dir);
-            }
-            Some(info)
-        }),
+        } => probe_git(root, git_dir, common_dir, runner)
+            .or_else(|| read_git_head_fallback(git_dir, common_dir)),
     }
 }
 

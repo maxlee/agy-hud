@@ -946,8 +946,20 @@ impl StepAccumulator {
                     let mcp_server = if raw_name == "call_mcp_tool" {
                         args.map(|a| unwrap_arg_value(a.get("ServerName")))
                             .unwrap_or_default()
+                    } else if let Some(after_double) = raw_name.strip_prefix("mcp__") {
+                        if !after_double.starts_with('_')
+                            && let Some((srv, _tool)) = after_double.split_once("__")
+                        {
+                            srv.to_string()
+                        } else {
+                            String::new()
+                        }
                     } else if let Some(after_mcp) = raw_name.strip_prefix("mcp_") {
-                        after_mcp.split('_').next().unwrap_or("").to_string()
+                        if let Some((srv, _tool)) = after_mcp.split_once("__") {
+                            srv.to_string()
+                        } else {
+                            after_mcp.split('_').next().unwrap_or("").to_string()
+                        }
                     } else {
                         String::new()
                     };
@@ -1860,5 +1872,77 @@ mod tests {
         let max_res = parse_transcript_and_tasks(None, Some(&max_steps), None, None);
         assert_eq!(max_res.step_count, usize::MAX);
         assert_eq!(max_res.compaction_count, 0);
+    }
+
+    #[test]
+    fn mcp_prefix_parsing_and_subagent_status_variants() {
+        let steps = [
+            json!({
+                "step_index": 0,
+                "source": "MODEL",
+                "type": "PLANNER_RESPONSE",
+                "status": "DONE",
+                "created_at": "2026-11-10T05:00:00Z",
+                "tool_calls": [
+                    { "name": "mcp__context7__query_docs" },
+                    { "name": "mcp__my_server__list_items" },
+                    { "name": "mcp_my_server__list_items" },
+                    { "name": "mcp_github_create_issue" },
+                    { "name": "mcp_alpha_beta__nested__call" },
+                    { "name": "mcp___srv__tool" },
+                    { "name": "mcp___empty_server" }
+                ]
+            }),
+            json!({ "step_index": 1, "source": "MODEL", "type": "GENERIC", "status": "DONE", "content": "ok" }),
+            json!({ "step_index": 2, "source": "MODEL", "type": "GENERIC", "status": "DONE", "content": "ok" }),
+            json!({ "step_index": 3, "source": "MODEL", "type": "GENERIC", "status": "ERROR", "content": "Error: failed" }),
+            json!({ "step_index": 4, "source": "MODEL", "type": "GENERIC", "status": "DONE", "content": "ok" }),
+            json!({ "step_index": 5, "source": "MODEL", "type": "GENERIC", "status": "DONE", "content": "ok" }),
+            json!({ "step_index": 6, "source": "MODEL", "type": "GENERIC", "status": "DONE", "content": "ok" }),
+            json!({ "step_index": 7, "source": "MODEL", "type": "GENERIC", "status": "DONE", "content": "ok" }),
+        ];
+        let jsonl = steps
+            .iter()
+            .map(serde_json::to_string)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+            .join("\n");
+        let summary = parse_transcript_and_tasks(jsonl.lines().next(), Some(&jsonl), None, None);
+        assert_eq!(
+            summary.mcp_servers,
+            vec!["context7", "my_server", "github", "alpha_beta"]
+        );
+        assert_eq!(summary.mcp_errors, vec!["my_server"]);
+
+        assert_eq!(
+            parse_subagent_status(Some("running")),
+            SubagentStatus::Running
+        );
+        assert_eq!(
+            parse_subagent_status(Some(" Starting ")),
+            SubagentStatus::Running
+        );
+        assert_eq!(
+            parse_subagent_status(Some("IN_PROGRESS")),
+            SubagentStatus::Running
+        );
+        assert_eq!(
+            parse_subagent_status(Some("WAITING")),
+            SubagentStatus::Blocked
+        );
+        assert_eq!(
+            parse_subagent_status(Some("paused")),
+            SubagentStatus::Blocked
+        );
+        assert_eq!(parse_subagent_status(Some("FAILED")), SubagentStatus::Error);
+        assert_eq!(
+            parse_subagent_status(Some("canceled")),
+            SubagentStatus::Error
+        );
+        assert_eq!(
+            parse_subagent_status(Some("done")),
+            SubagentStatus::Completed
+        );
+        assert_eq!(parse_subagent_status(None), SubagentStatus::Completed);
     }
 }

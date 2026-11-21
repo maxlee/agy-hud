@@ -210,9 +210,11 @@ pub fn is_shadow_or_utility_model(s: &str) -> bool {
         return true;
     }
     let bytes = lower.as_bytes();
-    lower
-        .match_indices("m50")
-        .any(|(idx, _)| !bytes.get(idx + 3).is_some_and(u8::is_ascii_digit))
+    lower.match_indices("m50").any(|(idx, _)| {
+        let before_ok = idx == 0 || !bytes[idx - 1].is_ascii_alphanumeric();
+        let after_ok = !bytes.get(idx + 3).is_some_and(u8::is_ascii_digit);
+        before_ok && after_ok
+    })
 }
 
 /// Non-empty normalized `model_family` paired with `phys_win > 0`.
@@ -908,6 +910,55 @@ fn bucket_to_view(id: &str, raw: &RawQuotaBucket, now_ms: i64) -> Option<QuotaBu
     })
 }
 
+const NON_FAMILY_MODEL_TOKENS: &[&str] = &[
+    "google",
+    "gemini",
+    "claude",
+    "anthropic",
+    "openai",
+    "antigravity",
+    "model",
+    "preview",
+    "latest",
+    "default",
+    "inherit",
+    "auto",
+    "low",
+    "med",
+    "medium",
+    "high",
+    "xhigh",
+    "thinking",
+    "minimal",
+    "max",
+    "weekly",
+    "wtu",
+    "5h",
+    "7d",
+    "pro",
+    "flash",
+    "ultra",
+    "mini",
+    "nano",
+    "oss",
+];
+
+fn extract_active_model_family_tokens(model_haystack: &str) -> Vec<&str> {
+    let mut tokens = Vec::new();
+    for tok in model_haystack.split(|c: char| !c.is_ascii_alphanumeric()) {
+        if tok.len() < 3 || tok.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        if NON_FAMILY_MODEL_TOKENS.contains(&tok) {
+            continue;
+        }
+        if !tokens.contains(&tok) {
+            tokens.push(tok);
+        }
+    }
+    tokens
+}
+
 pub fn extract_quota_buckets(stdin: Option<&AgyStdinData>) -> Vec<QuotaBucketView> {
     extract_quota_buckets_reconciled(stdin, None, 0)
 }
@@ -996,14 +1047,42 @@ pub fn extract_quota_buckets_reconciled(
         &["gemini-5h", "gemini-weekly"]
     };
 
-    routed_keys
+    let mut views: Vec<QuotaBucketView> = routed_keys
         .iter()
         .filter_map(|&key| {
             merged
                 .get(key)
                 .and_then(|raw| bucket_to_view(key, raw, now_ms))
         })
-        .collect()
+        .collect();
+
+    let family_tokens = extract_active_model_family_tokens(&model_haystack);
+    let mut family_views = Vec::new();
+    let mut credits_views = Vec::new();
+    for (id, raw) in &merged {
+        let id_lower = id.to_ascii_lowercase();
+        if KNOWN_CANONICAL_BUCKETS.contains(&id_lower.as_str())
+            || views.iter().any(|v| v.id.eq_ignore_ascii_case(&id_lower))
+        {
+            continue;
+        }
+        let matches_family = !family_tokens.is_empty()
+            && id_lower
+                .split(|c: char| !c.is_ascii_alphanumeric())
+                .any(|seg| family_tokens.contains(&seg));
+        let matches_credits = id_lower.contains("credits");
+        if matches_family {
+            if let Some(view) = bucket_to_view(id, raw, now_ms) {
+                family_views.push(view);
+            }
+        } else if matches_credits && let Some(view) = bucket_to_view(id, raw, now_ms) {
+            credits_views.push(view);
+        }
+    }
+    views.extend(family_views);
+    views.extend(credits_views);
+
+    views
 }
 
 /// Projects whether the current quota bucket burn rate will exhaust the window before reset.
@@ -1459,6 +1538,7 @@ mod tests {
             "m50",
             "MODEL_PLACEHOLDER_M50",
             "m50-preview",
+            "am50-m50",
         ] {
             assert!(
                 is_shadow_or_utility_model(matched),
@@ -1470,6 +1550,9 @@ mod tests {
             "m500",
             "M500",
             "gemini-m500",
+            "am50",
+            "v2m50",
+            "ModelAm50",
             "Gemini 4 Argon",
             "gemini-3-flash",
             "claude-sonnet-4.6",
@@ -1479,6 +1562,222 @@ mod tests {
                 "unexpected match: {unmatched}"
             );
         }
+    }
+
+    #[test]
+    fn gemini_4_and_claude_5_5_formatting_compaction_and_quota_passthrough() {
+        let mk_model = |id: &str, display: &str, effort: Option<&str>| ModelStdin {
+            id: Some(id.to_string()),
+            display_name: Some(display.to_string()),
+            effort: effort.map(str::to_string),
+        };
+        assert_eq!(
+            format_model_name(
+                Some(&mk_model(
+                    "gemini-4-neon-xhigh",
+                    "Gemini 4 Neon (XHigh)",
+                    Some("xhigh")
+                )),
+                ModelFormatMode::Short,
+                EffortFormatMode::Text
+            ),
+            "Neon · xhigh"
+        );
+        assert_eq!(
+            format_model_name(
+                Some(&mk_model(
+                    "gemini-4-carbon-high",
+                    "Gemini 4 Carbon (High)",
+                    Some("high")
+                )),
+                ModelFormatMode::Short,
+                EffortFormatMode::Hidden
+            ),
+            "Carbon"
+        );
+        assert_eq!(
+            format_model_name(
+                Some(&mk_model(
+                    "gemini-4-hydrogen-medium",
+                    "Gemini 4 Hydrogen (Medium)",
+                    Some("medium")
+                )),
+                ModelFormatMode::Compact,
+                EffortFormatMode::Text
+            ),
+            "Gemini 4 Hydrogen · med"
+        );
+        assert_eq!(
+            format_model_name(
+                Some(&mk_model(
+                    "claude-opus-5-5-high",
+                    "Claude Opus 5.5 (High)",
+                    Some("high")
+                )),
+                ModelFormatMode::Short,
+                EffortFormatMode::Text
+            ),
+            "Opus 5.5 · high"
+        );
+        assert_eq!(
+            format_model_name(
+                Some(&mk_model(
+                    "claude-sonnet-5-5-medium",
+                    "Claude Sonnet 5.5",
+                    Some("medium")
+                )),
+                ModelFormatMode::Short,
+                EffortFormatMode::Hidden
+            ),
+            "Sonnet 5.5"
+        );
+
+        assert_eq!(
+            normalize_model_family_str("gemini-4-neon-xhigh", Some("xhigh")),
+            Some("gemini-4-neon".to_string())
+        );
+        assert_eq!(
+            normalize_model_family_str("gemini-pro-orchestrator-high", Some("high")),
+            Some("gemini-pro-orchestrator".to_string())
+        );
+        assert_eq!(
+            canonical_db_family_key("claude-sonnet-5-5-medium"),
+            canonical_db_family_key("Claude Sonnet 5.5 (Medium)")
+        );
+
+        let now_ms = 1_794_218_400_000i64;
+        let future = "2099-01-01T00:00:00Z".to_string();
+        let mut quota = BTreeMap::new();
+        for (id, frac) in [
+            ("gemini-5h", Some(0.80)),
+            ("gemini-weekly", Some(0.70)),
+            ("3p-5h", Some(0.90)),
+            ("3p-weekly", Some(0.85)),
+            ("gemini-argon-wtu-weekly", Some(0.60)),
+            ("gemini-neon-weekly", Some(0.55)),
+            ("gemini-carbon-weekly", Some(0.50)),
+            ("gemini-hydrogen-wtu-weekly", Some(0.45)),
+            ("gemini-orchestrator-weekly", Some(0.40)),
+        ] {
+            quota.insert(
+                id.to_string(),
+                RawQuotaBucket {
+                    remaining_fraction: frac,
+                    reset_time: Some(future.clone()),
+                    ..Default::default()
+                },
+            );
+        }
+        quota.insert(
+            "ai-credits".to_string(),
+            RawQuotaBucket {
+                remaining_amount: Some(25.0),
+                reset_time: Some(future),
+                ..Default::default()
+            },
+        );
+
+        let ids_for = |id: &str, display: &str| -> Vec<String> {
+            let stdin = AgyStdinData {
+                model: Some(mk_model(id, display, None)),
+                quota: Some(quota.clone()),
+                ..Default::default()
+            };
+            extract_quota_buckets_reconciled(Some(&stdin), None, now_ms)
+                .into_iter()
+                .map(|b| b.id)
+                .collect()
+        };
+
+        assert_eq!(
+            ids_for("gemini-4-neon-xhigh", "Gemini 4 Neon (XHigh)"),
+            vec![
+                "gemini-5h",
+                "gemini-weekly",
+                "gemini-neon-weekly",
+                "ai-credits"
+            ]
+        );
+        assert_eq!(
+            ids_for("gemini-4-carbon-high", "Gemini 4 Carbon (High)"),
+            vec![
+                "gemini-5h",
+                "gemini-weekly",
+                "gemini-carbon-weekly",
+                "ai-credits"
+            ]
+        );
+        assert_eq!(
+            ids_for("gemini-4-hydrogen-medium", "Gemini 4 Hydrogen (Medium)"),
+            vec![
+                "gemini-5h",
+                "gemini-weekly",
+                "gemini-hydrogen-wtu-weekly",
+                "ai-credits"
+            ]
+        );
+        assert_eq!(
+            ids_for(
+                "gemini-pro-orchestrator-high",
+                "Gemini Pro Orchestrator (High)"
+            ),
+            vec![
+                "gemini-5h",
+                "gemini-weekly",
+                "gemini-orchestrator-weekly",
+                "ai-credits"
+            ]
+        );
+        assert_eq!(
+            ids_for("gemini-4-argon-high", "Gemini 4 Argon (High)"),
+            vec!["gemini-argon-wtu-weekly", "ai-credits"]
+        );
+        assert_eq!(
+            ids_for("claude-opus-5-5-high", "Claude Opus 5.5 (High)"),
+            vec!["3p-5h", "3p-weekly", "ai-credits"]
+        );
+
+        // Mixed-case canonical keys must NOT duplicate or leak, and family buckets outrank `credits`
+        let mut mixed_quota = quota;
+        mixed_quota.insert(
+            "Gemini-Argon-Wtu-Weekly".to_string(),
+            RawQuotaBucket {
+                remaining_fraction: Some(0.25),
+                reset_time: Some("2099-01-01T00:00:00Z".to_string()),
+                ..Default::default()
+            },
+        );
+        mixed_quota.insert(
+            "3P-Weekly".to_string(),
+            RawQuotaBucket {
+                remaining_fraction: Some(0.35),
+                reset_time: Some("2099-01-01T00:00:00Z".to_string()),
+                ..Default::default()
+            },
+        );
+        let mixed_stdin = AgyStdinData {
+            model: Some(mk_model(
+                "gemini-4-neon-xhigh",
+                "Gemini 4 Neon (XHigh)",
+                None,
+            )),
+            quota: Some(mixed_quota),
+            ..Default::default()
+        };
+        let mixed_ids: Vec<String> =
+            extract_quota_buckets_reconciled(Some(&mixed_stdin), None, now_ms)
+                .into_iter()
+                .map(|b| b.id)
+                .collect();
+        assert_eq!(
+            mixed_ids,
+            vec![
+                "gemini-5h",
+                "gemini-weekly",
+                "gemini-neon-weekly",
+                "ai-credits"
+            ]
+        );
     }
 
     #[test]

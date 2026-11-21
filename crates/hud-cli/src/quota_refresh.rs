@@ -1,5 +1,7 @@
-use crate::collector::read_bounded_string;
-use crate::paths::{AgyPaths, atomic_write_bytes, create_private_dir_all, prepare_data_dir};
+use crate::collector::{read_bounded_string, resolve_executable_in_path};
+use crate::paths::{
+    AgyPaths, atomic_write_bytes, create_private_dir_all, existing_data_dir, prepare_data_dir,
+};
 use hud_core::probes::parse_usage_command_output;
 use hud_core::types::{AgyStdinData, CachedQuotaSnapshot};
 use serde::{Deserialize, Serialize};
@@ -16,9 +18,17 @@ const ACTIVE_REFRESH_FLOOR_MS: i64 = 60_000;
 const IDLE_REFRESH_FLOOR_MS: i64 = 300_000;
 const BASE_BACKOFF_MS: i64 = 60_000;
 const MAX_BACKOFF_MS: i64 = 600_000;
+const AUTH_UNSUPPORTED_BACKOFF_MS: i64 = 86_400_000;
 const USAGE_TIMEOUT_MS: u64 = 32_000;
 const USAGE_MAX_STDOUT_BYTES: u64 = 512 * 1024;
 const TEMP_SWEEP_AGE_SECS: u64 = 3_600;
+
+enum UsageProbeOutcome {
+    Ok(String),
+    UnsupportedAuthExit2,
+    TimeoutExit3,
+    TransientError,
+}
 
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -115,18 +125,32 @@ fn read_backoff(backoff_path: &Path) -> QuotaBackoffInfo {
         .unwrap_or_default()
 }
 
+fn write_backoff_entry(backoff_path: &Path, failures: u32, next_retry_at: i64) {
+    let next = QuotaBackoffInfo {
+        failures,
+        next_retry_at,
+    };
+    if let Ok(bytes) = serde_json::to_vec(&next) {
+        let _ = atomic_write_bytes(backoff_path, &bytes, 0o600);
+    }
+}
+
 fn record_backoff_failure(backoff_path: &Path, now_ms: i64) {
     let prev = read_backoff(backoff_path);
     let failures = prev.failures.saturating_add(1);
     let shift = failures.saturating_sub(1).min(4);
     let delay = (BASE_BACKOFF_MS.saturating_mul(1i64 << shift)).min(MAX_BACKOFF_MS);
-    let next = QuotaBackoffInfo {
+    write_backoff_entry(backoff_path, failures, now_ms.saturating_add(delay));
+}
+
+fn record_unsupported_auth_backoff(backoff_path: &Path, now_ms: i64) {
+    let prev = read_backoff(backoff_path);
+    let failures = prev.failures.saturating_add(1);
+    write_backoff_entry(
+        backoff_path,
         failures,
-        next_retry_at: now_ms.saturating_add(delay),
-    };
-    if let Ok(bytes) = serde_json::to_vec(&next) {
-        let _ = atomic_write_bytes(backoff_path, &bytes, 0o600);
-    }
+        now_ms.saturating_add(AUTH_UNSUPPORTED_BACKOFF_MS),
+    );
 }
 
 fn sweep_stale_usage_temp_dirs(base_tmp: &Path) {
@@ -183,13 +207,20 @@ impl Drop for ScopedTempDir {
     }
 }
 
-fn run_agy_usage_isolated() -> Option<String> {
-    let temp_cwd = ScopedTempDir::create()?;
-    let agy_bin = std::env::var("AGY_HUD_AGY_BIN")
+fn run_agy_usage_isolated() -> UsageProbeOutcome {
+    let Some(temp_cwd) = ScopedTempDir::create() else {
+        return UsageProbeOutcome::TransientError;
+    };
+    let raw_bin = std::env::var("AGY_HUD_AGY_BIN")
         .ok()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "agy".to_string());
+    let Some(agy_bin) =
+        resolve_executable_in_path(&raw_bin, std::env::var_os("PATH").as_deref(), cfg!(windows))
+    else {
+        return UsageProbeOutcome::TransientError;
+    };
 
     let mut command = Command::new(agy_bin);
     command
@@ -223,6 +254,8 @@ fn run_agy_usage_isolated() -> Option<String> {
         "HTTPS_PROXY",
         "HTTP_PROXY",
         "NO_PROXY",
+        "GEMINI_API_KEY",
+        "AGY_ADC_AUTH",
     ] {
         if let Ok(val) = std::env::var(key) {
             command.env(key, val);
@@ -239,8 +272,14 @@ fn run_agy_usage_isolated() -> Option<String> {
         command.creation_flags(CREATE_NO_WINDOW);
     }
 
-    let mut child = command.spawn().ok()?;
-    let mut stdout_pipe = child.stdout.take()?;
+    let Ok(mut child) = command.spawn() else {
+        return UsageProbeOutcome::TransientError;
+    };
+    let Some(mut stdout_pipe) = child.stdout.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return UsageProbeOutcome::TransientError;
+    };
 
     let reader = thread::spawn(move || {
         let mut buf = Vec::with_capacity(8192);
@@ -252,6 +291,7 @@ fn run_agy_usage_isolated() -> Option<String> {
     });
 
     let deadline = Instant::now() + Duration::from_millis(USAGE_TIMEOUT_MS);
+    let mut timed_out = false;
     let status = loop {
         match child.try_wait() {
             Ok(Some(st)) => break Some(st),
@@ -259,6 +299,7 @@ fn run_agy_usage_isolated() -> Option<String> {
                 if Instant::now() >= deadline {
                     let _ = child.kill();
                     let _ = child.wait();
+                    timed_out = true;
                     break None;
                 }
                 thread::sleep(Duration::from_millis(15));
@@ -269,34 +310,75 @@ fn run_agy_usage_isolated() -> Option<String> {
                 break None;
             }
         }
-    }?;
+    };
+
+    let Some(status) = status else {
+        let _ = reader.join();
+        return if timed_out {
+            UsageProbeOutcome::TimeoutExit3
+        } else {
+            UsageProbeOutcome::TransientError
+        };
+    };
 
     if !status.success() {
-        return None;
+        let _ = reader.join();
+        return match status.code() {
+            Some(2) => UsageProbeOutcome::UnsupportedAuthExit2,
+            Some(3) => UsageProbeOutcome::TimeoutExit3,
+            _ => UsageProbeOutcome::TransientError,
+        };
     }
-    let buf = reader.join().ok()?;
+    let Ok(buf) = reader.join() else {
+        return UsageProbeOutcome::TransientError;
+    };
     if (buf.len() as u64) > USAGE_MAX_STDOUT_BYTES {
-        return None;
+        return UsageProbeOutcome::TransientError;
     }
-    String::from_utf8(buf).ok()
+    match String::from_utf8(buf) {
+        Ok(text) => UsageProbeOutcome::Ok(text),
+        Err(_) => UsageProbeOutcome::TransientError,
+    }
 }
 
 fn execute_locked_refresh(
+    paths: &AgyPaths,
     data_dir: &Path,
     now_ms: i64,
 ) -> Result<CachedQuotaSnapshot, &'static str> {
     let backoff_path = data_dir.join("quota-backoff.json");
     let cache_path = data_dir.join("quota-cache.json");
 
-    let Some(stdout) = run_agy_usage_isolated() else {
-        record_backoff_failure(&backoff_path, now_ms);
-        return Err(
-            "Failed to query `agy -p /usage` (check that `agy` is installed and authenticated).",
-        );
+    let stdout = match run_agy_usage_isolated() {
+        UsageProbeOutcome::Ok(s) => s,
+        UsageProbeOutcome::UnsupportedAuthExit2 => {
+            if paths.hud_home.exists() {
+                record_unsupported_auth_backoff(&backoff_path, now_ms);
+            }
+            return Err(
+                "`agy -p /usage` failed with exit code 2 (quota query is unsupported under GEMINI_API_KEY or non-OAuth auth); pausing background refresh for 24h.",
+            );
+        }
+        UsageProbeOutcome::TimeoutExit3 => {
+            if paths.hud_home.exists() {
+                record_backoff_failure(&backoff_path, now_ms);
+            }
+            return Err("Timed out querying `agy -p /usage` (exit code 3).");
+        }
+        UsageProbeOutcome::TransientError => {
+            if paths.hud_home.exists() {
+                record_backoff_failure(&backoff_path, now_ms);
+            }
+            return Err(
+                "Failed to query `agy -p /usage` (check that `agy` is installed and authenticated).",
+            );
+        }
     };
 
     let Some(quota) = parse_usage_command_output(&stdout) else {
-        record_backoff_failure(&backoff_path, now_ms);
+        if paths.hud_home.exists() {
+            record_backoff_failure(&backoff_path, now_ms);
+        }
         return Err("`agy -p /usage` returned an unrecognized or empty quota payload.");
     };
 
@@ -307,6 +389,9 @@ fn execute_locked_refresh(
     };
     let bytes = serde_json::to_vec_pretty(&snapshot)
         .map_err(|_| "Failed to serialize quota cache snapshot.")?;
+    if !paths.hud_home.exists() {
+        return Err("HUD home directory was removed during quota refresh; skipping cache write.");
+    }
     atomic_write_bytes(&cache_path, &bytes, 0o600)
         .map_err(|_| "Failed to write quota-cache.json.")?;
     let _ = fs::remove_file(&backoff_path);
@@ -331,7 +416,12 @@ pub fn run_quota_subcommand(
         .and_then(|idx| args.get(idx + 1))
         .cloned();
 
-    let Some(data_dir) = prepare_data_dir(paths) else {
+    let data_dir_opt = if passed_token.is_some() {
+        existing_data_dir(paths)
+    } else {
+        prepare_data_dir(paths)
+    };
+    let Some(data_dir) = data_dir_opt else {
         if is_background {
             return Ok(None);
         }
@@ -354,7 +444,7 @@ pub fn run_quota_subcommand(
         tok
     };
 
-    let result = execute_locked_refresh(&data_dir, now_ms);
+    let result = execute_locked_refresh(paths, &data_dir, now_ms);
     release_lock_if_owner(&lock_path, &owned_token);
 
     match result {
@@ -391,6 +481,13 @@ pub fn maybe_spawn_background_quota_refresh(
     stdin: &AgyStdinData,
     now_ms: i64,
 ) {
+    if std::env::var("GEMINI_API_KEY")
+        .ok()
+        .is_some_and(|v| !v.trim().is_empty())
+    {
+        return;
+    }
+
     let Some(data_dir) = prepare_data_dir(paths) else {
         return;
     };

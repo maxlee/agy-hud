@@ -11,6 +11,7 @@ use crate::stdin::{
     format_model_name_with_glyphs, format_session_cost, format_workspace_breadcrumb,
     normalize_plan_tier,
 };
+use crate::transcript::parse_subagent_status;
 use crate::types::{
     AgyStdinData, CachedQuotaSnapshot, ContextValueMode, CostTotals, DbCeilingInfo, GlyphMode,
     HUD_VERSION, LearnedCompactionState, LineLayout, MemoryProbeInfo, ModelFormatMode, PathLevels,
@@ -167,7 +168,7 @@ fn render_mode_badges(
             &format!("[{}]", labels.mode.auto),
             &[colors::GREEN, BOLD],
         )),
-        "accept-edits" => parts.push(paint(
+        "accept-edits" | "auto_edit" => parts.push(paint(
             &format!("[{}]", labels.mode.accept_edits),
             &[colors::YELLOW, BOLD],
         )),
@@ -705,7 +706,7 @@ impl SubagentCounts {
         }
         let running = subagents
             .iter()
-            .filter(|s| s.status.as_deref() == Some("running"))
+            .filter(|s| parse_subagent_status(s.status.as_deref()) == SubagentStatus::Running)
             .count();
         Some(Self {
             running,
@@ -1685,6 +1686,23 @@ fn build_metrics_line(
         .join(&sep_str)
 }
 
+fn align_standalone_row(
+    name: &str,
+    line: String,
+    config: &HudConfig,
+    line_budget: Option<usize>,
+) -> String {
+    if let Some(budget) = line_budget
+        && config.display.right_align.iter().any(|r| r == name)
+    {
+        let width = text_width(&line);
+        if width < budget {
+            return format!("{}{line}", " ".repeat(budget - width));
+        }
+    }
+    line
+}
+
 fn compose_expanded_rows(
     named_rows: Vec<(&'static str, String)>,
     config: &HudConfig,
@@ -1694,7 +1712,9 @@ fn compose_expanded_rows(
     if config.display.merge_groups.is_empty() {
         return named_rows
             .into_iter()
-            .filter_map(|(_, line)| (!line.is_empty()).then_some(line))
+            .filter_map(|(name, line)| {
+                (!line.is_empty()).then(|| align_standalone_row(name, line, config, line_budget))
+            })
             .collect();
     }
 
@@ -1727,7 +1747,8 @@ fn compose_expanded_rows(
                 continue;
             }
             if present.len() == 1 {
-                out.push(present.pop().unwrap().1);
+                let (member_name, val) = present.pop().unwrap();
+                out.push(align_standalone_row(member_name, val, config, line_budget));
                 continue;
             }
 
@@ -1758,21 +1779,29 @@ fn compose_expanded_rows(
                 // Auto-stack fallback: align bar labels if context & quota stacked together
                 let ctx_pos = present.iter().position(|(k, _)| *k == "context");
                 let quota_pos = present.iter().position(|(k, _)| *k == "quota");
-                if let (Some(ci), Some(qi)) = (ctx_pos, quota_pos) {
-                    let mut ctx_clone = present[ci].1.clone();
-                    let mut quota_clone = present[qi].1.clone();
-                    align_bar_prefix_pair(&mut ctx_clone, &mut quota_clone);
-                    present[ci].1 = ctx_clone;
-                    present[qi].1 = quota_clone;
-                }
-                for (_, line) in present {
-                    out.push(line);
+                let bar_pair_aligned = match (ctx_pos, quota_pos) {
+                    (Some(ci), Some(qi)) => {
+                        let mut ctx_clone = present[ci].1.clone();
+                        let mut quota_clone = present[qi].1.clone();
+                        align_bar_prefix_pair(&mut ctx_clone, &mut quota_clone);
+                        present[ci].1 = ctx_clone;
+                        present[qi].1 = quota_clone;
+                        true
+                    }
+                    _ => false,
+                };
+                for (member_name, line) in present {
+                    if bar_pair_aligned && (member_name == "context" || member_name == "quota") {
+                        out.push(line);
+                    } else {
+                        out.push(align_standalone_row(member_name, line, config, line_budget));
+                    }
                 }
             }
         } else {
             consumed.insert(name);
             if let Some(val) = row_map.remove(name) {
-                out.push(val);
+                out.push(align_standalone_row(name, val, config, line_budget));
             }
         }
     }
@@ -2155,14 +2184,13 @@ pub fn render_hud_lines_full(input: RenderInput<'_>, extras: RenderExtras<'_>) -
             if effective_width.is_some_and(|w| text_width(&wide_line) <= w) {
                 vec![wide_line]
             } else {
-                join_with_rail(
-                    [line1, ctx_line, quota_line]
-                        .into_iter()
-                        .filter(|s| !s.is_empty())
-                        .collect(),
-                    true,
-                    gm,
-                )
+                let named_rows = vec![
+                    ("header", line1),
+                    ("context", ctx_line),
+                    ("quota", quota_line),
+                ];
+                let composed = compose_expanded_rows(named_rows, config, &sep_str, line_budget);
+                join_with_rail(composed, true, gm)
             }
         } else {
             let named_rows = vec![

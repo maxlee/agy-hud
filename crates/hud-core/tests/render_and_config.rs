@@ -4221,3 +4221,228 @@ fn honest_cold_start_ui_showcase_and_db_ceiling_report_scrub() {
         }
     );
 }
+
+#[test]
+fn pr1_auto_edit_mode_subagent_status_fallback_and_standalone_right_align() {
+    let render_plain = |stdin: &AgyStdinData, cfg: &HudConfig, cols: usize| -> Vec<String> {
+        render_hud_lines(RenderInput {
+            stdin: Some(stdin),
+            config: cfg,
+            transcript: &TranscriptSummary::default(),
+            vcs: None,
+            memory: None,
+            cached_quota: None,
+            update_info: None,
+            columns: Some(cols),
+            now_ms: 1_700_000_000_000,
+        })
+        .into_iter()
+        .map(|l| strip_ansi(&l))
+        .collect()
+    };
+
+    // 1. Both `auto_edit` and `accept-edits` render `[ACCEPT]`
+    for mode in ["auto_edit", "accept-edits"] {
+        let mut stdin = sample_stdin(120);
+        stdin.cycle_mode = Some(mode.to_string());
+        let plain = render_plain(&stdin, &HudConfig::default(), 120).join("\n");
+        assert!(plain.contains("[ACCEPT]"), "mode={mode}: {plain}");
+
+        let zh_cfg = HudConfig {
+            language: Language::ZhHans,
+            ..HudConfig::default()
+        };
+        let zh_plain = render_plain(&stdin, &zh_cfg, 120).join("\n");
+        assert!(zh_plain.contains("[接受编辑]"), "mode={mode}: {zh_plain}");
+    }
+
+    // 2. `stdin.subagents` fallback uses `parse_subagent_status` (running/starting/in_progress case-insensitively)
+    let mut sub_stdin = sample_stdin(120);
+    sub_stdin.subagents = Some(vec![
+        SubagentStdin {
+            name: Some("a1".to_string()),
+            role: None,
+            status: Some("running".to_string()),
+            model: None,
+        },
+        SubagentStdin {
+            name: Some("a2".to_string()),
+            role: None,
+            status: Some(" Starting ".to_string()),
+            model: None,
+        },
+        SubagentStdin {
+            name: Some("a3".to_string()),
+            role: None,
+            status: Some("IN_PROGRESS".to_string()),
+            model: None,
+        },
+        SubagentStdin {
+            name: Some("a4".to_string()),
+            role: None,
+            status: Some("blocked".to_string()),
+            model: None,
+        },
+        SubagentStdin {
+            name: Some("a5".to_string()),
+            role: None,
+            status: Some("failed".to_string()),
+            model: None,
+        },
+        SubagentStdin {
+            name: Some("a6".to_string()),
+            role: None,
+            status: Some("completed".to_string()),
+            model: None,
+        },
+    ]);
+    let sub_plain = render_plain(&sub_stdin, &HudConfig::default(), 120).join("\n");
+    assert!(
+        sub_plain.contains("agents 3/6"),
+        "expected 3/6 running subagents: {sub_plain}"
+    );
+
+    // 3. Standalone `rightAlign` across all 4 standalone cases in `compose_expanded_rows`
+    let mut wide_stdin = sample_stdin(120);
+    wide_stdin.cost = Some(CostStdin {
+        total_usd: Some(0.55),
+        subagent_usd: None,
+        estimated: Some(false),
+    });
+
+    // 3a. `merge_groups.is_empty()` + `rightAlign: ["quota"]`
+    let mut cfg_empty = HudConfig::default();
+    cfg_empty.display.right_align = vec!["quota".to_string()];
+    let lines_empty = render_plain(&wide_stdin, &cfg_empty, 120);
+    let quota_empty = lines_empty
+        .iter()
+        .find(|l| l.contains("Quota("))
+        .expect("quota row");
+    assert_eq!(text_width(quota_empty), 120);
+    assert!(quota_empty.starts_with("╰─   "), "{quota_empty:?}");
+
+    // 3b. Ungrouped row (`quota` not in `merge_groups`)
+    let mut cfg_ungrouped = HudConfig::default();
+    cfg_ungrouped.display.merge_groups = vec![vec!["context".to_string(), "meta".to_string()]];
+    cfg_ungrouped.display.right_align = vec!["quota".to_string()];
+    let lines_ungrouped = render_plain(&wide_stdin, &cfg_ungrouped, 120);
+    let quota_ungrouped = lines_ungrouped
+        .iter()
+        .find(|l| l.contains("Quota("))
+        .expect("ungrouped quota row");
+    assert_eq!(text_width(quota_ungrouped), 120);
+    assert!(quota_ungrouped.starts_with("╰─   "), "{quota_ungrouped:?}");
+
+    // 3c. Single member of group present (`["quota", "meta"]`, but `meta` not split cleanly -> hide cost/counts so `meta` is empty)
+    let mut cfg_single = HudConfig::default();
+    cfg_single.display.show_cost = false;
+    cfg_single.display.show_counts = false;
+    cfg_single.display.show_sandbox = false;
+    cfg_single.display.merge_groups = vec![vec!["quota".to_string(), "meta".to_string()]];
+    cfg_single.display.right_align = vec!["quota".to_string()];
+    let lines_single = render_plain(&wide_stdin, &cfg_single, 120);
+    let quota_single = lines_single
+        .iter()
+        .find(|l| l.contains("Quota("))
+        .expect("single-member quota row");
+    assert_eq!(text_width(quota_single), 120);
+    assert!(quota_single.starts_with("╰─   "), "{quota_single:?}");
+
+    // 3d. Auto-stack non-bar-aligned row (`["context", "meta"]` overflows narrow 78-col width and stacks, `meta` right-aligns)
+    let mut cfg_autostack = HudConfig {
+        line_layout: hud_core::types::LineLayout::Expanded,
+        ..HudConfig::default()
+    };
+    cfg_autostack.display.show_daily_cost = true;
+    cfg_autostack.display.show_weekly_cost = true;
+    cfg_autostack.display.merge_groups = vec![vec!["context".to_string(), "meta".to_string()]];
+    cfg_autostack.display.right_align = vec!["meta".to_string()];
+    let mut dense_stdin = sample_stdin(78);
+    dense_stdin.cost = Some(CostStdin {
+        total_usd: Some(1.23),
+        subagent_usd: None,
+        estimated: Some(false),
+    });
+    dense_stdin.task_count = Some(3);
+    let lines_autostack = render_plain(&dense_stdin, &cfg_autostack, 78);
+    let meta_stacked = lines_autostack
+        .iter()
+        .find(|l| l.contains("$1.23") && !l.contains("Ctx"))
+        .expect("auto-stacked standalone meta row");
+    assert_eq!(text_width(meta_stacked), 78, "{lines_autostack:#?}");
+    assert!(meta_stacked.starts_with("├─   "), "{meta_stacked:?}");
+
+    // 3e. Ultrawide >= 180 Adaptive overflow fallback routes through `compose_expanded_rows`
+    let mut cfg_180 = HudConfig::default();
+    cfg_180.display.show_title = true;
+    cfg_180.display.custom_tag = "ultrawide-overflow-tag".to_string();
+    cfg_180.display.right_align = vec!["quota".to_string()];
+    cfg_180.path_levels = hud_core::types::PathLevels::Full;
+    let mut stdin_180 = wide_stdin;
+    stdin_180.terminal_width = Some(180);
+    stdin_180.conversation_title =
+        Some("Very long conversation title forcing 180 col wrap".to_string());
+    stdin_180.cwd = Some(
+        "/Users/dev/workspace/org/division/extremely-long-monorepo-project-folder-name".to_string(),
+    );
+    stdin_180.workspace = Some(WorkspaceStdin {
+        project_dir: Some(
+            "/Users/dev/workspace/org/division/extremely-long-monorepo-project-folder-name"
+                .to_string(),
+        ),
+        current_dir: Some(
+            "/Users/dev/workspace/org/division/extremely-long-monorepo-project-folder-name"
+                .to_string(),
+        ),
+    });
+    let lines_180 = render_plain(&stdin_180, &cfg_180, 180);
+    assert!(
+        lines_180.len() >= 3,
+        "expected ultrawide overflow to stack: {lines_180:#?}"
+    );
+    let quota_180 = lines_180
+        .iter()
+        .find(|l| l.contains("Quota("))
+        .expect("180-col overflow quota row");
+    assert_eq!(text_width(quota_180), 180, "{quota_180:?}");
+    assert!(quota_180.starts_with("╰─   "), "{quota_180:?}");
+
+    // 3f. Family quota bucket outranks `ai-credits` under 2-bucket display cap
+    let mut fam_stdin = sample_stdin(120);
+    fam_stdin.model = Some(ModelStdin {
+        id: Some("gemini-4-neon-xhigh".to_string()),
+        display_name: Some("Gemini 4 Neon (XHigh)".to_string()),
+        effort: Some("xhigh".to_string()),
+    });
+    let mut fam_quota = BTreeMap::new();
+    fam_quota.insert(
+        "gemini-5h".to_string(),
+        RawQuotaBucket {
+            remaining_fraction: Some(0.8),
+            reset_time: Some("2099-01-01T00:00:00Z".to_string()),
+            ..Default::default()
+        },
+    );
+    fam_quota.insert(
+        "gemini-neon-weekly".to_string(),
+        RawQuotaBucket {
+            remaining_fraction: Some(0.5),
+            reset_time: Some("2099-01-01T00:00:00Z".to_string()),
+            ..Default::default()
+        },
+    );
+    fam_quota.insert(
+        "ai-credits".to_string(),
+        RawQuotaBucket {
+            remaining_amount: Some(42.0),
+            reset_time: Some("2099-01-01T00:00:00Z".to_string()),
+            ..Default::default()
+        },
+    );
+    fam_stdin.quota = Some(fam_quota);
+    let fam_out = render_plain(&fam_stdin, &HudConfig::default(), 120).join("\n");
+    assert!(
+        fam_out.contains("neon-weekly") && !fam_out.contains("ai-credits"),
+        "expected dedicated family bucket before ai-credits under 2-bucket cap: {fam_out}"
+    );
+}

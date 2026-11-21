@@ -53,7 +53,7 @@
     "step_count": 2
   },
   "expectedPlainLines": [
-    "╭─ ● READY │ [Gemini 3 Flash] │ agy-hud › hud-core git:(main) │ ⏱ 3m",
+    "╭─ ● READY │ [ACCEPT] │ [Gemini 3 Flash] │ agy-hud › hud-core git:(main) │ ⏱ 3m",
     "╰─ Ctx ██▒········· 22.0% │ $0.18                                                                                    Quota(weekly) █······ 15%▲ (6d)"
   ]
 }
