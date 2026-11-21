@@ -4,7 +4,7 @@ use hud_cli::collector::{
     probe_git, probe_hg, probe_jj, probe_vcs_cached, probe_vcs_uncached,
     read_and_parse_transcript_incremental, read_git_head_fallback, resolve_executable_in_path,
 };
-use hud_cli::install::format_statusline_command_for_platform;
+use hud_cli::install::{format_statusline_command_for_platform, format_title_command_for_platform};
 use hud_cli::paths::{
     AgyPaths, build_logic_paths, db_ceiling_cache_path, derive_task_md_path, prepare_data_dir,
 };
@@ -4533,4 +4533,286 @@ fn pr2_lazy_unprefixed_skills_respects_updates_enabled_and_clean_config() {
     let (ok_upd, out_upd) = run_bin(&[], &env_vars, Some(&payload));
     assert!(ok_upd);
     assert!(strip_ansi(&out_upd).contains("↑ v9.9.0 · /hud-update"));
+}
+
+#[test]
+fn pr4_title_subcommand_install_flags_doctor_preview_and_uninstall_roundtrip() {
+    // 1. OS command formatting for title
+    let (posix_title_cmd, posix_warn) =
+        format_title_command_for_platform("/Users/alice/it's/agy-hud", false);
+    assert_eq!(posix_title_cmd, "'/Users/alice/it'\\''s/agy-hud' title");
+    assert!(posix_warn.is_none());
+
+    let (win_title_cmd, win_warn) = format_title_command_for_platform(
+        r"C:\Users\alice\.gemini\antigravity-cli\agy-hud\bin\agy-hud.exe",
+        true,
+    );
+    assert_eq!(
+        win_title_cmd,
+        r"C:\Users\alice\.gemini\antigravity-cli\agy-hud\bin\agy-hud.exe title"
+    );
+    assert!(!win_title_cmd.contains('"'));
+    assert!(win_warn.is_none());
+
+    // 2. Ultra-fast `agy-hud title`: piped JSON -> single plain line, zero ANSI, zero hud_home disk writes!
+    let tmp = TempDir::new("pr4-title-e2e");
+    let fake_home = tmp.path.join("home");
+    let gemini_cfg = fake_home.join(".gemini/config");
+    let cli_dir = tmp.path.join("cli");
+    let hud_home = cli_dir.join("agy-hud");
+    fs::create_dir_all(&cli_dir).unwrap();
+
+    let env_vars: [(&str, &Path); 5] = [
+        ("HOME", fake_home.as_path()),
+        ("USERPROFILE", fake_home.as_path()),
+        ("AGY_CONFIG_DIR", gemini_cfg.as_path()),
+        ("AGY_CLI_DIR", cli_dir.as_path()),
+        ("AGY_HUD_HOME", hud_home.as_path()),
+    ];
+
+    let title_payload = json!({
+        "cwd": "/Users/dev/my-proj",
+        "conversation_id": "conv-pr4-title",
+        "agent_state": "idle",
+        "vcs": { "type": "git", "branch": "feat/title", "dirty": true },
+        "model": { "id": "Gemini 4 Neon (High)", "display_name": "Gemini 4 Neon (High)" },
+        "context_window": { "used_percentage": 34.0, "context_window_size": 256_000 },
+        "conversation_title": "\x1b[31mNative\ntitle mode\x1b[0m"
+    })
+    .to_string();
+
+    let (ok_title, title_out) = run_bin(&["title"], &env_vars, Some(&title_payload));
+    assert!(ok_title, "agy-hud title failed: {title_out}");
+    assert_eq!(strip_ansi(&title_out), title_out);
+    assert_eq!(
+        title_out.trim_end(),
+        "● my-proj (feat/title*) · Neon · 34% — Native title mode"
+    );
+    assert_eq!(title_out.lines().count(), 1);
+    assert!(
+        !hud_home.exists(),
+        "agy-hud title must NEVER create hud_home/data/heartbeat/snapshot files"
+    );
+
+    // 2b. `AGY_HUD_NESTED=1` and `AGY_HUD_DISABLE=1` on `agy-hud title` emit zero output & zero files
+    for (env_k, env_v) in [("AGY_HUD_NESTED", "1"), ("AGY_HUD_DISABLE", "1")] {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_agy-hud"))
+            .arg("title")
+            .env("HOME", &fake_home)
+            .env("USERPROFILE", &fake_home)
+            .env("AGY_CONFIG_DIR", &gemini_cfg)
+            .env("AGY_CLI_DIR", &cli_dir)
+            .env("AGY_HUD_HOME", &hud_home)
+            .env(env_k, env_v)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(title_payload.as_bytes())
+            .unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert!(out.status.success());
+        assert!(out.stdout.is_empty());
+        assert!(!hud_home.exists());
+    }
+
+    // 2c. Open stdin pipe on `agy-hud title` exits immediately without waiting for EOF
+    let started = Instant::now();
+    let mut pipe_child = Command::new(env!("CARGO_BIN_EXE_agy-hud"))
+        .arg("title")
+        .env("HOME", &fake_home)
+        .env("USERPROFILE", &fake_home)
+        .env("AGY_CONFIG_DIR", &gemini_cfg)
+        .env("AGY_CLI_DIR", &cli_dir)
+        .env("AGY_HUD_HOME", &hud_home)
+        .env("LC_ALL", "en_US.UTF-8")
+        .env("LANG", "en_US.UTF-8")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut open_pipe = pipe_child.stdin.take().unwrap();
+    open_pipe.write_all(title_payload.as_bytes()).unwrap();
+    open_pipe.flush().unwrap();
+    let status = loop {
+        if let Some(st) = pipe_child.try_wait().unwrap() {
+            break st;
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(3000),
+            "agy-hud title blocked waiting for EOF on open pipe"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    };
+    assert!(status.success());
+    drop(open_pipe);
+
+    // 3. Seed foreign `title` in settings.json and verify `--with-title`, `--replace`, preserve, `--no-title`, `doctor`, `uninstall`
+    let settings_path = cli_dir.join("settings.json");
+    let foreign_title = json!({
+        "type": "command",
+        "command": "/usr/local/bin/custom-title.sh --token=keepsecret",
+        "enabled": true
+    });
+    fs::write(
+        &settings_path,
+        serde_json::to_string_pretty(&json!({
+            "colorScheme": "dark",
+            "title": foreign_title
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    // 3a. `install` without `--with-title` configures statusLine and leaves foreign title untouched (`kept-foreign` on uninstall)
+    let (ok_plain_inst, plain_inst_out) = run_bin(&["install"], &env_vars, None);
+    assert!(ok_plain_inst, "install failed: {plain_inst_out}");
+    let plain_inst: Value = serde_json::from_str(&plain_inst_out).unwrap();
+    assert_eq!(plain_inst["titleConfigured"], false);
+    assert_eq!(plain_inst["titleCommand"], Value::Null);
+    let settings_after_plain: Value =
+        serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
+    assert_eq!(settings_after_plain["title"], foreign_title);
+
+    // 3b. `install --with-title` without `--replace` MUST error without clobbering foreign `title`
+    let (ok_conflict, _) = run_bin(&["install", "--with-title"], &env_vars, None);
+    assert!(!ok_conflict);
+    let settings_after_conflict: Value =
+        serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
+    assert_eq!(settings_after_conflict["title"], foreign_title);
+
+    // 3c. `install --with-title --replace` backs up foreign title to `previous-title.json` and writes `agy-hud title`
+    let (ok_with_title, with_title_out) =
+        run_bin(&["install", "--with-title", "--replace"], &env_vars, None);
+    assert!(
+        ok_with_title,
+        "install --with-title --replace failed: {with_title_out}"
+    );
+    let with_title_json: Value = serde_json::from_str(&with_title_out).unwrap();
+    assert_eq!(with_title_json["titleConfigured"], true);
+    let expected_title_cmd = with_title_json["titleCommand"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(expected_title_cmd.ends_with(" title"));
+    assert!(hud_home.join("previous-title.json").is_file());
+
+    // `doctor` reports `title.kind == "agy-hud"` and `enabled == true`
+    let (ok_doc, doc_out) = run_bin(&["doctor"], &env_vars, None);
+    assert!(ok_doc);
+    let doc_json: Value = serde_json::from_str(&doc_out).unwrap();
+    assert_eq!(doc_json["title"]["kind"], "agy-hud");
+    assert_eq!(doc_json["title"]["enabled"], true);
+
+    // 3d. Re-running `install` without `--with-title` preserves user opt-in & unknown extra keys on `title`!
+    let mut custom_key_settings: Value =
+        serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
+    custom_key_settings["title"]["customHint"] = json!("preserve-me");
+    fs::write(
+        &settings_path,
+        serde_json::to_string_pretty(&custom_key_settings).unwrap(),
+    )
+    .unwrap();
+
+    let (ok_preserve, preserve_out) = run_bin(&["install"], &env_vars, None);
+    assert!(ok_preserve);
+    let preserve_json: Value = serde_json::from_str(&preserve_out).unwrap();
+    assert_eq!(preserve_json["titleConfigured"], true);
+    assert_eq!(preserve_json["titleCommand"], expected_title_cmd);
+    let preserved_settings: Value =
+        serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
+    assert_eq!(preserved_settings["title"]["customHint"], "preserve-me");
+
+    // 3e. `install --no-title` restores foreign `previous-title.json` and removes backup
+    let (ok_no_title, no_title_out) = run_bin(&["install", "--no-title"], &env_vars, None);
+    assert!(ok_no_title);
+    let no_title_json: Value = serde_json::from_str(&no_title_out).unwrap();
+    assert_eq!(no_title_json["titleConfigured"], false);
+    assert_eq!(no_title_json["titleCommand"], Value::Null);
+    assert!(!hud_home.join("previous-title.json").exists());
+    let restored_by_flag: Value =
+        serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
+    assert_eq!(restored_by_flag["title"], foreign_title);
+
+    // Uninstall while foreign title is active -> `titleAction == "kept-foreign"`
+    let (ok_uninst_foreign, uninst_foreign_out) = run_bin(&["uninstall"], &env_vars, None);
+    assert!(ok_uninst_foreign);
+    let uninst_foreign: Value = serde_json::from_str(&uninst_foreign_out).unwrap();
+    assert_eq!(uninst_foreign["titleAction"], "kept-foreign");
+    let kept_settings: Value =
+        serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
+    assert_eq!(kept_settings["title"], foreign_title);
+
+    // 3f. Re-enable with `--with-title --replace`, verify `uninstall` restores `previous-title.json` cleanly
+    let (ok_re_replace, _) = run_bin(&["install", "--with-title", "--replace"], &env_vars, None);
+    assert!(ok_re_replace);
+    let (ok_uninst_restore, uninst_restore_out) = run_bin(&["uninstall"], &env_vars, None);
+    assert!(ok_uninst_restore);
+    let uninst_restore: Value = serde_json::from_str(&uninst_restore_out).unwrap();
+    assert_eq!(uninst_restore["titleAction"], "restored-previous");
+    assert!(!hud_home.exists());
+    let restored_settings: Value =
+        serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
+    assert_eq!(restored_settings["title"], foreign_title);
+
+    // 4. Clean settings (no prior `title`): `install --with-title` -> live render -> `preview --last --title` -> `uninstall` removes `"title"`
+    fs::write(&settings_path, r#"{"colorScheme":"solarized"}"#).unwrap();
+    let (ok_clean_inst, clean_inst_out) = run_bin(&["install", "--with-title"], &env_vars, None);
+    assert!(ok_clean_inst);
+    let clean_inst: Value = serde_json::from_str(&clean_inst_out).unwrap();
+    assert_eq!(clean_inst["titleConfigured"], true);
+
+    let (ok_live_snap, _) = run_bin(&[], &env_vars, Some(&title_payload));
+    assert!(ok_live_snap);
+    let (ok_prev_last, prev_last_out) = run_bin(&["preview", "--last", "--title"], &env_vars, None);
+    assert!(ok_prev_last);
+    assert_eq!(strip_ansi(&prev_last_out), prev_last_out);
+    assert_eq!(
+        prev_last_out.trim_end(),
+        "● my-proj (feat/title*) · Neon · 34% — Native title mode"
+    );
+
+    let (ok_prev_showcase, prev_showcase_out) = run_bin(
+        &["preview", "--state", "showcase", "--title"],
+        &env_vars,
+        None,
+    );
+    assert!(ok_prev_showcase);
+    assert_eq!(strip_ansi(&prev_showcase_out), prev_showcase_out);
+
+    let (ok_clean_uninst, clean_uninst_out) = run_bin(&["uninstall"], &env_vars, None);
+    assert!(ok_clean_uninst);
+    let clean_uninst: Value = serde_json::from_str(&clean_uninst_out).unwrap();
+    assert_eq!(clean_uninst["titleAction"], "restored-official-default");
+    assert!(!hud_home.exists());
+    let final_settings: Value =
+        serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
+    assert_eq!(final_settings, json!({"colorScheme": "solarized"}));
+
+    // 5. `uninstall --reset-default` removes `"title"` instead of restoring `previous-title.json`
+    fs::write(
+        &settings_path,
+        serde_json::to_string_pretty(&json!({
+            "colorScheme": "solarized",
+            "title": foreign_title
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let (ok_rep2, _) = run_bin(&["install", "--with-title", "--replace"], &env_vars, None);
+    assert!(ok_rep2);
+    assert!(hud_home.join("previous-title.json").is_file());
+    let (ok_reset_uninst, reset_uninst_out) =
+        run_bin(&["uninstall", "--reset-default"], &env_vars, None);
+    assert!(ok_reset_uninst);
+    let reset_uninst: Value = serde_json::from_str(&reset_uninst_out).unwrap();
+    assert_eq!(reset_uninst["titleAction"], "restored-official-default");
+    assert!(!hud_home.exists());
+    let reset_settings: Value =
+        serde_json::from_str(&fs::read_to_string(&settings_path).unwrap()).unwrap();
+    assert_eq!(reset_settings, json!({"colorScheme": "solarized"}));
 }

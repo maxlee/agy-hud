@@ -11,6 +11,7 @@ use crate::probes::{
 };
 use crate::render::{
     RenderExtras, RenderInput, format_config_problem_line_with_cmd, render_hud_lines_full,
+    render_title_line,
 };
 use crate::stdin::CompactionScope;
 use crate::transcript::parse_transcript_and_tasks;
@@ -49,7 +50,8 @@ fn parse_cli_args(args: &[String]) -> (HashMap<String, Vec<String>>, Vec<String>
             i += 1;
             continue;
         }
-        let next_is_val = i + 1 < args.len() && !args[i + 1].starts_with("--");
+        let is_bool_flag = matches!(a.as_str(), "--pretty" | "--last" | "--title");
+        let next_is_val = !is_bool_flag && i + 1 < args.len() && !args[i + 1].starts_with("--");
         let val = if next_is_val {
             i += 1;
             args[i].clone()
@@ -187,6 +189,29 @@ fn run_doctor(args: &[String], ctx: &CommandContext<'_>) -> CommandOutput {
         "other"
     };
 
+    let title_obj = cli_settings
+        .as_ref()
+        .and_then(|m| m.get("title"))
+        .and_then(Value::as_object);
+    let title_cmd = title_obj
+        .and_then(|t| t.get("command"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let title_kind = if title_cmd.is_empty() {
+        "none"
+    } else if title_cmd.contains("agy-hud")
+        || title_cmd.contains("hud.mjs")
+        || title_cmd.contains("statusline.mjs")
+    {
+        "agy-hud"
+    } else {
+        "other"
+    };
+    let title_enabled = title_obj
+        .and_then(|t| t.get("enabled"))
+        .and_then(Value::as_bool)
+        .unwrap_or(!title_cmd.is_empty());
+
     let mut findings: Vec<String> = Vec::new();
     if kind == "none" {
         findings.push(
@@ -211,6 +236,28 @@ fn run_doctor(args: &[String], ctx: &CommandContext<'_>) -> CommandOutput {
         } else if cmd.contains(' ') {
             findings.push(
                 "Windows statusLine.command path contains spaces without 8.3 short-path form. Fix: move agy-hud to a space-free path or configure its 8.3 short path.".to_string(),
+            );
+        }
+    }
+
+    if title_kind == "agy-hud" && !title_enabled {
+        findings.push(
+            "title is configured for agy-hud but currently disabled (`enabled: false`). Fix: run `/title on` inside agy CLI or `agy-hud install --with-title`.".to_string(),
+        );
+    }
+    if title_kind == "agy-hud" && ctx.facts.platform == "windows" {
+        let title_bin_part = title_cmd
+            .trim_end()
+            .strip_suffix(" title")
+            .unwrap_or(title_cmd)
+            .trim();
+        if title_cmd.contains('"') {
+            findings.push(
+                "Windows title.command contains double quotes (\"), which breaks Antigravity CLI cmd.exe invocation (tightship#89). Fix: run `agy-hud install --with-title --replace`.".to_string(),
+            );
+        } else if title_bin_part.contains(' ') {
+            findings.push(
+                "Windows title.command path contains spaces without 8.3 short-path form. Fix: move agy-hud to a space-free path or configure its 8.3 short path.".to_string(),
             );
         }
     }
@@ -344,6 +391,11 @@ fn run_doctor(args: &[String], ctx: &CommandContext<'_>) -> CommandOutput {
         } else {
             abbreviate_home_path(&redact_command(cmd), home)
         };
+        let title_cmd_disp = if title_cmd.is_empty() {
+            "<not set>".to_string()
+        } else {
+            abbreviate_home_path(&redact_command(title_cmd), home)
+        };
         let plugin_status = if ctx.facts.installed_plugin_status.is_empty() {
             "unknown"
         } else {
@@ -368,6 +420,9 @@ fn run_doctor(args: &[String], ctx: &CommandContext<'_>) -> CommandOutput {
         ));
         out.push(format!(
             "  StatusLine       : kind={kind} · enabled={enabled} · command={cmd_disp}"
+        ));
+        out.push(format!(
+            "  Title            : kind={title_kind} · enabled={title_enabled} · command={title_cmd_disp}"
         ));
         out.push(format!(
             "  Settings File    : {}",
@@ -506,6 +561,11 @@ fn run_doctor(args: &[String], ctx: &CommandContext<'_>) -> CommandOutput {
             "enabled": enabled,
             "command": if cmd.is_empty() { Value::Null } else { Value::String(redact_command(cmd)) },
             "stackWithDefault": stack_with_default,
+        },
+        "title": {
+            "kind": title_kind,
+            "enabled": title_enabled,
+            "command": if title_cmd.is_empty() { Value::Null } else { Value::String(redact_command(title_cmd)) },
         },
         "lastRender": last_render,
         "updates": {
@@ -941,6 +1001,7 @@ fn run_preview(args: &[String], ctx: &CommandContext<'_>) -> CommandOutput {
             crate::i18n::resolve_language(Language::Auto, ctx.facts.locale.as_deref());
     }
 
+    let title_mode = flags.contains_key("--title");
     let explicit_width = flags
         .get("--width")
         .and_then(|v| v.first())
@@ -965,6 +1026,18 @@ fn run_preview(args: &[String], ctx: &CommandContext<'_>) -> CommandOutput {
                 config_to_write: None,
             };
         };
+        if title_mode {
+            let title_line = render_title_line(snap.stdin.as_ref(), &config);
+            return CommandOutput {
+                lines: if title_line.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![title_line]
+                },
+                failed: false,
+                config_to_write: None,
+            };
+        }
         let mut transcript = parse_transcript_and_tasks(
             ctx.transcript_head,
             ctx.transcript_tail,
@@ -1082,6 +1155,14 @@ fn run_preview(args: &[String], ctx: &CommandContext<'_>) -> CommandOutput {
             if let Some(lang) = lang_override {
                 cfg.language = *lang;
             }
+            if title_mode {
+                out.push(format!("── {title} ──"));
+                out.push(render_title_line(Some(&p.stdin), &cfg));
+                if idx + 1 < scenarios.len() {
+                    out.push(String::new());
+                }
+                continue;
+            }
             out.push(paint(&format!("── {title} ──"), &[DIM, BOLD]));
             let vcs = parse_vcs_info(Some(&p.stdin), &p.probes);
             let memory = parse_memory_info(&p.probes);
@@ -1121,6 +1202,18 @@ fn run_preview(args: &[String], ctx: &CommandContext<'_>) -> CommandOutput {
     }
 
     if let Some(p) = presets.get(state_arg) {
+        if title_mode {
+            let title_line = render_title_line(Some(&p.stdin), &config);
+            return CommandOutput {
+                lines: if title_line.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![title_line]
+                },
+                failed: false,
+                config_to_write: None,
+            };
+        }
         let vcs = parse_vcs_info(Some(&p.stdin), &p.probes);
         let memory = parse_memory_info(&p.probes);
         let compaction_ceiling =
@@ -1161,6 +1254,18 @@ fn run_preview(args: &[String], ctx: &CommandContext<'_>) -> CommandOutput {
 
     // Custom inline JSON state
     if let Ok(custom_stdin) = serde_json::from_str::<AgyStdinData>(state_arg) {
+        if title_mode {
+            let title_line = render_title_line(Some(&custom_stdin), &config);
+            return CommandOutput {
+                lines: if title_line.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![title_line]
+                },
+                failed: false,
+                config_to_write: None,
+            };
+        }
         let empty_probes = ProbeAnswers::default();
         let vcs = parse_vcs_info(Some(&custom_stdin), &empty_probes);
         let empty_transcript = TranscriptSummary::default();
@@ -1473,7 +1578,7 @@ pub fn execute_subcommand(name: &str, args: &[String], ctx: &CommandContext<'_>)
         other => CommandOutput {
             lines: vec![
                 format!("Unknown subcommand \"{other}\"."),
-                "Available commands: doctor, install, uninstall, update, preview, schema, set, quota, report"
+                "Available commands: doctor, install, uninstall, update, title, preview, schema, set, quota, report"
                     .to_string(),
             ],
             failed: true,

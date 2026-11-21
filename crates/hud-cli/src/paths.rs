@@ -29,6 +29,7 @@ pub struct AgyPaths {
     pub undo_path: PathBuf,
     pub heartbeat_path: PathBuf,
     pub previous_statusline_path: PathBuf,
+    pub previous_title_path: PathBuf,
 }
 
 fn expand_tilde(raw: &str, home: &Path) -> PathBuf {
@@ -110,6 +111,7 @@ impl AgyPaths {
             undo_path: hud_home.join("config.undo.json"),
             heartbeat_path: hud_home.join("heartbeat.json"),
             previous_statusline_path: hud_home.join("previous-statusline.json"),
+            previous_title_path: hud_home.join("previous-title.json"),
             cli_dir,
             hud_home,
             gemini_config_dir,

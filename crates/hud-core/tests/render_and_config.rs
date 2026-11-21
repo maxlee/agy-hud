@@ -14,7 +14,7 @@ use hud_core::probes::{
 };
 use hud_core::render::{
     RenderExtras, RenderInput, format_config_problem_line, format_config_problem_line_with_cmd,
-    render_hud_lines, render_hud_lines_full,
+    render_hud_lines, render_hud_lines_full, render_title_line,
 };
 use hud_core::stdin::{
     CeilingSource, CompactionInputs, CompactionScope, EffectiveCeiling, SENTINEL_RESET_CUTOFF_MS,
@@ -31,7 +31,7 @@ use hud_core::types::{
     PathLevels, PluginFacts, ProbeAnswers, QuotaBucketView, QuotaPace, RawQuotaBucket,
     RuntimeFacts, SandboxStdin, SubagentEntry, SubagentStatus, SubagentStdin, TodoItem, TodoStatus,
     ToolEntry, ToolStatus, TranscriptCursor, TranscriptSummary, UnprefixedSkillsFacts,
-    UpdateCacheSnapshot, VimStdin, WorkspaceStdin,
+    UpdateCacheSnapshot, VcsStdin, VimStdin, WorkspaceStdin,
 };
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
@@ -4943,5 +4943,479 @@ fn pr3_subagent_model_badges_zero_io_stdin_telemetry_and_short_session_id() {
             && !step0_header.contains("PR-3 Telemetry")
             && step0_header.contains("CORE-TAG"),
         "header_steps[0] should drop title and session ID together before customTag: {step0_header}"
+    );
+}
+
+#[test]
+fn pr4_render_title_line_preview_title_and_doctor_title_diagnostics() {
+    let assert_plain_title_invariants = |line: &str| {
+        assert_eq!(
+            strip_ansi(line),
+            line,
+            "title must have zero ANSI: {line:?}"
+        );
+        assert!(
+            !line.contains('\x1b') && !line.contains('\n') && !line.contains('\r'),
+            "title must be single-line without escapes: {line:?}"
+        );
+        assert!(
+            !line.chars().any(|c| c.is_control()),
+            "title must have zero control chars: {line:?}"
+        );
+        assert!(
+            text_width(line) <= 80,
+            "title width {} > 80: {line:?}",
+            text_width(line)
+        );
+    };
+
+    // 1. Minimal None stdin renders single state glyph
+    let min_title = render_title_line(None, &HudConfig::default());
+    assert_eq!(min_title, "●");
+    assert_plain_title_invariants(&min_title);
+
+    // 2. All agent_state glyphs in Unicode and ASCII modes
+    for (state, uni_glyph, asc_glyph) in [
+        ("idle", "●", "*"),
+        ("thinking", "◆", "~"),
+        ("working", "⚙", "*"),
+        ("tool_use", "🔧", ">"),
+        ("reviewing", "👁", "?"),
+        ("authenticating", "🔑", "@"),
+        ("initializing", "◌", "."),
+        ("error", "✖", "X"),
+        ("custom_unknown", "●", "*"),
+    ] {
+        let s = AgyStdinData {
+            agent_state: Some(state.to_string()),
+            cwd: Some("/work/agy-hud".to_string()),
+            ..Default::default()
+        };
+        let uni = render_title_line(Some(&s), &HudConfig::default());
+        assert_eq!(uni, format!("{uni_glyph} agy-hud"), "state={state}");
+        assert_plain_title_invariants(&uni);
+
+        let mut asc_cfg = HudConfig::default();
+        asc_cfg.display.glyph_mode = GlyphMode::Ascii;
+        let asc = render_title_line(Some(&s), &asc_cfg);
+        assert_eq!(asc, format!("{asc_glyph} agy-hud"), "ascii state={state}");
+        assert!(asc.is_ascii());
+    }
+
+    // 3. tool_confirmation_pending takes priority across languages & glyph modes
+    let confirm_stdin = AgyStdinData {
+        agent_state: Some("tool_use".to_string()),
+        tool_confirmation_pending: Some(true),
+        cwd: Some("/work/agy-hud".to_string()),
+        model: Some(ModelStdin {
+            display_name: Some("Gemini 4 Neon (High)".to_string()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    assert_eq!(
+        render_title_line(Some(&confirm_stdin), &HudConfig::default()),
+        "⚠ CONFIRM? agy-hud · Neon"
+    );
+    let mut asc_cfg = HudConfig::default();
+    asc_cfg.display.glyph_mode = GlyphMode::Ascii;
+    let confirm_asc = render_title_line(Some(&confirm_stdin), &asc_cfg);
+    assert_eq!(confirm_asc, "! CONFIRM? agy-hud . Neon");
+    assert!(confirm_asc.is_ascii());
+    let zh_cfg = HudConfig {
+        language: Language::ZhHans,
+        ..HudConfig::default()
+    };
+    assert_eq!(
+        render_title_line(Some(&confirm_stdin), &zh_cfg),
+        "⚠ 待确认! agy-hud · Neon"
+    );
+
+    // 4. Full prioritized composition: workspace priority, VCS branch/client/dirty, short model, context % & cold tokens, title
+    let rich_stdin = AgyStdinData {
+        agent_state: Some("idle".to_string()),
+        cwd: Some("/fallback/cwd-dir".to_string()),
+        workspace: Some(WorkspaceStdin {
+            current_dir: Some(r"C:\Users\dev\agy-hud\".to_string()),
+            project_dir: Some("/fallback/proj-dir".to_string()),
+        }),
+        vcs: Some(VcsStdin {
+            vcs_type: Some("git".to_string()),
+            branch: Some("main".to_string()),
+            dirty: Some(true),
+            client: None,
+        }),
+        model: Some(ModelStdin {
+            id: Some("Gemini 4 Neon (High)".to_string()),
+            display_name: Some("Gemini 4 Neon (High)".to_string()),
+            effort: Some("high".to_string()),
+        }),
+        context_window: Some(ContextWindowStdin {
+            used_percentage: Some(34.4),
+            context_window_size: Some(256_000),
+            ..Default::default()
+        }),
+        conversation_title: Some("Fix auth race".to_string()),
+        ..Default::default()
+    };
+    let full_uni = render_title_line(Some(&rich_stdin), &HudConfig::default());
+    assert_eq!(full_uni, "● agy-hud (main*) · Neon · 34% — Fix auth race");
+    assert_plain_title_invariants(&full_uni);
+
+    let full_asc = render_title_line(Some(&rich_stdin), &asc_cfg);
+    assert_eq!(full_asc, "* agy-hud (main*) . Neon . 34% - Fix auth race");
+    assert!(full_asc.is_ascii());
+
+    // VCS client fallback + show_dirty=false + vcs.enabled=false + show_model=false
+    let mut client_stdin = rich_stdin.clone();
+    client_stdin.vcs = Some(VcsStdin {
+        vcs_type: Some("citc".to_string()),
+        branch: Some("   ".to_string()),
+        dirty: Some(true),
+        client: Some("citc-ws-42".to_string()),
+    });
+    assert_eq!(
+        render_title_line(Some(&client_stdin), &HudConfig::default()),
+        "● agy-hud (citc-ws-42*) · Neon · 34% — Fix auth race"
+    );
+    let mut cfg_flags = HudConfig::default();
+    cfg_flags.vcs.show_dirty = false;
+    cfg_flags.display.show_model = false;
+    assert_eq!(
+        render_title_line(Some(&client_stdin), &cfg_flags),
+        "● agy-hud (citc-ws-42) · 34% — Fix auth race"
+    );
+    cfg_flags.vcs.enabled = false;
+    assert_eq!(
+        render_title_line(Some(&client_stdin), &cfg_flags),
+        "● agy-hud · 34% — Fix auth race"
+    );
+
+    // Cold-start 1M window renders compact tokens (`149k`) without fabricating a percentage
+    let cold_1m_stdin = AgyStdinData {
+        agent_state: Some("working".to_string()),
+        cwd: Some("/work/demo".to_string()),
+        model: Some(ModelStdin {
+            display_name: Some("Gemini 4 Argon (Medium)".to_string()),
+            ..Default::default()
+        }),
+        context_window: Some(ContextWindowStdin {
+            context_window_size: Some(1_048_576),
+            used_percentage: Some(14.2),
+            current_usage: Some(CurrentUsageStdin {
+                input_tokens: Some(49_000),
+                cache_read_input_tokens: Some(100_000),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let cold_title = render_title_line(Some(&cold_1m_stdin), &HudConfig::default());
+    assert_eq!(cold_title, "⚙ demo · Argon · 149k");
+    assert!(!cold_title.contains('%'));
+
+    let mut win_scale_cfg = HudConfig::default();
+    win_scale_cfg.display.context_scale = ContextScaleMode::Window;
+    assert_eq!(
+        render_title_line(Some(&cold_1m_stdin), &win_scale_cfg),
+        "⚙ demo · Argon · 14%"
+    );
+
+    // 5. Control chars, newlines, ANSI/OSC hijacks, bidi overrides, long CJK titles & <= 80 col clamp
+    let hostile_stdin = AgyStdinData {
+        agent_state: Some("working".to_string()),
+        workspace: Some(WorkspaceStdin {
+            current_dir: Some(format!("/work/{}", "superlong-workspace-folder-".repeat(3))),
+            project_dir: None,
+        }),
+        vcs: Some(VcsStdin {
+            branch: Some("feat/\x1b[31mvery-long-branch-name\x1b[0m\n".to_string()),
+            dirty: Some(true),
+            ..Default::default()
+        }),
+        model: Some(ModelStdin {
+            display_name: Some("Gemini 4 Hydrogen (XHigh)".to_string()),
+            ..Default::default()
+        }),
+        conversation_title: Some(
+            "\x1b]0;hijack\x07\x1b[31m中文超长标题测试一二三四五六七八九十\n第二行\u{202e}👨‍💻"
+                .to_string(),
+        ),
+        ..Default::default()
+    };
+    let clamped_uni = render_title_line(Some(&hostile_stdin), &HudConfig::default());
+    assert_plain_title_invariants(&clamped_uni);
+    assert!(!clamped_uni.contains("hijack"));
+    assert!(!clamped_uni.contains('\u{202e}'));
+
+    let cjk_title_only = AgyStdinData {
+        cwd: Some("/work/app".to_string()),
+        conversation_title: Some("中文超长标题测试一二三四五六七八九十零一二三四".to_string()),
+        ..Default::default()
+    };
+    let clipped_title = render_title_line(Some(&cjk_title_only), &HudConfig::default());
+    assert_plain_title_invariants(&clipped_title);
+    let (_, after_dash) = clipped_title.split_once(" — ").expect("em-dash separator");
+    assert!(
+        text_width(after_dash) <= 28 && after_dash.ends_with('…'),
+        "conversation_title must clip to <=28 cols with ellipsis: {after_dash:?}"
+    );
+
+    // 6. `preview --title` across presets, showcase, custom JSON, --last, and --set overrides + `doctor` title diagnostics
+    let facts = DoctorFacts {
+        cwd: "/Users/alice/demo".to_string(),
+        home_dir: "/Users/alice".to_string(),
+        platform: "windows".to_string(),
+        terminal: "Windows Terminal".to_string(),
+        remote_session: false,
+        locale: None,
+        runtime: RuntimeFacts {
+            engine: "rust-native".to_string(),
+            version: "1.9.0".to_string(),
+            exec_path: r"C:\Users\alice\.gemini\antigravity-cli\agy-hud\bin\agy-hud.exe"
+                .to_string(),
+            supported: true,
+        },
+        plugin: PluginFacts {
+            root: r"C:\Users\alice\.gemini\config\plugins\agy-hud".to_string(),
+            version: "1.9.0".to_string(),
+        },
+        installed_plugin_status: "installed".to_string(),
+        installed_plugin: None,
+        unprefixed_skills: UnprefixedSkillsFacts {
+            hud: "installed".to_string(),
+            hud_update: "installed".to_string(),
+            skills_dir: String::new(),
+        },
+        config_path: r"C:\Users\alice\.gemini\antigravity-cli\agy-hud\config.json".to_string(),
+        heartbeat: Some(hud_core::types::HeartbeatInfo {
+            at: 1_700_000_000_000,
+            runtime: "rust-native/1.9.0".to_string(),
+            path: r"C:\Users\alice\.gemini\antigravity-cli\agy-hud\bin\agy-hud.exe".to_string(),
+            outcome: "ok".to_string(),
+            columns: Some(120),
+            duration_ms: Some(2),
+        }),
+    };
+    let snap_json = json!({
+        "at": 1_700_000_000_000i64,
+        "stdin": rich_stdin
+    })
+    .to_string();
+
+    // 6a. `preview --title` with default state, --state confirm, --state showcase, --state JSON, --last, --set
+    let base_ctx = CommandContext {
+        facts: &facts,
+        paths: &LogicPaths::default(),
+        now_ms: 1_700_000_000_000,
+        config_text: None,
+        cli_settings_text: None,
+        last_snapshot_text: Some(&snap_json),
+        update_cache_text: None,
+        transcript_head: None,
+        transcript_tail: None,
+        task_md_text: None,
+    };
+
+    let prev_default = execute_subcommand("preview", &["--title".to_string()], &base_ctx);
+    assert!(!prev_default.failed && prev_default.lines.len() == 1);
+    assert_plain_title_invariants(&prev_default.lines[0]);
+    assert!(prev_default.lines[0].contains("🔧 agy-hud"));
+
+    let prev_confirm = execute_subcommand(
+        "preview",
+        &[
+            "--title".to_string(),
+            "--state".to_string(),
+            "confirm".to_string(),
+            "--set".to_string(),
+            "display.glyphMode=ascii".to_string(),
+        ],
+        &base_ctx,
+    );
+    assert!(!prev_confirm.failed && prev_confirm.lines.len() == 1);
+    assert_eq!(prev_confirm.lines[0], "! CONFIRM? agy-hud . Argon . 152k");
+
+    let prev_last = execute_subcommand(
+        "preview",
+        &[
+            "--last".to_string(),
+            "--title".to_string(),
+            "--set".to_string(),
+            "display.showModel=false".to_string(),
+        ],
+        &base_ctx,
+    );
+    assert!(!prev_last.failed && prev_last.lines.len() == 1);
+    assert_eq!(
+        prev_last.lines[0],
+        "● agy-hud (main*) · 34% — Fix auth race"
+    );
+
+    let prev_json = execute_subcommand(
+        "preview",
+        &[
+            "--state".to_string(),
+            r#"{"cwd":"/work/repo","agent_state":"thinking","model":{"display_name":"Gemini 4 Neon"}}"#
+                .to_string(),
+            "--title".to_string(),
+        ],
+        &base_ctx,
+    );
+    assert!(!prev_json.failed && prev_json.lines.len() == 1);
+    assert_eq!(prev_json.lines[0], "◆ repo · Neon");
+
+    let prev_showcase = execute_subcommand(
+        "preview",
+        &[
+            "--state".to_string(),
+            "showcase".to_string(),
+            "--title".to_string(),
+        ],
+        &base_ctx,
+    );
+    assert!(!prev_showcase.failed && prev_showcase.lines.len() >= 10);
+    for l in &prev_showcase.lines {
+        assert_eq!(strip_ansi(l), *l, "showcase --title must have zero ANSI");
+    }
+
+    // 6b. `doctor` title diagnostics across none, other (with secret redaction), agy-hud disabled, Windows quotes/spaces
+    let doc_none_ctx = CommandContext {
+        cli_settings_text: Some(
+            r#"{"statusLine":{"type":"command","command":"C:\\Users\\alice\\agy-hud.exe"}}"#,
+        ),
+        ..base_ctx
+    };
+    let doc_none: Value = serde_json::from_str(
+        &execute_subcommand("doctor", &[], &doc_none_ctx)
+            .lines
+            .join("\n"),
+    )
+    .unwrap();
+    assert_eq!(doc_none["title"]["kind"], "none");
+    assert_eq!(doc_none["title"]["enabled"], false);
+    assert_eq!(doc_none["title"]["command"], Value::Null);
+    assert!(
+        doc_none["findings"][0]
+            .as_str()
+            .unwrap()
+            .starts_with("None.")
+    );
+
+    let doc_other_ctx = CommandContext {
+        cli_settings_text: Some(
+            r#"{"statusLine":{"type":"command","command":"C:\\Users\\alice\\agy-hud.exe"},"title":{"type":"command","command":"/usr/local/bin/title.sh --token=topsecret123","enabled":true}}"#,
+        ),
+        ..base_ctx
+    };
+    let doc_other: Value = serde_json::from_str(
+        &execute_subcommand("doctor", &[], &doc_other_ctx)
+            .lines
+            .join("\n"),
+    )
+    .unwrap();
+    assert_eq!(doc_other["title"]["kind"], "other");
+    assert_eq!(doc_other["title"]["enabled"], true);
+    assert!(
+        !doc_other["title"]["command"]
+            .as_str()
+            .unwrap()
+            .contains("topsecret123")
+    );
+    assert!(
+        doc_other["title"]["command"]
+            .as_str()
+            .unwrap()
+            .contains("[REDACTED]")
+    );
+    assert!(
+        doc_other["findings"][0]
+            .as_str()
+            .unwrap()
+            .starts_with("None.")
+    );
+
+    // Clean Windows `agy-hud.exe title` MUST NOT trigger space warning because of `" title"` suffix!
+    let doc_win_clean_ctx = CommandContext {
+        cli_settings_text: Some(
+            r#"{"statusLine":{"type":"command","command":"C:\\Users\\alice\\agy-hud.exe"},"title":{"type":"command","command":"C:\\Users\\alice\\agy-hud.exe title","enabled":true}}"#,
+        ),
+        ..base_ctx
+    };
+    let doc_win_clean: Value = serde_json::from_str(
+        &execute_subcommand("doctor", &[], &doc_win_clean_ctx)
+            .lines
+            .join("\n"),
+    )
+    .unwrap();
+    assert_eq!(doc_win_clean["title"]["kind"], "agy-hud");
+    assert!(
+        doc_win_clean["findings"][0]
+            .as_str()
+            .unwrap()
+            .starts_with("None."),
+        "clean Windows `agy-hud.exe title` must not false-positive on space: {:?}",
+        doc_win_clean["findings"]
+    );
+    let doc_pretty = execute_subcommand("doctor", &["--pretty".to_string()], &doc_win_clean_ctx)
+        .lines
+        .iter()
+        .map(|l| strip_ansi(l))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(doc_pretty.contains("Title            : kind=agy-hud · enabled=true"));
+
+    // Disabled title + Windows double quotes + Windows path spaces trigger explicit findings
+    let doc_win_quote_ctx = CommandContext {
+        cli_settings_text: Some(
+            r#"{"statusLine":{"type":"command","command":"C:\\Users\\alice\\agy-hud.exe"},"title":{"type":"command","command":"\"C:\\Users\\alice\\agy-hud.exe\" title","enabled":false}}"#,
+        ),
+        ..base_ctx
+    };
+    let doc_win_quote: Value = serde_json::from_str(
+        &execute_subcommand("doctor", &[], &doc_win_quote_ctx)
+            .lines
+            .join("\n"),
+    )
+    .unwrap();
+    let quote_findings = doc_win_quote["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        quote_findings.contains("enabled: false"),
+        "{quote_findings}"
+    );
+    assert!(
+        quote_findings.contains("Windows title.command contains double quotes"),
+        "{quote_findings}"
+    );
+
+    let doc_win_space_ctx = CommandContext {
+        cli_settings_text: Some(
+            r#"{"statusLine":{"type":"command","command":"C:\\Users\\alice\\agy-hud.exe"},"title":{"type":"command","command":"C:\\Users\\Max Lee\\agy-hud.exe title","enabled":true}}"#,
+        ),
+        ..base_ctx
+    };
+    let doc_win_space: Value = serde_json::from_str(
+        &execute_subcommand("doctor", &[], &doc_win_space_ctx)
+            .lines
+            .join("\n"),
+    )
+    .unwrap();
+    let space_findings = doc_win_space["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        space_findings.contains("Windows title.command path contains spaces"),
+        "{space_findings}"
     );
 }

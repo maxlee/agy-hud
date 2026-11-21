@@ -40,6 +40,18 @@ fn format_statusline_command(bin_path: &str) -> (String, Option<String>) {
     format_statusline_command_for_platform(bin_path, cfg!(windows))
 }
 
+pub fn format_title_command_for_platform(
+    bin_path: &str,
+    is_windows: bool,
+) -> (String, Option<String>) {
+    let (cmd, warning) = format_statusline_command_for_platform(bin_path, is_windows);
+    (format!("{cmd} title"), warning)
+}
+
+fn format_title_command(bin_path: &str) -> (String, Option<String>) {
+    format_title_command_for_platform(bin_path, cfg!(windows))
+}
+
 fn read_json_object_or_empty(file_path: &Path) -> Result<Map<String, Value>, String> {
     if !file_path.exists() {
         return Ok(Map::new());
@@ -964,6 +976,11 @@ pub fn install_status_line(
     let replace = argv.iter().any(|a| a == "--replace");
     let explicit_stack = argv.iter().any(|a| a == "--stack");
     let explicit_no_stack = argv.iter().any(|a| a == "--no-stack");
+    let explicit_with_title = argv.iter().any(|a| a == "--with-title");
+    let explicit_no_title = argv.iter().any(|a| a == "--no-title");
+    if explicit_with_title && explicit_no_title {
+        return Err("Cannot specify both --with-title and --no-title.".to_string());
+    }
     let plugin_flag = argv.iter().any(|a| a == "--plugin-installed");
     let explicit_padding = argv
         .iter()
@@ -988,6 +1005,22 @@ pub fn install_status_line(
         .and_then(Value::as_str)
         .unwrap_or("");
     let current_kind = classify_statusline_command(current_cmd);
+
+    let existing_title = settings.get("title").and_then(Value::as_object).cloned();
+    let current_title_cmd = existing_title
+        .as_ref()
+        .and_then(|m| m.get("command"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let current_title_kind = classify_statusline_command(current_title_cmd);
+
+    let enable_title = if explicit_with_title {
+        true
+    } else if explicit_no_title {
+        false
+    } else {
+        current_title_kind == "agy-hud"
+    };
 
     let stack = if explicit_stack {
         true
@@ -1018,6 +1051,12 @@ pub fn install_status_line(
     if current_kind == "other" && !replace {
         return Err(
             "settings.json already configures another statusLine script. Ask the user first, then re-run `agy-hud install --replace` (a backup is created automatically)."
+                .to_string(),
+        );
+    }
+    if enable_title && current_title_kind == "other" && !replace {
+        return Err(
+            "settings.json already configures another title command. Ask the user first, then re-run `agy-hud install --with-title --replace` (a backup is created automatically)."
                 .to_string(),
         );
     }
@@ -1084,6 +1123,14 @@ pub fn install_status_line(
         atomic_write_bytes(&paths.previous_statusline_path, &prev_bytes, 0o600)
             .map_err(|e| e.to_string())?;
     }
+    if enable_title
+        && current_title_kind == "other"
+        && let Some(prev_title_val) = settings.get("title")
+    {
+        let prev_bytes = serde_json::to_vec_pretty(prev_title_val).map_err(|e| e.to_string())?;
+        atomic_write_bytes(&paths.previous_title_path, &prev_bytes, 0o600)
+            .map_err(|e| e.to_string())?;
+    }
 
     let (command_str, command_warning) =
         format_statusline_command(&paths.installed_bin_path.to_string_lossy());
@@ -1099,6 +1146,32 @@ pub fn install_status_line(
     next_sl.insert("stack_with_default".to_string(), Value::Bool(stack));
 
     settings.insert("statusLine".to_string(), Value::Object(next_sl));
+
+    let title_command_report: Option<String> = if enable_title {
+        let (title_cmd, _) = format_title_command(&paths.installed_bin_path.to_string_lossy());
+        let mut next_title = if current_title_kind == "agy-hud" {
+            existing_title.unwrap_or_default()
+        } else {
+            Map::new()
+        };
+        next_title.insert("type".to_string(), Value::String("command".to_string()));
+        next_title.insert("command".to_string(), Value::String(title_cmd.clone()));
+        next_title.insert("enabled".to_string(), Value::Bool(true));
+        settings.insert("title".to_string(), Value::Object(next_title));
+        Some(title_cmd)
+    } else {
+        if explicit_no_title && current_title_kind == "agy-hud" {
+            if let Some(raw) = read_bounded_string(&paths.previous_title_path, 64 * 1024)
+                && let Ok(prev_val) = serde_json::from_str::<Value>(&raw)
+            {
+                settings.insert("title".to_string(), prev_val);
+            } else {
+                settings.remove("title");
+            }
+            let _ = fs::remove_file(&paths.previous_title_path);
+        }
+        None
+    };
 
     let target_settings = canonical_or_parent(&paths.cli_settings_path);
     let mode = file_mode_or_default(&target_settings, 0o600);
@@ -1118,6 +1191,8 @@ pub fn install_status_line(
         "command": command_str,
         "stackWithDefault": stack,
         "replaced": current_kind,
+        "titleConfigured": enable_title,
+        "titleCommand": title_command_report,
         "backupPath": backup_path,
         "unprefixedSkills": unprefixed_skills,
     });
@@ -1154,12 +1229,15 @@ pub fn uninstall_status_line(paths: &AgyPaths, argv: &[String]) -> Result<Value,
         })
         .unwrap_or_default();
 
-    // 1. Restore `~/.gemini/antigravity-cli/settings.json` cleanly to official default (or prior third-party bar)
+    // 1. Restore `~/.gemini/antigravity-cli/settings.json` cleanly to official default (or prior third-party bar/title)
     let mut restored_previous = false;
     let status_line_action: &'static str;
+    let title_action: &'static str;
 
     if paths.cli_settings_path.exists() {
         let mut settings = read_json_object_or_empty(&paths.cli_settings_path)?;
+        let mut settings_changed = false;
+
         let current_cmd = settings
             .get("statusLine")
             .and_then(Value::as_object)
@@ -1182,19 +1260,51 @@ pub fn uninstall_status_line(paths: &AgyPaths, argv: &[String]) -> Result<Value,
                 settings.remove("statusLine");
                 status_line_action = "restored-official-default";
             }
-            let target_settings = canonical_or_parent(&paths.cli_settings_path);
-            let mode = file_mode_or_default(&target_settings, 0o600);
-            let mut out_bytes = serde_json::to_vec_pretty(&settings).map_err(|e| e.to_string())?;
-            out_bytes.push(b'\n');
-            atomic_write_bytes(&target_settings, &out_bytes, mode).map_err(|e| e.to_string())?;
+            settings_changed = true;
         } else if current_kind == "none" {
             status_line_action = "already-official-default";
         } else {
             // Foreign statusLine configured manually by user — never clobber!
             status_line_action = "kept-foreign";
         }
+
+        let current_title_cmd = settings
+            .get("title")
+            .and_then(Value::as_object)
+            .and_then(|m| m.get("command"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let current_title_kind = classify_statusline_command(current_title_cmd);
+
+        if current_title_kind == "agy-hud" {
+            if !reset_default
+                && let Some(raw) = read_bounded_string(&paths.previous_title_path, 64 * 1024)
+                && let Ok(prev_val) = serde_json::from_str::<Value>(&raw)
+            {
+                settings.insert("title".to_string(), prev_val);
+                title_action = "restored-previous";
+            } else {
+                settings.remove("title");
+                title_action = "restored-official-default";
+            }
+            settings_changed = true;
+        } else if current_title_kind == "none" {
+            title_action = "already-official-default";
+        } else {
+            // Foreign title configured manually by user — never clobber!
+            title_action = "kept-foreign";
+        }
+
+        if settings_changed {
+            let target_settings = canonical_or_parent(&paths.cli_settings_path);
+            let mode = file_mode_or_default(&target_settings, 0o600);
+            let mut out_bytes = serde_json::to_vec_pretty(&settings).map_err(|e| e.to_string())?;
+            out_bytes.push(b'\n');
+            atomic_write_bytes(&target_settings, &out_bytes, mode).map_err(|e| e.to_string())?;
+        }
     } else {
         status_line_action = "settings-not-present";
+        title_action = "settings-not-present";
     }
 
     // 2. Remove `.bak.<timestamp>` files created by `agy-hud install` (only tracked ones inside cli_dir)
@@ -1239,6 +1349,7 @@ pub fn uninstall_status_line(paths: &AgyPaths, argv: &[String]) -> Result<Value,
             "heartbeat.json",
             "install-meta.json",
             "previous-statusline.json",
+            "previous-title.json",
             "config.undo.json",
         ] {
             let _ = fs::remove_file(paths.hud_home.join(file));
@@ -1271,6 +1382,7 @@ pub fn uninstall_status_line(paths: &AgyPaths, argv: &[String]) -> Result<Value,
         "uninstalled": true,
         "settingsPath": paths.cli_settings_path.to_string_lossy(),
         "statusLineAction": status_line_action,
+        "titleAction": title_action,
         "restoredPrevious": restored_previous,
         "removedBackups": removed_backups,
         "pluginUninstalled": plugin_uninstalled,

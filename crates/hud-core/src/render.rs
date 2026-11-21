@@ -1,6 +1,7 @@
 use crate::ansi::{
-    BOLD, DIM, ITALIC, RESET, colors, file_link, github_branch_link, paint, render_bar_with_mode,
-    sanitize_text, sanitize_title_text, text_width, truncate_ansi_with_ellipsis,
+    BOLD, DIM, ITALIC, RESET, colors, file_link, github_branch_link, grapheme_width, graphemes,
+    paint, render_bar_with_mode, sanitize_text, sanitize_title_text, text_width,
+    truncate_ansi_with_ellipsis,
 };
 use crate::config::{DisplayConfig, HudConfig};
 use crate::i18n::{Labels, get_labels};
@@ -9,14 +10,14 @@ use crate::stdin::{
     CompactionInputs, compute_quota_pace, extract_context_metrics_scaled,
     extract_quota_buckets_reconciled, format_compact_tokens, format_duration_seconds,
     format_model_name_with_glyphs, format_session_cost, format_subagent_model_label,
-    format_workspace_breadcrumb, normalize_plan_tier,
+    format_workspace_breadcrumb, format_workspace_path, normalize_plan_tier,
 };
 use crate::transcript::parse_subagent_status;
 use crate::types::{
-    AgyStdinData, CachedQuotaSnapshot, ContextValueMode, CostTotals, DbCeilingInfo, GlyphMode,
-    HUD_VERSION, LearnedCompactionState, LineLayout, MemoryProbeInfo, ModelFormatMode, PathLevels,
-    QuotaPace, QuotaValueMode, SubagentEntry, SubagentStatus, TodoStatus, ToolStatus,
-    TranscriptSummary, UpdateCacheSnapshot, VcsProbeInfo,
+    AgyStdinData, CachedQuotaSnapshot, ContextValueMode, CostTotals, DbCeilingInfo,
+    EffortFormatMode, GlyphMode, HUD_VERSION, LearnedCompactionState, LineLayout, MemoryProbeInfo,
+    ModelFormatMode, PathLevels, QuotaPace, QuotaValueMode, SubagentEntry, SubagentStatus,
+    TodoStatus, ToolStatus, TranscriptSummary, UpdateCacheSnapshot, VcsProbeInfo,
 };
 
 pub struct RenderInput<'a> {
@@ -1968,6 +1969,224 @@ pub fn format_config_problem_line_with_cmd(
     };
 
     Some(format!("{RESET}{body}{RESET}"))
+}
+
+fn truncate_plain_with_ellipsis(text: &str, max_cols: usize, ellipsis_str: &str) -> String {
+    if max_cols == 0 {
+        return String::new();
+    }
+    if text_width(text) <= max_cols {
+        return text.to_string();
+    }
+    let ellipsis_width = text_width(ellipsis_str);
+    let budget = max_cols.saturating_sub(ellipsis_width);
+    let mut out = String::with_capacity(text.len());
+    let mut used = 0usize;
+    for cluster in graphemes(text) {
+        let w = grapheme_width(cluster);
+        if used + w > budget {
+            break;
+        }
+        out.push_str(cluster);
+        used += w;
+    }
+    if max_cols >= ellipsis_width {
+        out.push_str(ellipsis_str);
+    }
+    out
+}
+
+/// Renders a plain single-line terminal window/tab title from live `stdin` telemetry and config,
+/// with zero ANSI SGR/OSC 8 sequences, sanitized controls/newlines, and an 80-column display cap.
+pub fn render_title_line(stdin: Option<&AgyStdinData>, config: &HudConfig) -> String {
+    let gm = config.display.glyph_mode;
+    let ascii = gm == GlyphMode::Ascii;
+    let labels = get_labels(config.language);
+
+    let state_str = if stdin
+        .and_then(|s| s.tool_confirmation_pending)
+        .unwrap_or(false)
+    {
+        format!("{} {}", if ascii { "!" } else { "⚠" }, labels.state.confirm)
+    } else {
+        let state = sanitize_text(
+            stdin
+                .and_then(|s| s.agent_state.as_deref())
+                .unwrap_or("idle"),
+        )
+        .to_ascii_lowercase();
+        let glyph = match state.as_str() {
+            "thinking" => {
+                if ascii {
+                    "~"
+                } else {
+                    "◆"
+                }
+            }
+            "working" => {
+                if ascii {
+                    "*"
+                } else {
+                    "⚙"
+                }
+            }
+            "tool_use" => {
+                if ascii {
+                    ">"
+                } else {
+                    "🔧"
+                }
+            }
+            "reviewing" => {
+                if ascii {
+                    "?"
+                } else {
+                    "👁"
+                }
+            }
+            "authenticating" => {
+                if ascii {
+                    "@"
+                } else {
+                    "🔑"
+                }
+            }
+            "initializing" => {
+                if ascii {
+                    "."
+                } else {
+                    "◌"
+                }
+            }
+            "error" => {
+                if ascii {
+                    "X"
+                } else {
+                    "✖"
+                }
+            }
+            _ => {
+                if ascii {
+                    "*"
+                } else {
+                    "●"
+                }
+            }
+        };
+        glyph.to_string()
+    };
+
+    let raw_dir = stdin.and_then(|s| {
+        s.workspace
+            .as_ref()
+            .and_then(|w| w.current_dir.as_deref())
+            .filter(|d| !sanitize_text(d).is_empty())
+            .or_else(|| s.cwd.as_deref().filter(|d| !sanitize_text(d).is_empty()))
+            .or_else(|| {
+                s.workspace
+                    .as_ref()
+                    .and_then(|w| w.project_dir.as_deref())
+                    .filter(|d| !sanitize_text(d).is_empty())
+            })
+    });
+    let folder = format_workspace_path(raw_dir, PathLevels::One);
+
+    let vcs_suffix = if config.vcs.enabled
+        && let Some(sv) = stdin.and_then(|s| s.vcs.as_ref())
+    {
+        let branch_raw = sv
+            .branch
+            .as_deref()
+            .filter(|b| !sanitize_text(b).is_empty())
+            .or_else(|| {
+                sv.client
+                    .as_deref()
+                    .filter(|c| !sanitize_text(c).is_empty())
+            });
+        if let Some(raw_branch) = branch_raw {
+            let branch = sanitize_text(raw_branch);
+            if branch.is_empty() {
+                String::new()
+            } else {
+                let dirty_mark = if config.vcs.show_dirty && sv.dirty.unwrap_or(false) {
+                    "*"
+                } else {
+                    ""
+                };
+                format!("({branch}{dirty_mark})")
+            }
+        } else {
+            String::new()
+        }
+    } else {
+        String::new()
+    };
+
+    let folder_vcs = match (folder.is_empty(), vcs_suffix.is_empty()) {
+        (false, false) => format!("{folder} {vcs_suffix}"),
+        (false, true) => folder,
+        (true, false) => vcs_suffix,
+        (true, true) => String::new(),
+    };
+
+    let model_str = if config.display.show_model {
+        format_model_name_with_glyphs(
+            stdin.and_then(|s| s.model.as_ref()),
+            ModelFormatMode::Short,
+            EffortFormatMode::Hidden,
+            gm,
+        )
+    } else {
+        String::new()
+    };
+
+    let metrics = extract_context_metrics_scaled(
+        stdin,
+        config.display.context_scale,
+        CompactionInputs::default(),
+    );
+    let ctx_str = if metrics.has_data && metrics.ceiling_known {
+        format!("{:.0}%", metrics.used_percent)
+    } else if metrics.has_data
+        && !metrics.ceiling_known
+        && let Some(used) = metrics.used_tokens
+    {
+        format_compact_tokens(used)
+    } else {
+        String::new()
+    };
+
+    let head = if folder_vcs.is_empty() {
+        state_str
+    } else {
+        format!("{state_str} {folder_vcs}")
+    };
+    let mid_dot = if ascii { " . " } else { " · " };
+    let core_parts: Vec<String> = [head, model_str, ctx_str]
+        .into_iter()
+        .filter(|s| !s.is_empty())
+        .collect();
+    let core = core_parts.join(mid_dot);
+
+    let title_part = stdin
+        .and_then(|s| s.conversation_title.as_deref())
+        .map(sanitize_title_text)
+        .filter(|t| !t.is_empty())
+        .map(|t| truncate_plain_with_ellipsis(&t, 28, ellipsis(gm)));
+
+    let assembled = match title_part {
+        Some(title) => {
+            let em_sep = if ascii { " - " } else { " — " };
+            if core.is_empty() {
+                title
+            } else {
+                format!("{core}{em_sep}{title}")
+            }
+        }
+        None => core,
+    };
+
+    truncate_plain_with_ellipsis(&assembled, 80, ellipsis(gm))
 }
 
 pub fn render_hud_lines(input: RenderInput<'_>) -> Vec<String> {

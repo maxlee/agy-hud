@@ -24,6 +24,7 @@ use hud_core::probes::{
 };
 use hud_core::render::{
     RenderExtras, RenderInput, format_config_problem_line_with_cmd, render_hud_lines_full,
+    render_title_line,
 };
 use hud_core::stdin::CompactionScope;
 use hud_core::types::{
@@ -45,11 +46,12 @@ const HELP_LINES: &[&str] = &[
     "",
     "Usage:",
     "  agy-hud                                 (statusLine mode: reads JSON from stdin)",
+    "  agy-hud title                           (title mode: reads JSON from stdin, prints single-line terminal title)",
     "  agy-hud doctor [--pretty]               Check setup, binary, settings.json, and glyph alignment",
-    "  agy-hud install [--replace] [--stack]   Deploy native binary & configure settings.json",
+    "  agy-hud install [--replace] [--stack] [--with-title] [--no-title]  Deploy native binary & configure settings.json",
     "  agy-hud update [--check] [--force]      Check for updates or upgrade to the latest verified GitHub release",
     "  agy-hud uninstall [--keep-config] [--reset-default]  Cleanly remove HUD & restore official default",
-    "  agy-hud preview [options]               Render live previews (--state showcase|idle|tool_use|confirm|high-context, --width N, --set k=v, --last)",
+    "  agy-hud preview [options]               Render live previews (--state showcase|idle|tool_use|confirm|high-context, --width N, --set k=v, --last, --title)",
     "  agy-hud schema [query]                  List configurable HUD keys and descriptions",
     "  agy-hud set <k=v...>|--undo             Update or undo HUD configuration",
     "  agy-hud quota refresh                   Manually refresh official `/usage` quota cache",
@@ -483,6 +485,35 @@ fn run() -> u8 {
                 return 1;
             }
         }
+    }
+
+    if sub == Some("title") {
+        if is_nested_hud() || is_hud_disabled() {
+            drain_stdin_nested(Duration::from_millis(150));
+            return 0;
+        }
+        let Some(stdin_payload): Option<AgyStdinData> = read_stdin_payload() else {
+            if std::io::stdin().is_terminal() {
+                print_filtered(&[
+                    "agy-hud title: pipe Antigravity CLI statusLine JSON on stdin, or run `agy-hud preview --state showcase --title`.",
+                ]);
+            }
+            return 0;
+        };
+        let config_text = read_bounded_string(&paths.config_path, MAX_CONFIG_BYTES as u64);
+        let mut loaded_cfg = parse_config_str(config_text.as_deref());
+        if loaded_cfg.config.language == hud_core::types::Language::Auto {
+            let sys_locale = detect_system_locale();
+            loaded_cfg.config.language = hud_core::i18n::resolve_language(
+                hud_core::types::Language::Auto,
+                sys_locale.as_deref(),
+            );
+        }
+        let title_line = render_title_line(Some(&stdin_payload), &loaded_cfg.config);
+        if !title_line.is_empty() {
+            print_filtered(&[title_line]);
+        }
+        return 0;
     }
 
     if let Some(cmd_name) = sub {
